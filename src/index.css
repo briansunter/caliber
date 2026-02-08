@@ -1,0 +1,16 @@
+@import "../styles/globals.css";
+
+@layer base {
+  body {
+    @apply min-w-[320px] min-h-screen relative m-0 bg-bg-primary text-text-primary;
+    font-family: var(--font-sans);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation: none !important;
+  }
+}
