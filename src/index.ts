@@ -19,6 +19,32 @@ import { homedir } from "os";
 
 const LIBRARY_PATH = getLibraryPath();
 const WORK_DIR = join(homedir(), ".config", "caliber");
+const DEFAULT_PORT = 3003;
+const MAX_QUERY_LIMIT = 100;
+const MAX_STREAM_BATCH_SIZE = 5000;
+const SORT_FIELDS = ["title", "author", "added", "rating"] as const;
+const SORT_ORDERS = ["asc", "desc"] as const;
+
+type SortField = (typeof SORT_FIELDS)[number];
+type SortOrder = (typeof SORT_ORDERS)[number];
+
+function parseBoundedInt(
+  value: string | null | undefined,
+  fallback: number,
+  bounds: { min: number; max: number }
+): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(bounds.max, Math.max(bounds.min, parsed));
+}
+
+function parseSortField(value: string | null): SortField {
+  return SORT_FIELDS.includes(value as SortField) ? (value as SortField) : "title";
+}
+
+function parseSortOrder(value: string | null): SortOrder {
+  return SORT_ORDERS.includes(value as SortOrder) ? (value as SortOrder) : "asc";
+}
 
 // Initialize FTS on startup
 initFTS();
@@ -126,7 +152,7 @@ async function* streamBooksJSON(
 }
 
 const server = serve({
-  port: process.env.PORT ? parseInt(process.env.PORT) : 3003,
+  port: parseBoundedInt(process.env.PORT, DEFAULT_PORT, { min: 1, max: 65535 }),
   routes: {
     // Health check
     "/api/health": {
@@ -153,7 +179,10 @@ const server = serve({
     "/api/books/stream": {
       GET: async (req) => {
         const url = new URL(req.url);
-        const batchSize = parseInt(url.searchParams.get("batchSize") || "1000", 10);
+        const batchSize = parseBoundedInt(url.searchParams.get("batchSize"), 1000, {
+          min: 1,
+          max: MAX_STREAM_BATCH_SIZE,
+        });
 
         const stream = new ReadableStream({
           async start(controller) {
@@ -184,11 +213,12 @@ const server = serve({
         try {
           const url = new URL(req.url);
           const cursor = url.searchParams.get("cursor") || undefined;
-          const limit = parseInt(url.searchParams.get("limit") || "50", 10);
-          const sortByParam = url.searchParams.get("sortBy");
-          const sortBy = (sortByParam === "author" || sortByParam === "added" || sortByParam === "rating") ? sortByParam : "title";
-          const sortOrderParam = url.searchParams.get("sortOrder");
-          const sortOrder = sortOrderParam === "desc" ? "desc" : "asc";
+          const limit = parseBoundedInt(url.searchParams.get("limit"), 50, {
+            min: 1,
+            max: MAX_QUERY_LIMIT,
+          });
+          const sortBy = parseSortField(url.searchParams.get("sortBy"));
+          const sortOrder = parseSortOrder(url.searchParams.get("sortOrder"));
 
           const result = listBooksCursor({ cursor, limit, sortBy, sortOrder });
 
@@ -211,11 +241,12 @@ const server = serve({
           const url = new URL(req.url);
           const query = url.searchParams.get("q") || "";
           const cursor = url.searchParams.get("cursor") || undefined;
-          const limit = parseInt(url.searchParams.get("limit") || "50", 10);
-          const sortByParam = url.searchParams.get("sortBy");
-          const sortBy = (sortByParam === "author" || sortByParam === "added" || sortByParam === "rating") ? sortByParam : "title";
-          const sortOrderParam = url.searchParams.get("sortOrder");
-          const sortOrder = sortOrderParam === "desc" ? "desc" : "asc";
+          const limit = parseBoundedInt(url.searchParams.get("limit"), 50, {
+            min: 1,
+            max: MAX_QUERY_LIMIT,
+          });
+          const sortBy = parseSortField(url.searchParams.get("sortBy"));
+          const sortOrder = parseSortOrder(url.searchParams.get("sortOrder"));
 
           if (!query.trim()) {
             const result = listBooksCursor({ cursor, limit, sortBy, sortOrder });
@@ -246,7 +277,7 @@ const server = serve({
         try {
           const id = parseInt(req.params.id, 10);
 
-          if (isNaN(id)) {
+          if (Number.isNaN(id)) {
             return Response.json(
               { error: "Invalid book ID" },
               { status: 400 }
@@ -280,7 +311,7 @@ const server = serve({
           const id = parseInt(req.params.id, 10);
           const format = req.params.format.toUpperCase();
 
-          if (isNaN(id)) {
+          if (Number.isNaN(id)) {
             return Response.json(
               { error: "Invalid book ID" },
               { status: 400 }
@@ -353,7 +384,7 @@ const server = serve({
       GET: async (req) => {
         try {
           const id = parseInt(req.params.id, 10);
-          if (isNaN(id)) {
+          if (Number.isNaN(id)) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
 

@@ -5,8 +5,8 @@
  */
 
 import { Database } from "bun:sqlite";
-import { mkdir, exists } from "fs/promises";
-import { join } from "path";
+import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
 
 const TEST_LIBRARY_PATH = "/tmp/calibre-test-library-huge";
 const DB_PATH = join(TEST_LIBRARY_PATH, "metadata.db");
@@ -129,7 +129,10 @@ function randomInt(min: number, max: number): number {
 }
 
 function randomItem<T>(arr: T[]): T {
-  return arr[randomInt(0, arr.length - 1)];
+  if (arr.length === 0) {
+    throw new Error("randomItem requires a non-empty array");
+  }
+  return arr[randomInt(0, arr.length - 1)]!;
 }
 
 function randomItems<T>(arr: T[], count: number): T[] {
@@ -169,7 +172,7 @@ function generateISBN(): string {
   // Calculate check digit
   let sum = 0;
   for (let i = 0; i < 12; i++) {
-    sum += parseInt(isbn[i]) * (i % 2 === 0 ? 1 : 3);
+    sum += parseInt(isbn.charAt(i), 10) * (i % 2 === 0 ? 1 : 3);
   }
   const checkDigit = (10 - (sum % 10)) % 10;
   return isbn + checkDigit;
@@ -185,7 +188,7 @@ function generateUUID(): string {
 
 function generateDate(start: Date, end: Date): string {
   const timestamp = start.getTime() + Math.random() * (end.getTime() - start.getTime());
-  return new Date(timestamp).toISOString().replace('T', ' ').split('.')[0];
+  return new Date(timestamp).toISOString().replace("T", " ").split(".")[0] ?? "";
 }
 
 function generateComment(): string | null {
@@ -611,5 +614,5 @@ async function createTestLibrary(bookCount: number = 1_000_000) {
 }
 
 // Generate 1 million books by default
-const BOOK_COUNT = parseInt(process.argv[2] ?? "1000000");
+const BOOK_COUNT = parseInt(process.argv[2] ?? "1000000", 10);
 createTestLibrary(BOOK_COUNT);

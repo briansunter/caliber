@@ -1,10 +1,10 @@
 import { Database } from "bun:sqlite";
-import { join } from "path";
-import { copyFileSync, mkdirSync } from "fs";
-import { homedir } from "os";
+import { join } from "node:path";
+import { copyFileSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
 
 // Use Desktop Calibre library
-const LIBRARY_PATH = process.env.CALIBRE_LIBRARY_PATH || "/Users/bsunter/Desktop";
+const LIBRARY_PATH = process.env.CALIBRE_LIBRARY_PATH || "/Users/bsunter/Calibre Library";
 const DB_NAME = process.env.CALIBRE_DB_NAME || "metadata.db";
 const DB_PATH = join(LIBRARY_PATH, DB_NAME);
 
@@ -76,6 +76,15 @@ interface BookRow {
   authors: string | null;
   tags: string | null;
   formats: string | null;
+}
+
+function splitAggregatedField(value: string | null): string[] {
+  return value
+    ? value
+        .split(",")
+        .map((item) => item.trim())
+        .filter((item) => item.length > 0)
+    : [];
 }
 
 // Get database connection from pool or create new one
@@ -208,11 +217,11 @@ function parseBookRow(row: BookRow): BookListItem {
     id: row.id,
     title: row.title,
     author_sort: row.author_sort,
-    authors: row.authors ? row.authors.split(",") : [],
+    authors: splitAggregatedField(row.authors),
     series: row.series,
     series_index: row.series_index,
-    tags: row.tags ? row.tags.split(",") : [],
-    formats: row.formats ? row.formats.split(",") : [],
+    tags: splitAggregatedField(row.tags),
+    formats: splitAggregatedField(row.formats),
     has_cover: Boolean(row.has_cover),
     pubdate: row.pubdate,
     timestamp: row.timestamp,
@@ -674,11 +683,11 @@ export function searchBooksByTitle(title: string, limit: number = 10): BookListI
     id: row.id,
     title: row.title,
     author_sort: row.author_sort,
-    authors: row.authors ? row.authors.split(",") : [],
+    authors: splitAggregatedField(row.authors),
     series: row.series,
     series_index: row.series_index || 1,
-    tags: row.tags ? row.tags.split(",") : [],
-    formats: row.formats ? row.formats.split(",") : [],
+    tags: splitAggregatedField(row.tags),
+    formats: splitAggregatedField(row.formats),
     has_cover: !!row.has_cover,
     pubdate: row.pubdate,
     timestamp: row.timestamp,
@@ -732,11 +741,11 @@ export function searchBooksByAuthor(authorName: string, limit: number = 10): Boo
     id: row.id,
     title: row.title,
     author_sort: row.author_sort,
-    authors: row.authors ? row.authors.split(",") : [],
+    authors: splitAggregatedField(row.authors),
     series: row.series,
     series_index: row.series_index || 1,
-    tags: row.tags ? row.tags.split(",") : [],
-    formats: row.formats ? row.formats.split(",") : [],
+    tags: splitAggregatedField(row.tags),
+    formats: splitAggregatedField(row.formats),
     has_cover: !!row.has_cover,
     pubdate: row.pubdate,
     timestamp: row.timestamp,

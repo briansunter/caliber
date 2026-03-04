@@ -1,7 +1,8 @@
 import { Database } from "bun:sqlite";
-import { join } from "path";
+import { join } from "node:path";
 
-const LIBRARY_PATH = "/Users/bsunter/Calibre Library";
+const LIBRARY_PATH =
+  process.env.CALIBRE_LIBRARY_PATH ?? "/Users/bsunter/Calibre Library";
 const DB_PATH = join(LIBRARY_PATH, "metadata.db");
 
 export interface Book {

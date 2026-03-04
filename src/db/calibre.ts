@@ -299,11 +299,11 @@ export function getBookById(id: number): BookWithMetadata | null {
 
   return {
     ...book,
-    authors,
-    tags,
-    series,
-    publisher,
-    rating,
+    authors: authors.map((author) => author.name),
+    tags: tags.map((tag) => tag.name),
+    series: series?.name ?? null,
+    publisher: publisher?.name ?? null,
+    rating: rating?.rating ?? null,
     formats,
     comments,
   };

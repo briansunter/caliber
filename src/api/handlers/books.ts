@@ -1,4 +1,3 @@
-import type { Serve } from "bun";
 import {
   listBooks,
   searchBooks,
@@ -6,11 +5,14 @@ import {
   bookHasFormat,
   getFormatPath,
   getCoverPath,
-  getLibraryPath,
 } from "../../lib/calibre";
 
+type RouteRequest<TParams extends Record<string, string>> = Request & {
+  params: TParams;
+};
+
 export async function listBooksHandler(
-  req: Parameters<Serve["fetch"]>[0]
+  req: Request
 ): Promise<Response> {
   try {
     const url = new URL(req.url);
@@ -33,7 +35,7 @@ export async function listBooksHandler(
 }
 
 export async function searchBooksHandler(
-  req: Parameters<Serve["fetch"]>[0]
+  req: Request
 ): Promise<Response> {
   try {
     const url = new URL(req.url);
@@ -65,12 +67,12 @@ export async function searchBooksHandler(
 }
 
 export async function getBookHandler(
-  req: Parameters<Serve["fetch"]>[0] & { params: { id: string } }
+  req: RouteRequest<{ id: string }>
 ): Promise<Response> {
   try {
     const id = parseInt(req.params.id, 10);
 
-    if (isNaN(id)) {
+    if (Number.isNaN(id)) {
       return Response.json(
         { error: "Invalid book ID" },
         { status: 400 }
@@ -97,13 +99,13 @@ export async function getBookHandler(
 }
 
 export async function downloadBookHandler(
-  req: Parameters<Serve["fetch"]>[0] & { params: { id: string; format: string } }
+  req: RouteRequest<{ id: string; format: string }>
 ): Promise<Response> {
   try {
     const id = parseInt(req.params.id, 10);
     const format = req.params.format.toUpperCase();
 
-    if (isNaN(id)) {
+    if (Number.isNaN(id)) {
       return Response.json(
         { error: "Invalid book ID" },
         { status: 400 }
@@ -176,12 +178,12 @@ export async function downloadBookHandler(
 }
 
 export async function getCoverHandler(
-  req: Parameters<Serve["fetch"]>[0] & { params: { id: string } }
+  req: RouteRequest<{ id: string }>
 ): Promise<Response> {
   try {
     const id = parseInt(req.params.id, 10);
 
-    if (isNaN(id)) {
+    if (Number.isNaN(id)) {
       return Response.json(
         { error: "Invalid book ID" },
         { status: 400 }

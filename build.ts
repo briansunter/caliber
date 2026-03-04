@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 import plugin from "bun-plugin-tailwind";
-import { existsSync } from "fs";
-import { rm } from "fs/promises";
-import path from "path";
+import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import path from "node:path";
 
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
   console.log(`
@@ -33,9 +33,10 @@ Example:
   process.exit(0);
 }
 
-const toCamelCase = (str: string): string => str.replace(/-([a-z])/g, g => g[1].toUpperCase());
+const toCamelCase = (str: string): string =>
+  str.replace(/-([a-z])/g, (_match, char: string) => char.toUpperCase());
 
-const parseValue = (value: string): any => {
+const parseValue = (value: string): unknown => {
   if (value === "true") return true;
   if (value === "false") return false;
 
@@ -48,7 +49,7 @@ const parseValue = (value: string): any => {
 };
 
 function parseArgs(): Partial<Bun.BuildConfig> {
-  const config: Partial<Bun.BuildConfig> = {};
+  const config: Record<string, unknown> = {};
   const args = process.argv.slice(2);
 
   for (let i = 0; i < args.length; i++) {
@@ -81,15 +82,21 @@ function parseArgs(): Partial<Bun.BuildConfig> {
     key = toCamelCase(key);
 
     if (key.includes(".")) {
-      const [parentKey, childKey] = key.split(".");
-      config[parentKey] = config[parentKey] || {};
-      config[parentKey][childKey] = parseValue(value);
+      const [parentKey, childKey] = key.split(".", 2);
+      if (!parentKey || !childKey) continue;
+
+      const parent =
+        typeof config[parentKey] === "object" && config[parentKey] !== null
+          ? (config[parentKey] as Record<string, unknown>)
+          : {};
+      parent[childKey] = parseValue(value);
+      config[parentKey] = parent;
     } else {
       config[key] = parseValue(value);
     }
   }
 
-  return config;
+  return config as Partial<Bun.BuildConfig>;
 }
 
 const formatFileSize = (bytes: number): string => {
@@ -108,7 +115,10 @@ const formatFileSize = (bytes: number): string => {
 console.log("\n🚀 Starting build process...\n");
 
 const cliConfig = parseArgs();
-const outdir = cliConfig.outdir || path.join(process.cwd(), "dist");
+const outdir =
+  typeof cliConfig.outdir === "string"
+    ? cliConfig.outdir
+    : path.join(process.cwd(), "dist");
 
 if (existsSync(outdir)) {
   console.log(`🗑️ Cleaning previous build at ${outdir}`);

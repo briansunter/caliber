@@ -29,7 +29,10 @@ declare module "@tanstack/react-router" {
   }
 }
 
-const elem = document.getElementById("root")!;
+const elem = document.getElementById("root");
+if (!elem) {
+  throw new Error("Root element #root was not found");
+}
 const app = (
   <StrictMode>
     <RouterProvider router={router} />
@@ -38,7 +41,11 @@ const app = (
 
 if (import.meta.hot) {
   // With hot module reloading, `import.meta.hot.data` is persisted.
-  const root = (import.meta.hot.data.root ??= createRoot(elem));
+  let root = import.meta.hot.data.root as ReturnType<typeof createRoot> | undefined;
+  if (!root) {
+    root = createRoot(elem);
+    import.meta.hot.data.root = root;
+  }
   root.render(app);
 } else {
   // The hot module reloading API is not available in production.

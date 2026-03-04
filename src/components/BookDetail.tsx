@@ -16,12 +16,14 @@ import {
   BookOpen,
 } from "lucide-react";
 import { useState, useCallback, memo, useMemo } from "react";
-import { cn } from "@/lib/utils";
+import { cn, stripHtmlTags } from "@/lib/utils";
 import { Link } from "@tanstack/react-router";
 
 interface BookDetailProps {
   bookId: number;
 }
+
+const RATING_STAR_KEYS = ["star-1", "star-2", "star-3", "star-4", "star-5"] as const;
 
 // Elegant book cover with leather-bound shadow and spine effect
 const BookCover = memo(function BookCover({
@@ -135,9 +137,9 @@ const StarRating = memo(function StarRating({
 
   return (
     <div className="flex items-center gap-0.5">
-      {Array.from({ length: 5 }).map((_, i) => (
+      {RATING_STAR_KEYS.map((starKey, i) => (
         <Star
-          key={i}
+          key={starKey}
           className={cn(
             "h-4 w-4",
             i < stars.fullStars
@@ -227,6 +229,11 @@ export function BookDetail({ bookId }: BookDetailProps) {
     if (!book?.authors?.length) return "";
     return book.authors.join(", ");
   }, [book?.authors]);
+
+  const descriptionText = useMemo(() => {
+    if (!book?.comments) return "";
+    return stripHtmlTags(book.comments);
+  }, [book?.comments]);
 
   if (isLoading) {
     return (
@@ -389,21 +396,20 @@ export function BookDetail({ bookId }: BookDetailProps) {
           )}
 
           {/* Description */}
-          {book.comments && (
+          {descriptionText && (
             <div className="space-y-4">
               <h3 className="text-xs font-semibold text-ink-muted uppercase tracking-widest flex items-center gap-2">
                 <FileText className="h-4 w-4" strokeWidth={1.5} />
                 About this book
               </h3>
-              <div
-                className="prose prose-base max-w-none leading-relaxed text-ink-secondary"
-                dangerouslySetInnerHTML={{ __html: book.comments }}
-              />
+              <p className="leading-relaxed text-ink-secondary whitespace-pre-wrap">
+                {descriptionText}
+              </p>
             </div>
           )}
 
           {/* Empty state for no description */}
-          {!book.comments && (
+          {!descriptionText && (
             <div className="py-10 text-center border border-dashed border-ink rounded-lg bg-parchment-dark/50">
               <FileText className="h-8 w-8 mx-auto mb-2 text-ink-muted" strokeWidth={1.5} />
               <p className="text-sm text-ink-muted">No description available for this book.</p>

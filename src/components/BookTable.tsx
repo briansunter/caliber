@@ -1,4 +1,4 @@
-import { useRef, useState, useMemo, memo } from "react";
+import { useRef, useState, memo } from "react";
 import {
   useReactTable,
   getCoreRowModel,
@@ -8,10 +8,11 @@ import {
   createColumnHelper,
   type SortingState,
   type Row,
+  type Column,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useSearch } from "@/hooks/useSearch";
-import type { BookListItem, BookFormat } from "@/types/calibre";
+import type { BookListItem } from "@/types/calibre";
 import { Link } from "@tanstack/react-router";
 import {
   ArrowUpDown,
@@ -128,16 +129,16 @@ const TagsCell = memo(function TagsCell({ tags }: { tags?: string[] }) {
   );
 });
 
-const FormatsCell = memo(function FormatsCell({ formats }: { formats?: BookFormat[] }) {
+const FormatsCell = memo(function FormatsCell({ formats }: { formats?: string[] }) {
   if (!formats || formats.length === 0) return <span className="text-muted">—</span>;
   return (
     <div className="flex flex-wrap gap-1">
       {formats.map((fmt) => (
         <span
-          key={fmt.format}
+          key={fmt}
           className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-tertiary text-tertiary border border-default"
         >
-          {fmt.format}
+          {fmt}
         </span>
       ))}
     </div>
@@ -147,7 +148,10 @@ const FormatsCell = memo(function FormatsCell({ formats }: { formats?: BookForma
 const ActionsCell = memo(function ActionsCell({ id }: { id: number }) {
   return (
     <Link to="/book/$id" params={{ id: String(id) }}>
-      <button className="p-2 rounded-md hover:bg-tertiary text-tertiary hover:text-primary transition-colors">
+      <button
+        type="button"
+        className="p-2 rounded-md hover:bg-tertiary text-tertiary hover:text-primary transition-colors"
+      >
         <ChevronRight className="h-4 w-4" />
       </button>
     </Link>
@@ -156,7 +160,7 @@ const ActionsCell = memo(function ActionsCell({ id }: { id: number }) {
 
 // Sortable header
 interface SortableHeaderProps {
-  column: any;
+  column: Column<BookListItem, unknown>;
   title: string;
 }
 
@@ -165,6 +169,7 @@ const SortableHeader = memo(function SortableHeader({ column, title }: SortableH
 
   return (
     <button
+      type="button"
       onClick={() => column.toggleSorting()}
       className="flex items-center gap-1.5 text-xs font-semibold text-tertiary uppercase tracking-wider hover:text-primary transition-colors"
     >

@@ -1,4 +1,3 @@
-import type { Serve } from "bun";
 import {
   listBooksHandler,
   searchBooksHandler,
@@ -7,26 +6,24 @@ import {
   getCoverHandler,
 } from "./handlers/books";
 
-export const apiRoutes: Record<
-  string,
-  Record<
-    string,
-    (req: Parameters<Serve["fetch"]>[0] & { params: Record<string, string> }) => Promise<Response>
-  >
-> = {
+type GenericRouteHandler = (
+  req: Request & { params: Record<string, string> }
+) => Promise<Response>;
+
+export const apiRoutes: Record<string, Record<string, GenericRouteHandler>> = {
   "/api/books": {
-    GET: listBooksHandler,
+    GET: listBooksHandler as GenericRouteHandler,
   },
   "/api/books/search": {
-    GET: searchBooksHandler,
+    GET: searchBooksHandler as GenericRouteHandler,
   },
   "/api/books/:id": {
-    GET: getBookHandler,
+    GET: getBookHandler as GenericRouteHandler,
   },
   "/api/books/:id/download/:format": {
-    GET: downloadBookHandler,
+    GET: downloadBookHandler as GenericRouteHandler,
   },
   "/api/books/:id/cover": {
-    GET: getCoverHandler,
+    GET: getCoverHandler as GenericRouteHandler,
   },
 };

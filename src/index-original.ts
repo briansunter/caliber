@@ -1,6 +1,6 @@
 import { serve } from "bun";
-import { join } from "path";
-import { createHash } from "crypto";
+import { createHash } from "node:crypto";
+import { join } from "node:path";
 import index from "./index.html";
 import {
   listBooks,
@@ -116,7 +116,7 @@ const server = serve({
           const id = parseInt(req.params.id, 10);
           const format = req.params.format.toUpperCase();
 
-          if (isNaN(id)) {
+          if (Number.isNaN(id)) {
             return Response.json(
               { error: "Invalid book ID" },
               { status: 400 }
@@ -206,7 +206,7 @@ const server = serve({
         try {
           const id = parseInt(req.params.id, 10);
 
-          if (isNaN(id)) {
+          if (Number.isNaN(id)) {
             return Response.json(
               { error: "Invalid book ID" },
               { status: 400 }
@@ -263,7 +263,7 @@ const server = serve({
         try {
           const id = parseInt(req.params.id, 10);
 
-          if (isNaN(id)) {
+          if (Number.isNaN(id)) {
             return Response.json(
               { error: "Invalid book ID" },
               { status: 400 }

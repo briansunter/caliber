@@ -114,7 +114,7 @@ export interface BookListItem {
   series: string | null;
   series_index: number;
   tags: string[];
-  formats: BookFormat[];
+  formats: string[];
   has_cover: boolean;
   pubdate: string;
   timestamp: string;

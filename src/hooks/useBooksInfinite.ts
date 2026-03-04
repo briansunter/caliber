@@ -1,6 +1,7 @@
 import { useInfiniteQuery, useQuery, keepPreviousData } from "@tanstack/react-query";
 import { useMemo } from "react";
 import type { BookListItem, CursorPaginatedResult } from "@/lib/calibre-optimized";
+import { fetchJson } from "@/lib/http";
 
 const API_BASE = "/api";
 const PAGE_SIZE = 100;
@@ -19,10 +20,12 @@ async function fetchBooks({
   pageParam,
   sortBy,
   sortOrder,
+  signal,
 }: {
   pageParam?: string;
   sortBy: SortField;
   sortOrder: SortOrder;
+  signal?: AbortSignal;
 }): Promise<BooksResponse> {
   const params = new URLSearchParams();
   params.set("limit", String(PAGE_SIZE));
@@ -32,11 +35,7 @@ async function fetchBooks({
     params.set("cursor", pageParam);
   }
 
-  const response = await fetch(`${API_BASE}/books?${params}`, { priority: "high" });
-  if (!response.ok) {
-    throw new Error("Failed to fetch books");
-  }
-  return response.json();
+  return fetchJson<BooksResponse>(`${API_BASE}/books?${params}`, { signal });
 }
 
 async function searchBooks({
@@ -44,11 +43,13 @@ async function searchBooks({
   query,
   sortBy,
   sortOrder,
+  signal,
 }: {
   pageParam?: string;
   query: string;
   sortBy: SortField;
   sortOrder: SortOrder;
+  signal?: AbortSignal;
 }): Promise<BooksResponse> {
   const params = new URLSearchParams();
   params.set("limit", String(PAGE_SIZE));
@@ -59,22 +60,19 @@ async function searchBooks({
     params.set("cursor", pageParam);
   }
 
-  const response = await fetch(`${API_BASE}/books/search?${params}`, { priority: "high" });
-  if (!response.ok) {
-    throw new Error("Failed to search books");
-  }
-  return response.json();
+  return fetchJson<BooksResponse>(`${API_BASE}/books/search?${params}`, { signal });
 }
 
 // Infinite scroll hook for all books
 export function useBooksInfinite(sortConfig: SortConfig = { field: "title", order: "asc" }) {
   return useInfiniteQuery({
     queryKey: ["books", "infinite", sortConfig.field, sortConfig.order],
-    queryFn: ({ pageParam }) =>
+    queryFn: ({ pageParam, signal }) =>
       fetchBooks({
         pageParam,
         sortBy: sortConfig.field,
         sortOrder: sortConfig.order,
+        signal,
       }),
     getNextPageParam: (lastPage) => lastPage.nextCursor,
     initialPageParam: undefined as string | undefined,
@@ -89,12 +87,13 @@ export function useBooksInfinite(sortConfig: SortConfig = { field: "title", orde
 export function useSearchInfinite(query: string, sortConfig: SortConfig = { field: "title", order: "asc" }) {
   return useInfiniteQuery({
     queryKey: ["books", "search", "infinite", query, sortConfig.field, sortConfig.order],
-    queryFn: ({ pageParam }) =>
+    queryFn: ({ pageParam, signal }) =>
       searchBooks({
         pageParam,
         query,
         sortBy: sortConfig.field,
         sortOrder: sortConfig.order,
+        signal,
       }),
     getNextPageParam: (lastPage) => lastPage.nextCursor,
     initialPageParam: undefined as string | undefined,
@@ -132,18 +131,13 @@ export function useFlattenedBooks(searchQuery: string, sortConfig: SortConfig) {
 export function useLibraryStats() {
   return useQuery({
     queryKey: ["stats"],
-    queryFn: async () => {
-      const response = await fetch(`${API_BASE}/stats`);
-      if (!response.ok) {
-        throw new Error("Failed to fetch stats");
-      }
-      return response.json() as Promise<{
+    queryFn: ({ signal }) =>
+      fetchJson<{
         totalBooks: number;
         totalAuthors: number;
         totalSeries: number;
         totalTags: number;
-      }>;
-    },
+      }>(`${API_BASE}/stats`, { signal }),
     staleTime: 1000 * 60 * 5,
   });
 }
@@ -152,13 +146,7 @@ export function useLibraryStats() {
 export function useBook(id: number) {
   return useQuery({
     queryKey: ["book", id],
-    queryFn: async () => {
-      const response = await fetch(`${API_BASE}/books/${id}`);
-      if (!response.ok) {
-        throw new Error("Failed to fetch book");
-      }
-      return response.json() as Promise<BookListItem>;
-    },
-    enabled: !isNaN(id) && id > 0,
+    queryFn: ({ signal }) => fetchJson<BookListItem>(`${API_BASE}/books/${id}`, { signal }),
+    enabled: !Number.isNaN(id) && id > 0,
   });
 }

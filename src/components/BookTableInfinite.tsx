@@ -33,6 +33,16 @@ export const GRID_TEMPLATE = `${COLUMN_WIDTHS.title} ${COLUMN_WIDTHS.authors} ${
 const GRID_TEMPLATE_MOBILE = `1fr minmax(80px, auto) 40px`;
 
 const ROW_HEIGHT = 72;
+const SKELETON_ROW_KEYS = [
+  "skeleton-1",
+  "skeleton-2",
+  "skeleton-3",
+  "skeleton-4",
+  "skeleton-5",
+  "skeleton-6",
+  "skeleton-7",
+  "skeleton-8",
+] as const;
 
 // Star rating component
 const StarRating = memo(function StarRating({
@@ -174,6 +184,7 @@ const FormatsCell = memo(function FormatsCell({
     <div className="flex flex-wrap gap-1">
       {formats.slice(0, 3).map((fmt) => (
         <button
+          type="button"
           key={fmt}
           onClick={() => handleDownload(fmt)}
           className="format-tag"
@@ -192,7 +203,10 @@ const FormatsCell = memo(function FormatsCell({
 const ActionsCell = memo(function ActionsCell({ id }: { id: number }) {
   return (
     <Link to="/book/$id" params={{ id: String(id) }}>
-      <button className="p-2 rounded-md hover:bg-parchment-dark text-ink-muted hover:text-ink transition-colors">
+      <button
+        type="button"
+        className="p-2 rounded-md hover:bg-parchment-dark text-ink-muted hover:text-ink transition-colors"
+      >
         <ChevronRight className="h-4 w-4" strokeWidth={1.5} />
       </button>
     </Link>
@@ -281,9 +295,9 @@ const EmptyState = memo(function EmptyState({
 const TableSkeleton = memo(function TableSkeleton() {
   return (
     <div className="space-y-2 p-4">
-      {Array.from({ length: 8 }).map((_, i) => (
+      {SKELETON_ROW_KEYS.map((rowKey, i) => (
         <div
-          key={i}
+          key={rowKey}
           className="h-16 bg-parchment-dark/70 rounded animate-pulse"
           style={{ animationDelay: `${i * 50}ms` }}
         />
@@ -312,6 +326,7 @@ export const SortHeader = memo(function SortHeader({
 
   return (
     <button
+      type="button"
       onClick={() => onSort(field)}
       className={`flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider hover:text-ink transition-colors ${
         isActive ? "text-accent" : "text-ink-muted"
@@ -380,6 +395,8 @@ export function BookTableInfinite({
   searchQuery,
   sortConfig,
 }: BookTableInfiniteProps) {
+  const resetToken = `${searchQuery}|${sortConfig.field}|${sortConfig.order}`;
+
   const {
     books,
     hasNextPage,

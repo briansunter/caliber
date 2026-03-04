@@ -7,6 +7,11 @@ import { useRef, type FormEvent } from "react";
 
 export function APITester() {
   const responseInputRef = useRef<HTMLTextAreaElement>(null);
+  const setResponse = (value: string) => {
+    if (responseInputRef.current) {
+      responseInputRef.current.value = value;
+    }
+  };
 
   const testEndpoint = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -14,15 +19,15 @@ export function APITester() {
     try {
       const form = e.currentTarget;
       const formData = new FormData(form);
-      const endpoint = formData.get("endpoint") as string;
+      const endpoint = String(formData.get("endpoint") ?? "");
       const url = new URL(endpoint, location.href);
-      const method = formData.get("method") as string;
+      const method = String(formData.get("method") ?? "GET");
       const res = await fetch(url, { method });
 
       const data = await res.json();
-      responseInputRef.current!.value = JSON.stringify(data, null, 2);
+      setResponse(JSON.stringify(data, null, 2));
     } catch (error) {
-      responseInputRef.current!.value = String(error);
+      setResponse(String(error));
     }
   };
 
