@@ -3,7 +3,8 @@ import { join } from "path";
 
 // Use Desktop Calibre library
 const LIBRARY_PATH = process.env.CALIBRE_LIBRARY_PATH || "/Users/bsunter/Desktop";
-const DB_PATH = join(LIBRARY_PATH, "metadata.db");
+const DB_NAME = process.env.CALIBRE_DB_NAME || "metadata.db";
+const DB_PATH = join(LIBRARY_PATH, DB_NAME);
 
 // Connection pool for concurrent requests
 const dbPool: Database[] = [];
@@ -407,14 +408,42 @@ export function searchBooksCursor(options: SearchOptions): CursorPaginatedResult
   return fallbackSearch(options);
 }
 
-// Fallback LIKE-based search
+// Fallback LIKE-based search - searches title, author, and series
+// Supports multi-word queries - all words must match (AND logic)
 function fallbackSearch(options: SearchOptions): CursorPaginatedResult<BookListItem> {
   const db = getDb();
   const limit = Math.min(options.limit || 50, 100);
-  const searchTerm = `%${options.query.trim()}%`;
 
-  let bookWhere = `WHERE b.title LIKE ?`;
-  const params: (string | number)[] = [searchTerm];
+  // Split query into words and create individual search terms
+  const words = options.query.trim().split(/\s+/).filter(w => w.length > 0);
+  if (words.length === 0) {
+    return listBooksCursor({ ...options, limit });
+  }
+
+  // Build WHERE clause that requires ALL words to match (AND logic)
+  // Each word can match title, author, OR series
+  const wordConditions: string[] = [];
+  const params: (string | number)[] = [];
+
+  for (const word of words) {
+    const searchTerm = `%${word}%`;
+    wordConditions.push(`(
+      b.title LIKE ?
+      OR b.id IN (
+        SELECT bal.book FROM books_authors_link bal
+        JOIN authors a ON bal.author = a.id
+        WHERE a.name LIKE ? OR a.sort LIKE ?
+      )
+      OR b.id IN (
+        SELECT bsl.book FROM books_series_link bsl
+        JOIN series s ON bsl.series = s.id
+        WHERE s.name LIKE ?
+      )
+    )`);
+    params.push(searchTerm, searchTerm, searchTerm, searchTerm);
+  }
+
+  let bookWhere = `WHERE ${wordConditions.join(" AND ")}`;
 
   if (options.cursor) {
     const cursorData = decodeCursor(options.cursor);
@@ -532,6 +561,142 @@ export function getLibraryStats(): {
     totalAuthors: authors.count,
     totalSeries: series.count,
     totalTags: tags.count,
+  };
+}
+
+// Search books by title only
+export function searchBooksByTitle(title: string, limit: number = 10): BookListItem[] {
+  const db = getDb();
+  const searchTerm = `%${title.trim()}%`;
+
+  const query = `
+    SELECT
+      b.id,
+      b.title,
+      b.author_sort,
+      b.series_index,
+      b.has_cover,
+      b.pubdate,
+      b.timestamp,
+      s.name as series,
+      r.rating,
+      GROUP_CONCAT(DISTINCT a.name) as authors,
+      GROUP_CONCAT(DISTINCT t.name) as tags,
+      GROUP_CONCAT(DISTINCT d.format) as formats
+    FROM books b
+    LEFT JOIN books_authors_link bal ON b.id = bal.book
+    LEFT JOIN authors a ON bal.author = a.id
+    LEFT JOIN books_series_link bsl ON b.id = bsl.book
+    LEFT JOIN series s ON bsl.series = s.id
+    LEFT JOIN books_tags_link btl ON b.id = btl.book
+    LEFT JOIN tags t ON btl.tag = t.id
+    LEFT JOIN data d ON b.id = d.book
+    LEFT JOIN books_ratings_link brl ON b.id = brl.book
+    LEFT JOIN ratings r ON brl.rating = r.id
+    WHERE b.title LIKE ?
+    GROUP BY b.id
+    ORDER BY b.sort ASC
+    LIMIT ?
+  `;
+
+  const results = db.query(query).all(searchTerm, limit) as any[];
+
+  return results.map(row => ({
+    id: row.id,
+    title: row.title,
+    author_sort: row.author_sort,
+    authors: row.authors ? row.authors.split(",") : [],
+    series: row.series,
+    series_index: row.series_index || 1,
+    tags: row.tags ? row.tags.split(",") : [],
+    formats: row.formats ? row.formats.split(",") : [],
+    has_cover: !!row.has_cover,
+    pubdate: row.pubdate,
+    timestamp: row.timestamp,
+    rating: row.rating,
+  }));
+}
+
+// Search books by author name
+export function searchBooksByAuthor(authorName: string, limit: number = 10): BookListItem[] {
+  const db = getDb();
+  const searchTerm = `%${authorName.trim()}%`;
+
+  const query = `
+    SELECT
+      b.id,
+      b.title,
+      b.author_sort,
+      b.series_index,
+      b.has_cover,
+      b.pubdate,
+      b.timestamp,
+      s.name as series,
+      r.rating,
+      GROUP_CONCAT(DISTINCT a.name) as authors,
+      GROUP_CONCAT(DISTINCT t.name) as tags,
+      GROUP_CONCAT(DISTINCT d.format) as formats
+    FROM books b
+    LEFT JOIN books_authors_link bal ON b.id = bal.book
+    LEFT JOIN authors a ON bal.author = a.id
+    LEFT JOIN books_series_link bsl ON b.id = bsl.book
+    LEFT JOIN series s ON bsl.series = s.id
+    LEFT JOIN books_tags_link btl ON b.id = btl.book
+    LEFT JOIN tags t ON btl.tag = t.id
+    LEFT JOIN data d ON b.id = d.book
+    LEFT JOIN books_ratings_link brl ON b.id = brl.book
+    LEFT JOIN ratings r ON brl.rating = r.id
+    WHERE b.id IN (
+      SELECT bal2.book
+      FROM books_authors_link bal2
+      JOIN authors a2 ON bal2.author = a2.id
+      WHERE a2.name LIKE ? OR a2.sort LIKE ?
+    )
+    GROUP BY b.id
+    ORDER BY b.sort ASC
+    LIMIT ?
+  `;
+
+  const results = db.query(query).all(searchTerm, searchTerm, limit) as any[];
+
+  return results.map(row => ({
+    id: row.id,
+    title: row.title,
+    author_sort: row.author_sort,
+    authors: row.authors ? row.authors.split(",") : [],
+    series: row.series,
+    series_index: row.series_index || 1,
+    tags: row.tags ? row.tags.split(",") : [],
+    formats: row.formats ? row.formats.split(",") : [],
+    has_cover: !!row.has_cover,
+    pubdate: row.pubdate,
+    timestamp: row.timestamp,
+    rating: row.rating,
+  }));
+}
+
+// Get author info by name
+export function getAuthorByName(authorName: string): { name: string; bookCount: number } | null {
+  const db = getDb();
+  const searchTerm = `%${authorName.trim()}%`;
+
+  const query = `
+    SELECT a.name, COUNT(bal.book) as book_count
+    FROM authors a
+    LEFT JOIN books_authors_link bal ON a.id = bal.author
+    WHERE a.name LIKE ? OR a.sort LIKE ?
+    GROUP BY a.id
+    ORDER BY book_count DESC
+    LIMIT 1
+  `;
+
+  const result = db.query(query).get(searchTerm, searchTerm) as any;
+
+  if (!result) return null;
+
+  return {
+    name: result.name,
+    bookCount: result.book_count,
   };
 }
 

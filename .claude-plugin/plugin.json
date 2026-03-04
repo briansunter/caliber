@@ -1,0 +1,20 @@
+{
+  "name": "caliber-mcp",
+  "version": "1.0.0",
+  "description": "Connect Claude Code to Caliber library via MCP for book search",
+  "author": {
+    "name": "Caliber"
+  },
+  "license": "MIT",
+  "mcpServers": {
+    "caliber": {
+      "command": "bun",
+      "args": ["run", "/Volumes/Storage/code/caliber/src/mcp-server.ts"],
+      "env": {
+        "CALIBRE_LIBRARY_PATH": "/Users/bsunter/Desktop",
+        "CALIBRE_DB_NAME": "metadata 3.db"
+      }
+    }
+  },
+  "skills": ["./skills/"]
+}

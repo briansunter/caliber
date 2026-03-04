@@ -46,50 +46,24 @@ const BookCover = memo(function BookCover({
   if (!hasCover || hasError) {
     return (
       <div
-        className="relative w-full aspect-[2/3] bg-tertiary rounded flex flex-col items-center justify-center text-muted border border-default"
-        style={{
-          boxShadow: "0 4px 6px rgba(0,0,0,0.3), 0 10px 20px rgba(0,0,0,0.4)",
-        }}
+        className="relative w-full aspect-[2/3] bg-parchment-dark rounded-lg flex flex-col items-center justify-center text-ink-muted border border-ink"
       >
-        {/* Spine highlight */}
-        <div className="absolute left-0 top-0 bottom-0 w-2 bg-gradient-to-r from-white/10 to-transparent" />
-        <BookText className="h-16 w-16 mb-3 opacity-40" strokeWidth={1.5} />
-        <span className="text-xs uppercase tracking-widest opacity-60">No Cover</span>
+        <BookText className="h-12 w-12 mb-2 text-ink-muted/40" strokeWidth={1.5} />
+        <span className="text-xs text-ink-muted/60">No Cover</span>
       </div>
     );
   }
 
   return (
     <div className="relative group">
-      {/* Deep book shadow effect */}
-      <div
-        className="absolute -inset-3 rounded opacity-70 group-hover:opacity-90 transition-opacity duration-500"
-        style={{
-          background: "linear-gradient(135deg, rgba(0,0,0,0.4) 0%, rgba(0,0,0,0.6) 50%, rgba(0,0,0,0.8) 100%)",
-          filter: "blur(12px)",
-        }}
-      />
-
       {/* Book frame */}
       <div
-        className="relative bg-tertiary rounded p-1.5"
-        style={{
-          boxShadow: "0 4px 6px rgba(0,0,0,0.3), 0 10px 20px rgba(0,0,0,0.4)",
-        }}
+        className="relative bg-parchment-dark rounded-lg p-1.5 border border-ink shadow-lg"
       >
-        {/* Inner border for depth */}
-        <div className="relative overflow-hidden rounded border border-default">
-          {/* Spine highlight overlay */}
-          <div
-            className="absolute left-0 top-0 bottom-0 w-3 z-10 pointer-events-none"
-            style={{
-              background: "linear-gradient(90deg, rgba(255,255,255,0.1) 0%, transparent 100%)",
-            }}
-          />
-
+        <div className="relative overflow-hidden rounded-md border border-ink">
           {!isLoaded && (
-            <div className="absolute inset-0 flex items-center justify-center bg-tertiary">
-              <div className="h-8 w-8 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
+            <div className="absolute inset-0 flex items-center justify-center bg-parchment-dark">
+              <div className="h-6 w-6 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
             </div>
           )}
           <img
@@ -124,15 +98,15 @@ const MetadataRow = memo(function MetadataRow({
 }) {
   return (
     <div className="flex items-center gap-3 py-2">
-      <div className="flex items-center justify-center w-8 h-8 rounded bg-tertiary text-tertiary">
+      <div className="flex items-center justify-center w-8 h-8 rounded bg-parchment-dark text-ink-muted border border-ink">
         <Icon className="h-4 w-4" strokeWidth={1.5} />
       </div>
       <div className="flex-1 min-w-0">
-        <p className="text-xs uppercase tracking-widest text-muted">{label}</p>
+        <p className="text-xs uppercase tracking-widest text-ink-muted">{label}</p>
         <p
           className={cn(
             "text-sm truncate",
-            highlight ? "font-semibold text-primary" : "text-secondary"
+            highlight ? "font-semibold text-accent" : "text-ink-secondary"
           )}
         >
           {value}
@@ -168,7 +142,7 @@ const StarRating = memo(function StarRating({
               ? "fill-accent text-accent"
               : i === stars.fullStars && stars.hasHalfStar
                 ? "fill-accent/50 text-accent"
-                : "fill-tertiary text-muted"
+                : "fill-parchment-dark text-ink-muted"
           )}
           strokeWidth={1.5}
         />
@@ -194,10 +168,10 @@ const FormatButton = memo(function FormatButton({
       variant="outline"
       size="sm"
       onClick={handleDownload}
-      className="group relative overflow-hidden bg-secondary hover:bg-accent hover:text-primary border-default hover:border-accent text-primary transition-all duration-200 rounded-sm text-xs uppercase tracking-wider font-semibold"
+      className="group bg-text hover:bg-accent hover:text-white border-text hover:border-accent text-white transition-all duration-150 rounded text-xs uppercase tracking-wider font-semibold"
     >
-      <span className="relative z-10 flex items-center gap-2">
-        <Download className="h-3.5 w-3.5 transition-transform group-hover:-translate-y-0.5" strokeWidth={2} />
+      <span className="flex items-center gap-2">
+        <Download className="h-3.5 w-3.5" strokeWidth={2} />
         <span>{format.toUpperCase()}</span>
       </span>
     </Button>
@@ -209,7 +183,7 @@ const TagPill = memo(function TagPill({ tag }: { tag: string }) {
   return (
     <Badge
       variant="secondary"
-      className="px-3 py-1 bg-tertiary hover:bg-elevated text-secondary font-normal text-xs rounded-sm border border-default transition-colors cursor-default"
+      className="px-3 py-1 bg-parchment-dark hover:bg-parchment-warm text-ink-secondary font-normal text-xs rounded-md border border-ink transition-colors cursor-default"
     >
       {tag}
     </Badge>
@@ -219,10 +193,9 @@ const TagPill = memo(function TagPill({ tag }: { tag: string }) {
 // Ornamental divider
 const OrnamentalDivider = memo(function OrnamentalDivider() {
   return (
-    <div className="flex items-center justify-center gap-4 py-4">
-      <div className="h-px flex-1 bg-gradient-to-r from-transparent via-border-default to-transparent" />
-      <span className="text-muted text-lg">&#10087;</span>
-      <div className="h-px flex-1 bg-gradient-to-r from-transparent via-border-default to-transparent" />
+    <div className="flex items-center justify-center gap-4 py-5">
+      <div className="h-px flex-1 bg-border-default" />
+      <div className="h-px flex-1 bg-border-default" />
     </div>
   );
 });
@@ -256,12 +229,9 @@ export function BookDetail({ bookId }: BookDetailProps) {
   if (isLoading) {
     return (
       <div className="min-h-[60vh] flex items-center justify-center">
-        <div className="flex flex-col items-center gap-4">
-          <div className="relative">
-            <div className="h-12 w-12 animate-spin rounded-full border-2 border-accent/20 border-t-accent" />
-            <div className="absolute inset-0 h-12 w-12 animate-pulse rounded-full border border-accent/10" />
-          </div>
-          <p className="text-sm text-tertiary animate-pulse uppercase tracking-widest">Loading...</p>
+        <div className="flex flex-col items-center gap-3">
+          <div className="h-8 w-8 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
+          <p className="text-sm text-ink-muted">Loading...</p>
         </div>
       </div>
     );
@@ -271,11 +241,11 @@ export function BookDetail({ bookId }: BookDetailProps) {
     return (
       <div className="min-h-[60vh] flex items-center justify-center">
         <div className="text-center">
-          <div className="inline-flex items-center justify-center w-16 h-16 rounded bg-error/10 mb-4 border border-error/30">
-            <FileText className="h-8 w-8 text-error" strokeWidth={1.5} />
+          <div className="inline-flex items-center justify-center w-14 h-14 rounded bg-error/10 mb-3">
+            <FileText className="h-6 w-6 text-error" strokeWidth={1.5} />
           </div>
-          <h3 className="text-lg font-semibold text-error mb-1">Error loading book</h3>
-          <p className="text-sm text-tertiary">{error.message}</p>
+          <h3 className="text-base font-semibold text-error mb-1">Error loading book</h3>
+          <p className="text-sm text-ink-muted">{error.message}</p>
         </div>
       </div>
     );
@@ -285,11 +255,11 @@ export function BookDetail({ bookId }: BookDetailProps) {
     return (
       <div className="min-h-[60vh] flex items-center justify-center">
         <div className="text-center">
-          <div className="inline-flex items-center justify-center w-16 h-16 rounded bg-tertiary mb-4 border border-default">
-            <BookText className="h-8 w-8 text-muted" strokeWidth={1.5} />
+          <div className="inline-flex items-center justify-center w-14 h-14 rounded bg-parchment-dark mb-3 border border-ink">
+            <BookText className="h-6 w-6 text-ink-muted" strokeWidth={1.5} />
           </div>
-          <h3 className="text-lg font-semibold mb-1 text-primary">Book not found</h3>
-          <p className="text-sm text-tertiary">The book you&apos;re looking for doesn&apos;t exist.</p>
+          <h3 className="text-base font-semibold mb-1 text-ink">Book not found</h3>
+          <p className="text-sm text-ink-muted">The book you&apos;re looking for doesn&apos;t exist.</p>
         </div>
       </div>
     );
@@ -301,14 +271,14 @@ export function BookDetail({ bookId }: BookDetailProps) {
       <div className="grid grid-cols-1 lg:grid-cols-[300px_1fr] gap-8 lg:gap-12">
         {/* Left column - Cover and actions */}
         <div className="lg:col-span-1">
-          <div className="lg:sticky lg:top-8 space-y-6">
+          <div className="lg:sticky lg:top-24 space-y-6">
             {/* Book Cover */}
             <BookCover bookId={bookId} title={book.title} hasCover={book.has_cover} />
 
             {/* Download section */}
             {book.formats.length > 0 && (
               <div className="space-y-3">
-                <h3 className="text-xs font-semibold text-tertiary uppercase tracking-widest">Download</h3>
+                <h3 className="text-xs font-semibold text-ink-muted uppercase tracking-widest">Download</h3>
                 <div className="flex flex-wrap gap-2">
                   {book.formats.map((format) => (
                     <FormatButton key={format} format={format} bookId={bookId} />
@@ -318,7 +288,7 @@ export function BookDetail({ bookId }: BookDetailProps) {
             )}
 
             {/* Quick metadata */}
-            <div className="pt-4 border-t border-default space-y-1">
+            <div className="pt-4 border-t border-ink space-y-1">
               {book.rating && book.rating > 0 && (
                 <MetadataRow icon={Star} label="Rating" value={<StarRating rating={book.rating} />} />
               )}
@@ -336,30 +306,30 @@ export function BookDetail({ bookId }: BookDetailProps) {
           <div className="space-y-4">
             {/* Series badge */}
             {book.series && (
-              <div className="flex items-center gap-2 text-sm text-secondary">
-                <Bookmark className="h-4 w-4 text-accent" strokeWidth={1.5} />
+              <div className="flex items-center gap-2 text-sm text-ink-secondary">
+                <Bookmark className="h-4 w-4 text-accent" strokeWidth={2} />
                 <span className="font-medium">{book.series}</span>
-                <ChevronRight className="h-3 w-3 text-muted" />
-                <span className="text-xs bg-tertiary px-2 py-0.5 rounded-sm border border-default">
+                <ChevronRight className="h-3 w-3 text-ink-muted" />
+                <span className="text-xs bg-parchment-dark px-2 py-0.5 rounded-md border border-ink">
                   #{book.series_index}
                 </span>
               </div>
             )}
 
             {/* Title */}
-            <h1 className="text-3xl sm:text-4xl lg:text-5xl font-bold tracking-tight leading-[1.1] text-primary">
+            <h1 className="text-2xl sm:text-3xl lg:text-4xl font-semibold tracking-tight leading-tight text-ink">
               {book.title}
             </h1>
 
             {/* Author */}
             {authorNames && (
               <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded bg-accent-dim flex items-center justify-center border border-default">
-                  <User className="h-5 w-5 text-accent" strokeWidth={1.5} />
+                <div className="w-9 h-9 rounded bg-accent-subtle flex items-center justify-center">
+                  <User className="h-4 w-4 text-accent" strokeWidth={2} />
                 </div>
                 <div>
-                  <p className="text-xs text-muted uppercase tracking-widest font-medium">Author</p>
-                  <p className="text-lg font-medium text-primary">{authorNames}</p>
+                  <p className="text-xs text-ink-muted font-medium">Author</p>
+                  <p className="text-base font-medium text-ink">{authorNames}</p>
                 </div>
               </div>
             )}
@@ -376,7 +346,7 @@ export function BookDetail({ bookId }: BookDetailProps) {
           {/* Tags */}
           {book.tags.length > 0 && (
             <div className="space-y-3">
-              <h3 className="text-xs font-semibold text-muted uppercase tracking-widest">Tags</h3>
+              <h3 className="text-xs font-semibold text-ink-muted uppercase tracking-widest">Tags</h3>
               <div className="flex flex-wrap gap-2">
                 {book.tags.map((tag) => (
                   <TagPill key={tag} tag={tag} />
@@ -388,12 +358,12 @@ export function BookDetail({ bookId }: BookDetailProps) {
           {/* Description */}
           {book.comments && (
             <div className="space-y-4">
-              <h3 className="text-xs font-semibold text-muted uppercase tracking-widest flex items-center gap-2">
+              <h3 className="text-xs font-semibold text-ink-muted uppercase tracking-widest flex items-center gap-2">
                 <FileText className="h-4 w-4" strokeWidth={1.5} />
                 About this book
               </h3>
               <div
-                className="prose prose-invert prose-base max-w-none leading-relaxed text-secondary"
+                className="prose prose-base max-w-none leading-relaxed text-ink-secondary"
                 dangerouslySetInnerHTML={{ __html: book.comments }}
               />
             </div>
@@ -401,9 +371,9 @@ export function BookDetail({ bookId }: BookDetailProps) {
 
           {/* Empty state for no description */}
           {!book.comments && (
-            <div className="py-12 text-center border border-dashed border-default rounded bg-secondary/50">
-              <FileText className="h-10 w-10 mx-auto mb-3 text-muted" strokeWidth={1.5} />
-              <p className="text-sm text-muted">No description available for this book.</p>
+            <div className="py-10 text-center border border-dashed border-ink rounded-lg bg-parchment-dark/50">
+              <FileText className="h-8 w-8 mx-auto mb-2 text-ink-muted" strokeWidth={1.5} />
+              <p className="text-sm text-ink-muted">No description available for this book.</p>
             </div>
           )}
         </div>

@@ -13,6 +13,7 @@ import {
   initFTS,
   type BookListItem,
 } from "./lib/calibre-optimized";
+import { handleMCPRequest } from "./mcp";
 
 const LIBRARY_PATH = getLibraryPath();
 
@@ -122,6 +123,7 @@ async function* streamBooksJSON(
 }
 
 const server = serve({
+  port: process.env.PORT ? parseInt(process.env.PORT) : 3003,
   routes: {
     // Health check
     "/api/health": {
@@ -387,6 +389,22 @@ const server = serve({
           console.error("Error getting cover:", error);
           return Response.json(
             { error: "Failed to get cover" },
+            { status: 500 }
+          );
+        }
+      },
+    },
+
+    // MCP endpoint for AI tool integration
+    "/mcp": {
+      POST: async (req) => {
+        try {
+          const result = await handleMCPRequest(req);
+          return result;
+        } catch (error) {
+          console.error("MCP error:", error);
+          return Response.json(
+            { error: "MCP request failed" },
             { status: 500 }
           );
         }
