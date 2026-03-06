@@ -109,36 +109,18 @@ function IndexComponent() {
 
   return (
     <div className="min-h-screen bg-parchment paper-texture">
-      {/* Fixed Header */}
-      <header className="fixed top-0 left-0 right-0 z-50 border-b border-ink bg-white/80 backdrop-blur-md">
-        <div className="max-w-7xl mx-auto px-3 sm:px-6 py-2 sm:py-3">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2 sm:gap-3">
-              <div className="w-7 h-7 sm:w-9 sm:h-9 bg-ink rounded-lg flex items-center justify-center">
-                <Library className="h-3.5 w-3.5 sm:h-4 sm:w-4 text-white" strokeWidth={1.5} />
-              </div>
-              <div>
-                <h1 className="text-sm sm:text-base font-semibold text-ink tracking-tight">
-                  Caliber
-                </h1>
-                <p className="text-xs text-ink-muted hidden sm:block">Library</p>
-              </div>
-            </div>
-            <div className="hidden sm:flex items-center gap-2 text-ink-muted text-sm">
-              <span className="w-2 h-2 rounded-full bg-success"></span>
-              <span>Connected</span>
-            </div>
-          </div>
-        </div>
-      </header>
-
       {/* Main Content - Unified Scroll */}
-      <main className="max-w-7xl mx-auto px-3 sm:px-6 pt-14 sm:pt-20 pb-10">
+      <main className="max-w-7xl mx-auto px-3 sm:px-6 pt-4 sm:pt-8 pb-10">
         {/* Welcome Section */}
         <div className="mb-3 sm:mb-6">
-          <h2 className="text-base sm:text-xl font-semibold text-ink mb-0.5 sm:mb-1 tracking-tight">
-            Your Collection
-          </h2>
+          <div className="flex items-center gap-2 sm:gap-3 mb-1 sm:mb-2">
+            <div className="w-7 h-7 sm:w-9 sm:h-9 bg-ink rounded-lg flex items-center justify-center">
+              <Library className="h-3.5 w-3.5 sm:h-4 sm:w-4 text-white" strokeWidth={1.5} />
+            </div>
+            <h1 className="text-lg sm:text-2xl font-semibold text-ink tracking-tight">
+              Caliber
+            </h1>
+          </div>
           <p className="hidden sm:block text-sm text-ink-tertiary max-w-2xl">
             Browse, search, and download from your personal digital library.
             {stats?.totalBooks && ` ${stats.totalBooks.toLocaleString()} volumes.`}
@@ -164,8 +146,8 @@ function IndexComponent() {
           />
         </div>
 
-        {/* Search Bar + View Toggle - Sticky below header */}
-        <div className="sticky top-[41px] sm:top-[57px] z-40 -mx-1 sm:-mx-2 px-1 sm:px-2 py-1.5 sm:py-2.5 bg-parchment/95 backdrop-blur-sm border-y border-ink">
+        {/* Search Bar + View Toggle - Sticky at top */}
+        <div className="sticky top-0 z-40 -mx-1 sm:-mx-2 px-1 sm:px-2 py-1.5 sm:py-2.5 bg-parchment/95 backdrop-blur-sm border-y border-ink">
           <div className="flex items-center gap-2 sm:gap-3">
             <div className="flex-1 min-w-0">
               <BookSearch onSearch={setSearchQuery} initialValue={searchQuery} />
@@ -195,7 +177,7 @@ function IndexComponent() {
         {viewMode === "list" && (
           <>
             {/* Table Header - Sticky below search */}
-            <div className="sticky top-[85px] sm:top-[105px] z-30 bg-parchment-dark">
+            <div className="sticky top-[46px] sm:top-[56px] z-30 bg-parchment-dark">
               <TableHeader sortConfig={sortConfig} onSortChange={setSortConfig} />
             </div>
 

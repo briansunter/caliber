@@ -205,10 +205,14 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
 
         // Generate locations for progress (async, doesn't block)
         book.ready
-          .then(() => book.locations.generate(1600))
+          .then(() => {
+            if (cancelled) return;
+            return book.locations.generate(1600);
+          })
           .then(() => {
             if (!cancelled) setLocationsReady(true);
-          });
+          })
+          .catch(() => {});
 
         // Keyboard
         keyHandler = (e: KeyboardEvent) => {
@@ -223,8 +227,12 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
     return () => {
       cancelled = true;
       if (keyHandler) document.removeEventListener("keyup", keyHandler);
-      if (renditionRef.current) renditionRef.current.destroy();
-      if (bookRef.current) bookRef.current.destroy();
+      const r = renditionRef.current;
+      const b = bookRef.current;
+      renditionRef.current = null;
+      bookRef.current = null;
+      if (r) try { r.destroy(); } catch {}
+      if (b) try { b.destroy(); } catch {}
     };
   }, [url]);
 
@@ -236,6 +244,7 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
 
     const updateProgress = (location: any) => {
       try {
+        if (!book.locations || !location?.start?.cfi) return;
         const pct = book.locations.percentageFromCfi(location.start.cfi);
         setProgress(Math.round(pct * 100));
       } catch {}
