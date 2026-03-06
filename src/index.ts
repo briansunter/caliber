@@ -469,7 +469,7 @@ const server = serve({
         return new Response(file, {
           headers: {
             "Content-Type": "application/javascript",
-            "Cache-Control": "public, max-age=604800, immutable",
+            "Cache-Control": "no-cache",
           },
         });
       },

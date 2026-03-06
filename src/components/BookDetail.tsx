@@ -275,7 +275,9 @@ export function BookDetail({ bookId }: BookDetailProps) {
         <div className="lg:col-span-1">
           <div className="lg:sticky lg:top-24 space-y-6">
             {/* Book Cover */}
-            <BookCover bookId={bookId} title={book.title} hasCover={book.has_cover} />
+            <div className="max-w-[250px] mx-auto lg:max-w-none">
+              <BookCover bookId={bookId} title={book.title} hasCover={book.has_cover} />
+            </div>
 
             {/* Read button */}
             {book.formats.some((f) => f === "EPUB" || f === "PDF") && (

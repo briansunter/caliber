@@ -195,20 +195,17 @@ export function BookGridInfinite({ searchQuery, sortConfig }: BookGridInfinitePr
         </div>
       )}
 
-      <div className="px-4 py-3 border-t border-ink bg-parchment-dark flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <BookOpen className="h-4 w-4 text-accent" strokeWidth={2} />
-          <span className="text-sm font-medium text-ink">
+      <div className="px-3 sm:px-4 py-3 border-t border-ink bg-parchment-dark flex items-center justify-between gap-2 overflow-hidden">
+        <div className="flex items-center gap-2 min-w-0">
+          <BookOpen className="h-4 w-4 text-accent flex-shrink-0" strokeWidth={2} />
+          <span className="text-sm font-medium text-ink whitespace-nowrap">
             {books.length.toLocaleString()} book{books.length !== 1 ? "s" : ""}
           </span>
-          <span className="text-sm text-ink-muted">
+          <span className="text-sm text-ink-muted truncate">
             {searchQuery ? `matching "${searchQuery}"` : "loaded"}
           </span>
-          {hasNextPage && (
-            <span className="text-xs text-ink-muted">(more available)</span>
-          )}
         </div>
-        <div className="text-xs text-ink-muted">
+        <div className="text-xs text-ink-muted whitespace-nowrap hidden sm:block">
           {hasNextPage ? "Scroll to load more" : "All books loaded"}
         </div>
       </div>
