@@ -1,10 +1,22 @@
 import { Database } from "bun:sqlite";
 import { join } from "path";
+import { copyFileSync, mkdirSync } from "fs";
+import { homedir } from "os";
 
 // Use Desktop Calibre library
 const LIBRARY_PATH = process.env.CALIBRE_LIBRARY_PATH || "/Users/bsunter/Desktop";
 const DB_NAME = process.env.CALIBRE_DB_NAME || "metadata.db";
 const DB_PATH = join(LIBRARY_PATH, DB_NAME);
+
+// Writable copy in ~/.config/caliber for FTS support
+const WORK_DIR = join(homedir(), ".config", "caliber");
+const WRITABLE_DB_PATH = join(WORK_DIR, "metadata.db");
+
+function copyDbToWritable(): void {
+  mkdirSync(WORK_DIR, { recursive: true });
+  copyFileSync(DB_PATH, WRITABLE_DB_PATH);
+  console.log(`📋 Copied database to ${WRITABLE_DB_PATH}`);
+}
 
 // Connection pool for concurrent requests
 const dbPool: Database[] = [];
@@ -70,12 +82,13 @@ interface BookRow {
 function getDb(): Database {
   // Simple round-robin: return a db from the pool
   if (dbPool.length < MAX_POOL_SIZE) {
-    const db = new Database(DB_PATH, { readonly: true });
-    // Optimize for read-heavy workload (these are connection-level settings that work with readonly)
+    const db = new Database(WRITABLE_DB_PATH);
+    // Optimize for read-heavy workload
     try {
       db.exec("PRAGMA cache_size = -64000;"); // 64MB cache
       db.exec("PRAGMA temp_store = memory;");
       db.exec("PRAGMA mmap_size = 268435456;"); // 256MB memory map
+      db.exec("PRAGMA journal_mode = WAL;");
     } catch {
       // Ignore if these fail
     }
@@ -87,10 +100,43 @@ function getDb(): Database {
   return db;
 }
 
-// Initialize FTS5 virtual table if not exists
+// Initialize FTS5 virtual table on writable copy
 export function initFTS(): void {
-  // FTS requires write access, skip if readonly
-  console.log("FTS initialization skipped (requires write access)");
+  copyDbToWritable();
+  const db = getDb();
+
+  // Add indexes for sort performance
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_books_sort ON books(sort, id);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_books_author_sort ON books(author_sort, id);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_books_timestamp ON books(timestamp, id);`);
+
+  // Create FTS5 virtual table for full-text search
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS books_fts USING fts5(
+      title,
+      author_sort,
+      content='books',
+      content_rowid='id'
+    );
+  `);
+
+  // Always rebuild to ensure FTS content-sync table is populated correctly
+  console.log("🔍 Building FTS index...");
+  db.exec(`INSERT INTO books_fts(books_fts) VALUES('rebuild');`);
+  const total = db.query("SELECT COUNT(*) as count FROM books_fts").get() as { count: number };
+  console.log(`🔍 FTS index ready (${total.count} books)`);
+
+  // Warm up: run initial query to populate mmap/cache
+  console.log("🔥 Warming up database...");
+  db.query("SELECT COUNT(*) FROM books").get();
+  db.query(`
+    SELECT b.id FROM books b
+    LEFT JOIN books_authors_link bal ON b.id = bal.book
+    LEFT JOIN books_tags_link btl ON b.id = btl.book
+    LEFT JOIN data d ON b.id = d.book
+    ORDER BY b.sort ASC LIMIT 1
+  `).get();
+  console.log("🔥 Database warm");
 }
 
 // Build the optimized query using CTE for fast pagination
@@ -188,10 +234,18 @@ function parseBookDetailsRow(row: BookRow): BookWithDetails {
 
 // Encode cursor from book data
 function encodeCursor(book: BookListItem, sortField: string): string {
-  const cursorData = {
-    id: book.id,
-    sort: sortField === "title" ? book.title.toLowerCase() : book.id,
-  };
+  let sortVal: string | number;
+  switch (sortField) {
+    case "title":
+      sortVal = book.title.toLowerCase();
+      break;
+    case "author":
+      sortVal = (book.author_sort || "").toLowerCase();
+      break;
+    default:
+      sortVal = book.id;
+  }
+  const cursorData = { id: book.id, sort: sortVal };
   return Buffer.from(JSON.stringify(cursorData)).toString("base64url");
 }
 
@@ -215,7 +269,7 @@ interface ListOptions {
 // Cursor-based paginated list with CTE for O(1) performance
 export function listBooksCursor(options: ListOptions = {}): CursorPaginatedResult<BookListItem> {
   const db = getDb();
-  const limit = Math.min(options.limit || 50, 100);
+  const limit = Math.min(options.limit || 100, 200);
   const sortBy = options.sortBy || "title";
   const sortOrder = options.sortOrder || "asc";
 
@@ -225,12 +279,14 @@ export function listBooksCursor(options: ListOptions = {}): CursorPaginatedResul
   if (options.cursor) {
     const cursorData = decodeCursor(options.cursor);
     if (cursorData) {
+      const sortOp = sortOrder === "asc" ? ">" : "<";
       if (sortBy === "title") {
-        const sortOp = sortOrder === "asc" ? ">" : "<";
         bookWhere += ` AND (b.sort ${sortOp} ? OR (b.sort = ? AND b.id ${sortOp} ?))`;
         params.push(cursorData.sort as string, cursorData.sort as string, cursorData.id);
+      } else if (sortBy === "author") {
+        bookWhere += ` AND (b.author_sort ${sortOp} ? OR (b.author_sort = ? AND b.id ${sortOp} ?))`;
+        params.push(cursorData.sort as string, cursorData.sort as string, cursorData.id);
       } else {
-        const sortOp = sortOrder === "asc" ? ">" : "<";
         bookWhere += ` AND b.id ${sortOp} ?`;
         params.push(cursorData.id);
       }
@@ -256,42 +312,19 @@ export function listBooksCursor(options: ListOptions = {}): CursorPaginatedResul
       bookOrderBy = `ORDER BY b.sort ASC, b.id ASC`;
   }
 
-  // Use CTE for efficient pagination
+  // Lightweight list query — only fields needed for list/grid view
   const query = `
     WITH book_page AS (
-      SELECT
-        b.id,
-        b.title,
-        b.sort,
-        b.author_sort,
-        b.series_index,
-        b.has_cover,
-        b.pubdate,
-        b.timestamp,
-        b.isbn,
-        b.uuid,
-        b.path
+      SELECT b.id, b.title, b.sort, b.author_sort, b.series_index, b.has_cover, b.pubdate, b.timestamp
       FROM books b
       ${bookWhere}
       ${bookOrderBy}
       LIMIT ${limit + 1}
     )
     SELECT
-      b.id,
-      b.title,
-      b.sort,
-      b.author_sort,
-      b.series_index,
-      b.has_cover,
-      b.pubdate,
-      b.timestamp,
-      b.isbn,
-      b.uuid,
-      b.path,
+      b.id, b.title, b.sort, b.author_sort, b.series_index, b.has_cover, b.pubdate, b.timestamp,
       s.name as series,
       r.rating,
-      p.name as publisher,
-      c.text as comments,
       GROUP_CONCAT(DISTINCT a.name) as authors,
       GROUP_CONCAT(DISTINCT t.name) as tags,
       GROUP_CONCAT(DISTINCT d.format) as formats
@@ -305,9 +338,6 @@ export function listBooksCursor(options: ListOptions = {}): CursorPaginatedResul
     LEFT JOIN data d ON b.id = d.book
     LEFT JOIN books_ratings_link brl ON b.id = brl.book
     LEFT JOIN ratings r ON brl.rating = r.id
-    LEFT JOIN books_publishers_link bpl ON b.id = bpl.book
-    LEFT JOIN publishers p ON bpl.publisher = p.id
-    LEFT JOIN comments c ON b.id = c.book
     GROUP BY b.id
     ${bookOrderBy}
   `;
@@ -331,7 +361,7 @@ interface SearchOptions extends ListOptions {
   query: string;
 }
 
-// Helper function to build the full query with CTE
+// Helper function to build lightweight list query with CTE
 function buildBookQuery(
   bookWhere: string,
   bookOrderBy: string,
@@ -340,39 +370,16 @@ function buildBookQuery(
 ): string {
   return `
     WITH book_page AS (
-      SELECT
-        b.id,
-        b.title,
-        b.sort,
-        b.author_sort,
-        b.series_index,
-        b.has_cover,
-        b.pubdate,
-        b.timestamp,
-        b.isbn,
-        b.uuid,
-        b.path
+      SELECT b.id, b.title, b.sort, b.author_sort, b.series_index, b.has_cover, b.pubdate, b.timestamp
       FROM books b
       ${bookWhere}
       ${bookOrderBy}
       LIMIT ${limit}
     )
     SELECT
-      b.id,
-      b.title,
-      b.sort,
-      b.author_sort,
-      b.series_index,
-      b.has_cover,
-      b.pubdate,
-      b.timestamp,
-      b.isbn,
-      b.uuid,
-      b.path,
+      b.id, b.title, b.sort, b.author_sort, b.series_index, b.has_cover, b.pubdate, b.timestamp,
       s.name as series,
       r.rating,
-      p.name as publisher,
-      c.text as comments,
       GROUP_CONCAT(DISTINCT a.name) as authors,
       GROUP_CONCAT(DISTINCT t.name) as tags,
       GROUP_CONCAT(DISTINCT d.format) as formats
@@ -386,9 +393,6 @@ function buildBookQuery(
     LEFT JOIN data d ON b.id = d.book
     LEFT JOIN books_ratings_link brl ON b.id = brl.book
     LEFT JOIN ratings r ON brl.rating = r.id
-    LEFT JOIN books_publishers_link bpl ON b.id = bpl.book
-    LEFT JOIN publishers p ON bpl.publisher = p.id
-    LEFT JOIN comments c ON b.id = c.book
     GROUP BY b.id
     ${bookOrderBy}
   `;
@@ -397,22 +401,87 @@ function buildBookQuery(
 // FTS-powered search with cursor pagination
 export function searchBooksCursor(options: SearchOptions): CursorPaginatedResult<BookListItem> {
   const db = getDb();
-  const limit = Math.min(options.limit || 50, 100);
+  const limit = Math.min(options.limit || 100, 200);
   const searchQuery = options.query.trim();
 
   if (!searchQuery) {
     return listBooksCursor(options);
   }
 
-  // Use LIKE-based search (fallback since FTS requires write access)
-  return fallbackSearch(options);
+  // Use FTS5 for fast full-text search
+  return ftsSearch(options);
+}
+
+// FTS5-powered search
+function ftsSearch(options: SearchOptions): CursorPaginatedResult<BookListItem> {
+  const db = getDb();
+  const limit = Math.min(options.limit || 100, 200);
+
+  // Build FTS query: quote each word and join with AND
+  const words = options.query.trim().split(/\s+/).filter(w => w.length > 0);
+  if (words.length === 0) {
+    return listBooksCursor({ ...options, limit });
+  }
+
+  // Escape double quotes and wrap each word as a prefix search
+  const ftsQuery = words.map(w => `"${w.replace(/"/g, '""')}"*`).join(" AND ");
+  const params: (string | number)[] = [ftsQuery];
+
+  let bookWhere = `WHERE b.id IN (SELECT rowid FROM books_fts WHERE books_fts MATCH ?)`;
+
+  const sortBy = options.sortBy || "title";
+  const sortOrder = options.sortOrder || "asc";
+  const dir = sortOrder.toUpperCase();
+
+  if (options.cursor) {
+    const cursorData = decodeCursor(options.cursor);
+    if (cursorData) {
+      if (sortBy === "title") {
+        const sortOp = sortOrder === "asc" ? ">" : "<";
+        bookWhere += ` AND (b.sort ${sortOp} ? OR (b.sort = ? AND b.id ${sortOp} ?))`;
+        params.push(cursorData.sort as string, cursorData.sort as string, cursorData.id);
+      } else if (sortBy === "author") {
+        const sortOp = sortOrder === "asc" ? ">" : "<";
+        bookWhere += ` AND (b.author_sort ${sortOp} ? OR (b.author_sort = ? AND b.id ${sortOp} ?))`;
+        params.push(cursorData.sort as string, cursorData.sort as string, cursorData.id);
+      } else {
+        const sortOp = sortOrder === "asc" ? ">" : "<";
+        bookWhere += ` AND b.id ${sortOp} ?`;
+        params.push(cursorData.id);
+      }
+    }
+  }
+
+  let bookOrderBy: string;
+  switch (sortBy) {
+    case "author":
+      bookOrderBy = `ORDER BY b.author_sort ${dir}, b.id ${dir}`;
+      break;
+    case "added":
+      bookOrderBy = `ORDER BY b.timestamp ${dir}, b.id ${dir}`;
+      break;
+    case "rating":
+      bookOrderBy = `ORDER BY b.id ${dir}`;
+      break;
+    default:
+      bookOrderBy = `ORDER BY b.sort ${dir}, b.id ${dir}`;
+  }
+  const query = buildBookQuery(bookWhere, bookOrderBy, limit + 1, params);
+  const rows = db.query(query).all(...params) as BookRow[];
+
+  const hasMore = rows.length > limit;
+  const items = rows.slice(0, limit).map(parseBookRow);
+  const lastItem = items[items.length - 1];
+  const nextCursor = hasMore && lastItem ? encodeCursor(lastItem, sortBy) : null;
+
+  return { items, nextCursor, hasMore };
 }
 
 // Fallback LIKE-based search - searches title, author, and series
 // Supports multi-word queries - all words must match (AND logic)
 function fallbackSearch(options: SearchOptions): CursorPaginatedResult<BookListItem> {
   const db = getDb();
-  const limit = Math.min(options.limit || 50, 100);
+  const limit = Math.min(options.limit || 100, 200);
 
   // Split query into words and create individual search terms
   const words = options.query.trim().split(/\s+/).filter(w => w.length > 0);

@@ -1,6 +1,6 @@
-import { useMemo, memo, useEffect, useState, useCallback } from "react";
+import { memo, useEffect, useCallback, useRef, useState } from "react";
 import { useWindowVirtualizer } from "@tanstack/react-virtual";
-import { useBooksInfinite, useSearchInfinite, type SortConfig, type SortField } from "@/hooks/useBooksInfinite";
+import { useFlattenedBooks, type SortConfig, type SortField } from "@/hooks/useBooksInfinite";
 import type { BookListItem } from "@/lib/calibre-optimized";
 import { Link } from "@tanstack/react-router";
 import {
@@ -30,37 +30,9 @@ const COLUMN_WIDTHS = {
 };
 
 export const GRID_TEMPLATE = `${COLUMN_WIDTHS.title} ${COLUMN_WIDTHS.authors} ${COLUMN_WIDTHS.series} ${COLUMN_WIDTHS.tags} ${COLUMN_WIDTHS.rating} ${COLUMN_WIDTHS.formats} ${COLUMN_WIDTHS.actions}`;
+const GRID_TEMPLATE_MOBILE = `1fr minmax(80px, auto) 40px`;
 
 const ROW_HEIGHT = 72;
-
-// Flatten infinite query pages into a single array
-function useFlattenedBooks(searchQuery: string, sortConfig: SortConfig) {
-  const booksQuery = useBooksInfinite(sortConfig);
-  const searchQueryHook = useSearchInfinite(searchQuery, sortConfig);
-
-  const query = searchQuery.trim() ? searchQueryHook : booksQuery;
-
-  const flattenedBooks = useMemo(() => {
-    return query.data?.pages.flatMap((page) => page.items) ?? [];
-  }, [query.data]);
-
-  const hasNextPage = query.hasNextPage;
-  const fetchNextPage = query.fetchNextPage;
-  const isFetchingNextPage = query.isFetchingNextPage;
-  const isLoading = query.isLoading;
-  const isError = query.isError;
-  const error = query.error;
-
-  return {
-    books: flattenedBooks,
-    hasNextPage,
-    fetchNextPage,
-    isFetchingNextPage,
-    isLoading,
-    isError,
-    error,
-  };
-}
 
 // Star rating component
 const StarRating = memo(function StarRating({
@@ -115,8 +87,18 @@ const TitleCell = memo(function TitleCell({
       <div
         className="relative flex-shrink-0 w-9 h-12 rounded bg-parchment-dark overflow-hidden flex items-center justify-center border border-ink"
       >
-        <BookOpen className="h-4 w-4 text-ink-muted" strokeWidth={1.5} />
-        {hasCover && <div className="absolute bottom-0 left-0 right-0 h-1 bg-accent" />}
+        {hasCover ? (
+          <img
+            src={`/api/books/${id}/thumb`}
+            alt=""
+            loading="lazy"
+            decoding="async"
+            fetchPriority="low"
+            className="w-full h-full object-cover"
+          />
+        ) : (
+          <BookOpen className="h-4 w-4 text-ink-muted" strokeWidth={1.5} />
+        )}
       </div>
       <span className="font-medium text-ink-secondary group-hover:text-accent transition-colors line-clamp-2">
         {title}
@@ -225,19 +207,31 @@ interface TableRowProps {
 const TableRow = memo(function TableRow({ book }: TableRowProps) {
   return (
     <div
-      className="flex items-center px-4 border-b border-parchment hover:bg-parchment-dark transition-colors"
+      className="flex items-center px-3 sm:px-4 border-b border-parchment hover:bg-parchment-dark transition-colors"
       style={{ height: `${ROW_HEIGHT}px` }}
     >
+      {/* Mobile layout */}
       <div
-        className="w-full h-full items-center"
-        style={{ display: "grid", gridTemplateColumns: GRID_TEMPLATE, gap: "1rem" }}
+        className="w-full h-full items-center grid sm:!hidden"
+        style={{ gridTemplateColumns: GRID_TEMPLATE_MOBILE, gap: "0.5rem" }}
+      >
+        <div className="flex items-center min-w-0 py-2 overflow-hidden">
+          <TitleCell title={book.title} id={book.id} hasCover={book.has_cover} />
+        </div>
+        <div className="flex items-center min-w-0 py-2 overflow-hidden">
+          <span className="text-xs text-ink-tertiary truncate">{book.authors?.length ? book.authors[0] : "Unknown"}</span>
+        </div>
+        <div className="flex items-center justify-end py-2">
+          <ActionsCell id={book.id} />
+        </div>
+      </div>
+      {/* Desktop layout */}
+      <div
+        className="w-full h-full items-center hidden sm:!grid"
+        style={{ gridTemplateColumns: GRID_TEMPLATE, gap: "1rem" }}
       >
         <div className="flex items-center min-w-0 py-3 overflow-hidden">
-          <TitleCell
-            title={book.title}
-            id={book.id}
-            hasCover={book.has_cover}
-          />
+          <TitleCell title={book.title} id={book.id} hasCover={book.has_cover} />
         </div>
         <div className="flex items-center min-w-0 py-3 overflow-hidden">
           <AuthorsCell authors={book.authors} />
@@ -361,30 +355,24 @@ export const TableHeader = memo(function TableHeader({ sortConfig, onSortChange 
   );
 
   return (
-    <div className="px-4 h-12 items-center border-b border-ink" style={{ display: "grid", gridTemplateColumns: GRID_TEMPLATE, gap: "1rem" }}>
-      <SortHeader
-        label="Title"
-        field="title"
-        currentSort={sortConfig}
-        onSort={handleSort}
-      />
-      <SortHeader
-        label="Author"
-        field="author"
-        currentSort={sortConfig}
-        onSort={handleSort}
-      />
-      <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">Series</span>
-      <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">Tags</span>
-      <SortHeader
-        label="Rating"
-        field="rating"
-        currentSort={sortConfig}
-        onSort={handleSort}
-      />
-      <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">Formats</span>
-      <span></span>
-    </div>
+    <>
+      {/* Mobile header */}
+      <div className="px-3 h-10 items-center border-b border-ink grid sm:!hidden" style={{ gridTemplateColumns: GRID_TEMPLATE_MOBILE, gap: "0.5rem" }}>
+        <SortHeader label="Title" field="title" currentSort={sortConfig} onSort={handleSort} />
+        <SortHeader label="Author" field="author" currentSort={sortConfig} onSort={handleSort} />
+        <span></span>
+      </div>
+      {/* Desktop header */}
+      <div className="px-4 h-12 items-center border-b border-ink hidden sm:!grid" style={{ gridTemplateColumns: GRID_TEMPLATE, gap: "1rem" }}>
+        <SortHeader label="Title" field="title" currentSort={sortConfig} onSort={handleSort} />
+        <SortHeader label="Author" field="author" currentSort={sortConfig} onSort={handleSort} />
+        <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">Series</span>
+        <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">Tags</span>
+        <SortHeader label="Rating" field="rating" currentSort={sortConfig} onSort={handleSort} />
+        <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">Formats</span>
+        <span></span>
+      </div>
+    </>
   );
 });
 
@@ -402,54 +390,47 @@ export function BookTableInfinite({
     error,
   } = useFlattenedBooks(searchQuery, sortConfig);
 
-  const [isAutoFetching, setIsAutoFetching] = useState(false);
-
   // Set up window virtualizer - uses window scroll
   const virtualizer = useWindowVirtualizer({
     count: books.length,
-    estimateSize: () => ROW_HEIGHT,
-    overscan: 10,
-    scrollPaddingStart: 200, // Offset for fixed header
+    estimateSize: useCallback(() => ROW_HEIGHT, []),
+    overscan: 20,
+    scrollPaddingStart: 200,
   });
 
   const virtualItems = virtualizer.getVirtualItems();
   const totalSize = virtualizer.getTotalSize();
 
-  // Infinite scroll: fetch more when near bottom
+  // Infinite scroll — no extra state, just derive from virtualizer position
+  const lastVirtualItem = virtualItems[virtualItems.length - 1];
+  const shouldFetch = lastVirtualItem && lastVirtualItem.index >= books.length - 30
+    && hasNextPage && !isFetchingNextPage;
+
+  const fetchRef = useRef(fetchNextPage);
+  fetchRef.current = fetchNextPage;
+
   useEffect(() => {
-    if (!virtualItems.length || !hasNextPage || isFetchingNextPage) return;
-
-    const lastItem = virtualItems[virtualItems.length - 1];
-    if (!lastItem) return;
-
-    const isNearBottom = lastItem.index >= books.length - 20;
-
-    if (isNearBottom && !isAutoFetching) {
-      setIsAutoFetching(true);
-      fetchNextPage().finally(() => {
-        setIsAutoFetching(false);
-      });
+    if (shouldFetch) {
+      fetchRef.current();
     }
-  }, [virtualItems, books.length, hasNextPage, isFetchingNextPage, fetchNextPage, isAutoFetching]);
+  }, [shouldFetch]);
 
-  // Scroll to top when search or sort changes
+  // Scroll to top when search or sort changes (skip initial mount for scroll restoration)
+  const hasMountedTable = useRef(false);
   useEffect(() => {
-    window.scrollTo({ top: 0, behavior: "smooth" });
-    virtualizer.scrollToIndex(0);
-  }, [searchQuery, sortConfig, virtualizer]);
+    if (hasMountedTable.current) {
+      window.scrollTo({ top: 0 });
+    }
+    hasMountedTable.current = true;
+  }, [searchQuery, sortConfig]);
 
   if (isLoading) {
     return (
       <div className="overflow-hidden">
         <div className="table-header">
-          <div className="px-4 h-12 items-center" style={{ display: "grid", gridTemplateColumns: GRID_TEMPLATE, gap: "1rem" }}>
+          <div className="px-3 sm:px-4 h-10 sm:h-12 flex items-center gap-4">
             <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">Title</span>
             <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">Author</span>
-            <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">Series</span>
-            <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">Tags</span>
-            <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">Rating</span>
-            <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">Formats</span>
-            <span></span>
           </div>
         </div>
         <TableSkeleton />
@@ -499,7 +480,7 @@ export function BookTableInfinite({
       </div>
 
       {/* Loading indicator at bottom */}
-      {(isFetchingNextPage || isAutoFetching) && (
+      {isFetchingNextPage && (
         <div className="flex items-center justify-center py-4 border-t border-parchment">
           <div className="flex items-center gap-2 text-ink-muted">
             <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />

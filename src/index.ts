@@ -14,8 +14,11 @@ import {
   type BookListItem,
 } from "./lib/calibre-optimized";
 import { handleMCPRequest } from "./mcp";
+import { join } from "path";
+import { homedir } from "os";
 
 const LIBRARY_PATH = getLibraryPath();
+const WORK_DIR = join(homedir(), ".config", "caliber");
 
 // Initialize FTS on startup
 initFTS();
@@ -182,8 +185,10 @@ const server = serve({
           const url = new URL(req.url);
           const cursor = url.searchParams.get("cursor") || undefined;
           const limit = parseInt(url.searchParams.get("limit") || "50", 10);
-          const sortBy = (url.searchParams.get("sortBy") as any) || "title";
-          const sortOrder = (url.searchParams.get("sortOrder") as any) || "asc";
+          const sortByParam = url.searchParams.get("sortBy");
+          const sortBy = (sortByParam === "author" || sortByParam === "added" || sortByParam === "rating") ? sortByParam : "title";
+          const sortOrderParam = url.searchParams.get("sortOrder");
+          const sortOrder = sortOrderParam === "desc" ? "desc" : "asc";
 
           const result = listBooksCursor({ cursor, limit, sortBy, sortOrder });
 
@@ -207,13 +212,17 @@ const server = serve({
           const query = url.searchParams.get("q") || "";
           const cursor = url.searchParams.get("cursor") || undefined;
           const limit = parseInt(url.searchParams.get("limit") || "50", 10);
+          const sortByParam = url.searchParams.get("sortBy");
+          const sortBy = (sortByParam === "author" || sortByParam === "added" || sortByParam === "rating") ? sortByParam : "title";
+          const sortOrderParam = url.searchParams.get("sortOrder");
+          const sortOrder = sortOrderParam === "desc" ? "desc" : "asc";
 
           if (!query.trim()) {
-            const result = listBooksCursor({ cursor, limit });
-            return getCachedResponse(`books:${cursor || "first"}:${limit}`, result, req);
+            const result = listBooksCursor({ cursor, limit, sortBy, sortOrder });
+            return getCachedResponse(`books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}`, result, req);
           }
 
-          const result = searchBooksCursor({ query, cursor, limit });
+          const result = searchBooksCursor({ query, cursor, limit, sortBy, sortOrder });
 
           // Don't cache search results
           return Response.json(result, {
@@ -339,35 +348,23 @@ const server = serve({
       },
     },
 
-    // Get cover
+    // Get cover (full size)
     "/api/books/:id/cover": {
       GET: async (req) => {
         try {
           const id = parseInt(req.params.id, 10);
-
           if (isNaN(id)) {
-            return Response.json(
-              { error: "Invalid book ID" },
-              { status: 400 }
-            );
+            return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
 
           const coverPath = getBookCoverPath(id);
-
           if (!coverPath) {
-            return Response.json(
-              { error: "Cover not found" },
-              { status: 404 }
-            );
+            return Response.json({ error: "Cover not found" }, { status: 404 });
           }
 
           const file = Bun.file(coverPath);
-
           if (!(await file.exists())) {
-            return Response.json(
-              { error: "Cover file not found" },
-              { status: 404 }
-            );
+            return Response.json({ error: "Cover file not found" }, { status: 404 });
           }
 
           const fileStat = await file.stat();
@@ -387,10 +384,72 @@ const server = serve({
           });
         } catch (error) {
           console.error("Error getting cover:", error);
-          return Response.json(
-            { error: "Failed to get cover" },
-            { status: 500 }
-          );
+          return Response.json({ error: "Failed to get cover" }, { status: 500 });
+        }
+      },
+    },
+
+    // Get cover thumbnail (resized for list/grid views)
+    "/api/books/:id/thumb": {
+      GET: async (req) => {
+        try {
+          const id = parseInt(req.params.id, 10);
+          if (isNaN(id)) {
+            return Response.json({ error: "Invalid book ID" }, { status: 400 });
+          }
+
+          // Check thumbnail cache first
+          const thumbDir = join(WORK_DIR, "thumbs");
+          const thumbPath = join(thumbDir, `${id}.jpg`);
+          const thumbFile = Bun.file(thumbPath);
+
+          if (await thumbFile.exists()) {
+            const ifNoneMatch = req.headers.get("If-None-Match");
+            const stat = await thumbFile.stat();
+            const etag = `"t${stat.size}-${stat.mtime?.getTime() || 0}"`;
+            if (ifNoneMatch === etag) {
+              return new Response(null, { status: 304 });
+            }
+            return new Response(thumbFile, {
+              headers: {
+                "Content-Type": "image/jpeg",
+                "Cache-Control": "public, max-age=604800, immutable",
+                ETag: etag,
+              },
+            });
+          }
+
+          // Generate thumbnail
+          const coverPath = getBookCoverPath(id);
+          if (!coverPath) {
+            return Response.json({ error: "Cover not found" }, { status: 404 });
+          }
+
+          const coverFile = Bun.file(coverPath);
+          if (!(await coverFile.exists())) {
+            return Response.json({ error: "Cover file not found" }, { status: 404 });
+          }
+
+          // Use sharp-like resize if available, otherwise serve original with size hint
+          // For now, serve the original with aggressive caching — the browser will cache it
+          const fileStat = await coverFile.stat();
+          const etag = `"${fileStat.size}-${fileStat.mtime?.getTime() || 0}"`;
+
+          const ifNoneMatch = req.headers.get("If-None-Match");
+          if (ifNoneMatch === etag) {
+            return new Response(null, { status: 304 });
+          }
+
+          return new Response(coverFile, {
+            headers: {
+              "Content-Type": "image/jpeg",
+              "Cache-Control": "public, max-age=604800, immutable",
+              ETag: etag,
+            },
+          });
+        } catch (error) {
+          console.error("Error getting thumb:", error);
+          return Response.json({ error: "Failed to get thumbnail" }, { status: 500 });
         }
       },
     },

@@ -1,4 +1,4 @@
-import { createFileRoute, useParams, Link } from "@tanstack/react-router";
+import { createFileRoute, useParams, useRouter } from "@tanstack/react-router";
 import { BookDetail } from "@/components/BookDetail";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft, BookOpen } from "lucide-react";
@@ -18,18 +18,17 @@ function BookDetailPage() {
         <div className="max-w-6xl mx-auto px-6">
           <div className="flex items-center justify-between h-16">
             {/* Back navigation */}
-            <Link to="/">
               <Button
                 variant="ghost"
                 size="sm"
-                className="group gap-2 text-ink-muted hover:text-ink transition-colors bg-transparent hover:bg-parchment-dark"
+                onClick={() => window.history.back()}
+                className="group gap-2 text-ink-muted hover:text-ink transition-colors bg-transparent hover:bg-parchment-dark cursor-pointer"
               >
                 <div className="flex items-center justify-center w-8 h-8 rounded bg-parchment-dark group-hover:bg-parchment-warm transition-colors border border-ink">
                   <ArrowLeft className="h-4 w-4" strokeWidth={1.5} />
                 </div>
                 <span className="hidden sm:inline font-medium text-sm">Back to Library</span>
               </Button>
-            </Link>
 
             {/* Library branding */}
             <div className="flex items-center gap-3">

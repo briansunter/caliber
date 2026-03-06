@@ -1,7 +1,9 @@
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, keepPreviousData } from "@tanstack/react-query";
+import { useMemo } from "react";
 import type { BookListItem, CursorPaginatedResult } from "@/lib/calibre-optimized";
 
 const API_BASE = "/api";
+const PAGE_SIZE = 100;
 
 export type SortField = "title" | "author" | "added" | "rating";
 export type SortOrder = "asc" | "desc";
@@ -23,14 +25,14 @@ async function fetchBooks({
   sortOrder: SortOrder;
 }): Promise<BooksResponse> {
   const params = new URLSearchParams();
-  params.set("limit", "50");
+  params.set("limit", String(PAGE_SIZE));
   params.set("sortBy", sortBy);
   params.set("sortOrder", sortOrder);
   if (pageParam) {
     params.set("cursor", pageParam);
   }
 
-  const response = await fetch(`${API_BASE}/books?${params}`);
+  const response = await fetch(`${API_BASE}/books?${params}`, { priority: "high" });
   if (!response.ok) {
     throw new Error("Failed to fetch books");
   }
@@ -49,7 +51,7 @@ async function searchBooks({
   sortOrder: SortOrder;
 }): Promise<BooksResponse> {
   const params = new URLSearchParams();
-  params.set("limit", "50");
+  params.set("limit", String(PAGE_SIZE));
   params.set("q", query);
   params.set("sortBy", sortBy);
   params.set("sortOrder", sortOrder);
@@ -57,7 +59,7 @@ async function searchBooks({
     params.set("cursor", pageParam);
   }
 
-  const response = await fetch(`${API_BASE}/books/search?${params}`);
+  const response = await fetch(`${API_BASE}/books/search?${params}`, { priority: "high" });
   if (!response.ok) {
     throw new Error("Failed to search books");
   }
@@ -76,8 +78,10 @@ export function useBooksInfinite(sortConfig: SortConfig = { field: "title", orde
       }),
     getNextPageParam: (lastPage) => lastPage.nextCursor,
     initialPageParam: undefined as string | undefined,
-    staleTime: 1000 * 60, // 1 minute
-    gcTime: 1000 * 5 * 60, // 5 minutes
+    placeholderData: keepPreviousData,
+    staleTime: 1000 * 60 * 5,
+    gcTime: 1000 * 60 * 10,
+    maxPages: 50,
   });
 }
 
@@ -95,9 +99,33 @@ export function useSearchInfinite(query: string, sortConfig: SortConfig = { fiel
     getNextPageParam: (lastPage) => lastPage.nextCursor,
     initialPageParam: undefined as string | undefined,
     enabled: query.trim().length > 0,
-    staleTime: 1000 * 30, // 30 seconds for search
-    gcTime: 1000 * 60, // 1 minute
+    placeholderData: keepPreviousData,
+    staleTime: 1000 * 60,
+    gcTime: 1000 * 60 * 5,
+    maxPages: 20,
   });
+}
+
+// Shared hook: flattens pages and exposes fetch controls
+export function useFlattenedBooks(searchQuery: string, sortConfig: SortConfig) {
+  const isSearching = searchQuery.trim().length > 0;
+  const booksQuery = useBooksInfinite(sortConfig);
+  const searchQueryHook = useSearchInfinite(searchQuery, sortConfig);
+  const query = isSearching ? searchQueryHook : booksQuery;
+
+  const books = useMemo(() => {
+    return query.data?.pages.flatMap((page) => page.items) ?? [];
+  }, [query.data]);
+
+  return {
+    books,
+    hasNextPage: query.hasNextPage ?? false,
+    fetchNextPage: query.fetchNextPage,
+    isFetchingNextPage: query.isFetchingNextPage,
+    isLoading: query.isLoading,
+    isError: query.isError,
+    error: query.error,
+  };
 }
 
 // Hook for library stats
@@ -116,7 +144,7 @@ export function useLibraryStats() {
         totalTags: number;
       }>;
     },
-    staleTime: 1000 * 60 * 5, // 5 minutes
+    staleTime: 1000 * 60 * 5,
   });
 }
 
