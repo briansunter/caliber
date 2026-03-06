@@ -454,6 +454,27 @@ const server = serve({
       },
     },
 
+    // Serve PDF.js worker
+    "/pdfjs/pdf.worker.min.mjs": {
+      GET: async () => {
+        const workerPath = join(
+          import.meta.dir,
+          "..",
+          "node_modules",
+          "pdfjs-dist",
+          "build",
+          "pdf.worker.min.mjs"
+        );
+        const file = Bun.file(workerPath);
+        return new Response(file, {
+          headers: {
+            "Content-Type": "application/javascript",
+            "Cache-Control": "public, max-age=604800, immutable",
+          },
+        });
+      },
+    },
+
     // MCP endpoint for AI tool integration
     "/mcp": {
       POST: async (req) => {

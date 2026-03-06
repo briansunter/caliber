@@ -13,9 +13,11 @@ import {
   Bookmark,
   Clock,
   ChevronRight,
+  BookOpen,
 } from "lucide-react";
 import { useState, useCallback, memo, useMemo } from "react";
 import { cn } from "@/lib/utils";
+import { Link } from "@tanstack/react-router";
 
 interface BookDetailProps {
   bookId: number;
@@ -274,6 +276,35 @@ export function BookDetail({ bookId }: BookDetailProps) {
           <div className="lg:sticky lg:top-24 space-y-6">
             {/* Book Cover */}
             <BookCover bookId={bookId} title={book.title} hasCover={book.has_cover} />
+
+            {/* Read button */}
+            {book.formats.some((f) => f === "EPUB" || f === "PDF") && (
+              <div className="space-y-3">
+                <h3 className="text-xs font-semibold text-ink-muted uppercase tracking-widest">Read</h3>
+                <div className="flex flex-wrap gap-2">
+                  {book.formats
+                    .filter((f) => f === "EPUB" || f === "PDF")
+                    .map((format) => (
+                      <Link
+                        key={format}
+                        to="/read/$id/$format"
+                        params={{ id: String(bookId), format: format.toLowerCase() }}
+                      >
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="group bg-accent hover:bg-accent/90 border-accent text-white transition-all duration-150 rounded text-xs uppercase tracking-wider font-semibold cursor-pointer"
+                        >
+                          <span className="flex items-center gap-2">
+                            <BookOpen className="h-3.5 w-3.5" strokeWidth={2} />
+                            <span>Read {format}</span>
+                          </span>
+                        </Button>
+                      </Link>
+                    ))}
+                </div>
+              </div>
+            )}
 
             {/* Download section */}
             {book.formats.length > 0 && (

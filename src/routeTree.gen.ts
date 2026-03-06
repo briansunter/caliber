@@ -15,6 +15,7 @@ import { createFileRoute } from '@tanstack/react-router'
 import { Route as rootRoute } from './routes/__root'
 import { Route as IndexImport } from './routes/index'
 import { Route as BookIdImport } from './routes/book.$id'
+import { Route as ReadIdFormatImport } from './routes/read.$id.$format'
 
 // Create/Update Routes
 
@@ -25,6 +26,11 @@ const IndexRoute = IndexImport.update({
 
 const BookIdRoute = BookIdImport.update({
   path: '/book/$id',
+  getParentRoute: () => rootRoute,
+} as any)
+
+const ReadIdFormatRoute = ReadIdFormatImport.update({
+  path: '/read/$id/$format',
   getParentRoute: () => rootRoute,
 } as any)
 
@@ -46,11 +52,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof BookIdImport
       parentRoute: typeof rootRoute
     }
+    '/read/$id/$format': {
+      id: '/read/$id/$format'
+      path: '/read/$id/$format'
+      fullPath: '/read/$id/$format'
+      preLoaderRoute: typeof ReadIdFormatImport
+      parentRoute: typeof rootRoute
+    }
   }
 }
 
 // Create and export the route tree
 
-export const routeTree = rootRoute.addChildren([IndexRoute, BookIdRoute])
+export const routeTree = rootRoute.addChildren([IndexRoute, BookIdRoute, ReadIdFormatRoute])
 
 /* prettier-ignore-end */
