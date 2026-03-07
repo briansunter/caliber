@@ -14,8 +14,8 @@ import {
   type BookListItem,
 } from "./lib/calibre-optimized";
 import { handleMCPRequest } from "./mcp";
-import { join } from "path";
-import { homedir } from "os";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
 const LIBRARY_PATH = getLibraryPath();
 const WORK_DIR = join(homedir(), ".config", "caliber");
@@ -425,7 +425,7 @@ const server = serve({
       GET: async (req) => {
         try {
           const id = parseInt(req.params.id, 10);
-          if (isNaN(id)) {
+          if (Number.isNaN(id)) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
 

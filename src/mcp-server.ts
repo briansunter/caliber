@@ -131,7 +131,7 @@ async function executeTool(name: string, args: Record<string, unknown>): Promise
       const books = searchBooksByTitle(title, count);
 
       let output = `Library search for title: "${title}"\n`;
-      output += "=".repeat(60) + "\n\n";
+      output += `${"=".repeat(60)}\n\n`;
 
       if (books.length === 0) {
         output += "No books found with that title.\n";
@@ -153,7 +153,7 @@ async function executeTool(name: string, args: Record<string, unknown>): Promise
       const books = searchBooksByAuthor(author, count);
 
       let output = `Library search for author: "${author}"\n`;
-      output += "=".repeat(60) + "\n\n";
+      output += `${"=".repeat(60)}\n\n`;
 
       if (authorInfo) {
         output += `Author: ${authorInfo.name} (${authorInfo.bookCount} book(s) in library)\n\n`;
@@ -164,11 +164,11 @@ async function executeTool(name: string, args: Record<string, unknown>): Promise
       } else {
         output += `Showing ${books.length} book(s):\n\n`;
         for (let i = 0; i < books.length; i++) {
-          output += `${i + 1}. "${books[i]!.title}"`;
-          if (books[i]!.series) {
-            output += ` (Book ${books[i]!.series_index} in ${books[i]!.series})`;
+          output += `${i + 1}. "${books[i]?.title}"`;
+          if (books[i]?.series) {
+            output += ` (Book ${books[i]?.series_index} in ${books[i]?.series})`;
           }
-          output += ` [${books[i]!.formats.join(", ")}]\n`;
+          output += ` [${books[i]?.formats.join(", ")}]\n`;
         }
       }
 
@@ -182,7 +182,7 @@ async function executeTool(name: string, args: Record<string, unknown>): Promise
       const result = searchBooksCursor({ query, limit });
 
       let output = `Library search: "${query}"\n`;
-      output += "=".repeat(60) + "\n\n";
+      output += `${"=".repeat(60)}\n\n`;
 
       if (result.items.length === 0) {
         output += "No books found matching that query.\n";
@@ -288,7 +288,7 @@ async function main() {
         const request = JSON.parse(line) as MCPRequest;
         const response = await handleJSONRPC(request);
         const responseLine = JSON.stringify(response);
-        process.stdout.write(responseLine + "\n");
+        process.stdout.write(`${responseLine}\n`);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const errorResponse = {
@@ -299,7 +299,7 @@ async function main() {
             message: `Parse error: ${message}`,
           },
         };
-        process.stdout.write(JSON.stringify(errorResponse) + "\n");
+        process.stdout.write(`${JSON.stringify(errorResponse)}\n`);
       }
     }
   }

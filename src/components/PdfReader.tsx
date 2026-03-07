@@ -35,7 +35,7 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
   const [totalPages, setTotalPages] = useState(0);
   const [showUI, setShowUI] = useState(true);
   const [zoom, setZoom] = useState(1);
-  const [rendering, setRendering] = useState(false);
+  const [_rendering, setRendering] = useState(false);
 
   const goNext = useCallback(() => {
     setCurrentPage((p) => Math.min(p + 1, totalPages || p));
@@ -49,9 +49,11 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
 
   // Touch handling
   const onTouchStart = useCallback((e: React.TouchEvent) => {
+    const touch = e.touches[0];
+    if (!touch) return;
     touchRef.current = {
-      x: e.touches[0].clientX,
-      y: e.touches[0].clientY,
+      x: touch.clientX,
+      y: touch.clientY,
       t: Date.now(),
     };
   }, []);
@@ -62,8 +64,10 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
       if (!start) return;
       touchRef.current = null;
 
-      const dx = e.changedTouches[0].clientX - start.x;
-      const dy = e.changedTouches[0].clientY - start.y;
+      const touch = e.changedTouches[0];
+      if (!touch) return;
+      const dx = touch.clientX - start.x;
+      const dy = touch.clientY - start.y;
       const dt = Date.now() - start.t;
 
       if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5 && dt < 500) {
@@ -74,7 +78,7 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
 
       if (Math.abs(dx) < 15 && Math.abs(dy) < 15 && dt < 300) {
         const w = window.innerWidth;
-        const x = e.changedTouches[0].clientX;
+        const x = touch.clientX;
         if (x < w * 0.3) goPrev();
         else if (x > w * 0.7) goNext();
         else toggleUI();
@@ -149,7 +153,7 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
     try {
       localStorage.setItem(posKey, JSON.stringify({ page: currentPage, ts: Date.now() }));
     } catch {}
-  }, [currentPage, isLoading, zoom]);
+  }, [currentPage, isLoading, zoom, posKey]);
 
   // Keyboard
   useEffect(() => {

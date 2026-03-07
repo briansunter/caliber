@@ -7,7 +7,6 @@ import type {
   Publisher,
   Rating,
   BookFormat,
-  Comment,
   BookWithMetadata,
   BookListItem,
 } from "../types/calibre";
@@ -73,7 +72,7 @@ export function closeDatabase(): void {
  * Get all books with basic metadata
  */
 export function getBooks(limit: number = 100, offset: number = 0): BookListItem[] {
-  const database = getDatabase();
+  const _database = getDatabase();
 
   const query = `
     SELECT
@@ -147,7 +146,7 @@ export function searchBooks(
   limit: number = 100,
   offset: number = 0
 ): BookListItem[] {
-  const database = getDatabase();
+  const _database = getDatabase();
 
   const searchQuery = `%${query}%`;
 
@@ -235,7 +234,7 @@ export function searchBooks(
  * Get a single book by ID with full metadata
  */
 export function getBookById(id: number): BookWithMetadata | null {
-  const database = getDatabase();
+  const _database = getDatabase();
 
   // Get the book
   const bookStmt = getCachedStatement("SELECT * FROM books WHERE id = ?");
@@ -313,7 +312,7 @@ export function getBookById(id: number): BookWithMetadata | null {
  * Get formats for a specific book
  */
 export function getBookFormats(bookId: number): BookFormat[] {
-  const database = getDatabase();
+  const _database = getDatabase();
 
   const stmt = getCachedStatement(`
     SELECT * FROM data WHERE book = ? ORDER BY format
@@ -326,7 +325,7 @@ export function getBookFormats(bookId: number): BookFormat[] {
  * Get total count of books
  */
 export function getBookCount(): number {
-  const database = getDatabase();
+  const _database = getDatabase();
 
   const stmt = getCachedStatement("SELECT COUNT(*) as count FROM books");
   const result = stmt.get() as { count: number };
@@ -338,7 +337,7 @@ export function getBookCount(): number {
  * Get all authors with book counts
  */
 export function getAuthors(): Array<Author & { bookCount: number }> {
-  const database = getDatabase();
+  const _database = getDatabase();
 
   const stmt = getCachedStatement(`
     SELECT
@@ -355,7 +354,7 @@ export function getAuthors(): Array<Author & { bookCount: number }> {
  * Get all tags with book counts
  */
 export function getTags(): Array<Tag & { bookCount: number }> {
-  const database = getDatabase();
+  const _database = getDatabase();
 
   const stmt = getCachedStatement(`
     SELECT
@@ -372,7 +371,7 @@ export function getTags(): Array<Tag & { bookCount: number }> {
  * Get all series with book counts
  */
 export function getSeries(): Array<Series & { bookCount: number }> {
-  const database = getDatabase();
+  const _database = getDatabase();
 
   const stmt = getCachedStatement(`
     SELECT
@@ -389,7 +388,7 @@ export function getSeries(): Array<Series & { bookCount: number }> {
  * Get books by author ID
  */
 export function getBooksByAuthor(authorId: number): BookListItem[] {
-  const database = getDatabase();
+  const _database = getDatabase();
 
   const query = `
     SELECT

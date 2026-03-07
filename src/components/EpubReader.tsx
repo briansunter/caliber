@@ -99,9 +99,11 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
 
   // Touch handling on the overlay
   const onTouchStart = useCallback((e: React.TouchEvent) => {
+    const touch = e.touches[0];
+    if (!touch) return;
     touchRef.current = {
-      x: e.touches[0].clientX,
-      y: e.touches[0].clientY,
+      x: touch.clientX,
+      y: touch.clientY,
       t: Date.now(),
     };
   }, []);
@@ -112,8 +114,10 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
       if (!start) return;
       touchRef.current = null;
 
-      const dx = e.changedTouches[0].clientX - start.x;
-      const dy = e.changedTouches[0].clientY - start.y;
+      const touch = e.changedTouches[0];
+      if (!touch) return;
+      const dx = touch.clientX - start.x;
+      const dy = touch.clientY - start.y;
       const dt = Date.now() - start.t;
 
       // Swipe (horizontal, >50px, <500ms)
@@ -126,7 +130,7 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
       // Tap (minimal movement, <300ms)
       if (Math.abs(dx) < 15 && Math.abs(dy) < 15 && dt < 300) {
         const w = window.innerWidth;
-        const x = e.changedTouches[0].clientX;
+        const x = touch.clientX;
         if (x < w * 0.3) goPrev();
         else if (x > w * 0.7) goNext();
         else toggleUI();
@@ -234,7 +238,7 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
       if (r) try { r.destroy(); } catch {}
       if (b) try { b.destroy(); } catch {}
     };
-  }, [url]);
+  }, [url, fontSize, onBack, posKey, theme]);
 
   // Update progress when locations are ready
   useEffect(() => {

@@ -1,4 +1,4 @@
-import { createFileRoute, useParams, useRouter } from "@tanstack/react-router";
+import { createFileRoute, useParams, } from "@tanstack/react-router";
 import { BookDetail } from "@/components/BookDetail";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft, BookOpen } from "lucide-react";

@@ -100,7 +100,7 @@ export function getFormatPath(book: Book, format: string): string | null {
 }
 
 export function listBooks(page: number = 1, perPage: number = 20): BookListResult {
-  const db = getDb();
+  const _db = getDb();
   const offset = (page - 1) * perPage;
 
   const totalRow = getCachedStatement("SELECT COUNT(*) as count FROM books").get() as { count: number };
@@ -121,7 +121,7 @@ export function listBooks(page: number = 1, perPage: number = 20): BookListResul
 }
 
 export function searchBooks(query: string, page: number = 1, perPage: number = 20): BookListResult {
-  const db = getDb();
+  const _db = getDb();
   const offset = (page - 1) * perPage;
   const searchTerm = `%${query}%`;
 
@@ -166,7 +166,7 @@ export interface BookWithDetails extends Book {
 }
 
 export function getBookById(id: number): BookWithDetails | null {
-  const db = getDb();
+  const _db = getDb();
   const book = getCachedStatement("SELECT * FROM books WHERE id = ?").get(id) as Book | undefined;
 
   if (!book) return null;
@@ -184,7 +184,7 @@ export function getBookById(id: number): BookWithDetails | null {
 }
 
 export function getBookAuthors(bookId: number): string[] {
-  const db = getDb();
+  const _db = getDb();
   const rows = getCachedStatement(
     `SELECT authors.name
      FROM authors
@@ -197,14 +197,14 @@ export function getBookAuthors(bookId: number): string[] {
 }
 
 export function getBookFormats(bookId: number): BookFormat[] {
-  const db = getDb();
+  const _db = getDb();
   return getCachedStatement(
     `SELECT * FROM data WHERE book = ? ORDER BY format`
   ).all(bookId) as BookFormat[];
 }
 
 export function getBookTags(bookId: number): string[] {
-  const db = getDb();
+  const _db = getDb();
   const rows = getCachedStatement(
     `SELECT tags.name
      FROM tags
@@ -217,7 +217,7 @@ export function getBookTags(bookId: number): string[] {
 }
 
 export function getBookSeries(bookId: number): string | null {
-  const db = getDb();
+  const _db = getDb();
   const row = getCachedStatement(
     `SELECT series.name
      FROM series
@@ -229,7 +229,7 @@ export function getBookSeries(bookId: number): string | null {
 }
 
 export function getBookPublisher(bookId: number): string | null {
-  const db = getDb();
+  const _db = getDb();
   const row = getCachedStatement(
     `SELECT publishers.name
      FROM publishers
@@ -241,7 +241,7 @@ export function getBookPublisher(bookId: number): string | null {
 }
 
 export function getBookRating(bookId: number): number | null {
-  const db = getDb();
+  const _db = getDb();
   const row = getCachedStatement(
     `SELECT ratings.rating
      FROM ratings
@@ -253,7 +253,7 @@ export function getBookRating(bookId: number): number | null {
 }
 
 export function getBookComments(bookId: number): string | null {
-  const db = getDb();
+  const _db = getDb();
   const row = getCachedStatement(
     `SELECT comments.text
      FROM comments
@@ -264,7 +264,7 @@ export function getBookComments(bookId: number): string | null {
 }
 
 export function bookHasFormat(bookId: number, format: string): boolean {
-  const db = getDb();
+  const _db = getDb();
   const row = getCachedStatement(
     "SELECT 1 FROM data WHERE book = ? AND format = ?"
   ).get(bookId, format.toUpperCase()) as { 1: number } | undefined;

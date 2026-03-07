@@ -1,4 +1,4 @@
-import { memo, useEffect, useCallback, useRef, useState } from "react";
+import { memo, useEffect, useCallback, useRef, } from "react";
 import { useWindowVirtualizer } from "@tanstack/react-virtual";
 import { useFlattenedBooks, type SortConfig, type SortField } from "@/hooks/useBooksInfinite";
 import type { BookListItem } from "@/lib/calibre-optimized";
@@ -395,8 +395,6 @@ export function BookTableInfinite({
   searchQuery,
   sortConfig,
 }: BookTableInfiniteProps) {
-  const resetToken = `${searchQuery}|${sortConfig.field}|${sortConfig.order}`;
-
   const {
     books,
     hasNextPage,

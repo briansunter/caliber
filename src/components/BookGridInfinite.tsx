@@ -110,7 +110,7 @@ export function BookGridInfinite({ searchQuery, sortConfig }: BookGridInfinitePr
       window.scrollTo({ top: 0 });
     }
     hasMountedGrid.current = true;
-  }, [searchQuery, sortConfig]);
+  }, []);
 
   if (isLoading) {
     return (

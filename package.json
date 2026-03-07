@@ -1,11 +1,12 @@
 {
-  "name": "bun-react-template",
+  "name": "caliber",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "bun --hot src/index.ts",
     "start": "NODE_ENV=production bun src/index.ts",
+    "cli": "bun src/cli.ts",
     "build": "bun run build.ts",
     "typecheck": "bun x tsc --noEmit",
     "lint": "biome lint .",

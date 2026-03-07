@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { join } from "node:path";
-import { copyFileSync, mkdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 
 // Use Desktop Calibre library
@@ -87,8 +87,30 @@ function splitAggregatedField(value: string | null): string[] {
     : [];
 }
 
+// Ensure writable DB exists and is up-to-date with the source Calibre DB
+function ensureWritableDb(): void {
+  if (!existsSync(WRITABLE_DB_PATH)) {
+    copyDbToWritable();
+    return;
+  }
+  // Refresh if source DB is newer than the writable copy
+  try {
+    const srcMtime = statSync(DB_PATH).mtimeMs;
+    const dstMtime = statSync(WRITABLE_DB_PATH).mtimeMs;
+    if (srcMtime > dstMtime) {
+      copyDbToWritable();
+      dbPool.length = 0;
+    }
+  } catch {
+    // If stat fails, leave existing copy in place
+  }
+}
+
 // Get database connection from pool or create new one
 function getDb(): Database {
+  if (dbPool.length === 0) {
+    ensureWritableDb();
+  }
   // Simple round-robin: return a db from the pool
   if (dbPool.length < MAX_POOL_SIZE) {
     const db = new Database(WRITABLE_DB_PATH);
@@ -112,6 +134,7 @@ function getDb(): Database {
 // Initialize FTS5 virtual table on writable copy
 export function initFTS(): void {
   copyDbToWritable();
+  dbPool.length = 0;
   const db = getDb();
 
   // Add indexes for sort performance
@@ -150,7 +173,7 @@ export function initFTS(): void {
 
 // Build the optimized query using CTE for fast pagination
 // This avoids scanning the entire table when using OFFSET/Cursor
-function getPagedBooksCTE(
+function _getPagedBooksCTE(
   whereClause: string,
   orderByClause: string,
   limit: number
@@ -375,7 +398,7 @@ function buildBookQuery(
   bookWhere: string,
   bookOrderBy: string,
   limit: number,
-  params: (string | number)[]
+  _params: (string | number)[]
 ): string {
   return `
     WITH book_page AS (
@@ -409,8 +432,8 @@ function buildBookQuery(
 
 // FTS-powered search with cursor pagination
 export function searchBooksCursor(options: SearchOptions): CursorPaginatedResult<BookListItem> {
-  const db = getDb();
-  const limit = Math.min(options.limit || 100, 200);
+  const _db = getDb();
+  const _limit = Math.min(options.limit || 100, 200);
   const searchQuery = options.query.trim();
 
   if (!searchQuery) {
@@ -488,7 +511,7 @@ function ftsSearch(options: SearchOptions): CursorPaginatedResult<BookListItem> 
 
 // Fallback LIKE-based search - searches title, author, and series
 // Supports multi-word queries - all words must match (AND logic)
-function fallbackSearch(options: SearchOptions): CursorPaginatedResult<BookListItem> {
+function _fallbackSearch(options: SearchOptions): CursorPaginatedResult<BookListItem> {
   const db = getDb();
   const limit = Math.min(options.limit || 100, 200);
 
