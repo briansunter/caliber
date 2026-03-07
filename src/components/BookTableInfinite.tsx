@@ -1,4 +1,4 @@
-import { memo, useEffect, useCallback, useRef, } from "react";
+import { memo, useEffect, useCallback, useRef } from "react";
 import { useWindowVirtualizer } from "@tanstack/react-virtual";
 import { useFlattenedBooks, type SortConfig, type SortField } from "@/hooks/useBooksInfinite";
 import type { BookListItem } from "@/lib/calibre-optimized";
@@ -45,11 +45,7 @@ const SKELETON_ROW_KEYS = [
 ] as const;
 
 // Star rating component
-const StarRating = memo(function StarRating({
-  rating,
-}: {
-  rating?: number | null;
-}) {
+const StarRating = memo(function StarRating({ rating }: { rating?: number | null }) {
   if (!rating) return <span className="text-ink-muted">—</span>;
 
   const stars = [];
@@ -58,9 +54,7 @@ const StarRating = memo(function StarRating({
 
   for (let i = 0; i < 5; i++) {
     if (i < fullStars) {
-      stars.push(
-        <Star key={i} className="h-3.5 w-3.5 fill-accent text-accent" />
-      );
+      stars.push(<Star key={i} className="h-3.5 w-3.5 fill-accent text-accent" />);
     } else if (i === fullStars && hasHalfStar) {
       stars.push(
         <div key={i} className="relative">
@@ -68,7 +62,7 @@ const StarRating = memo(function StarRating({
           <div className="absolute inset-0 overflow-hidden w-1/2">
             <Star className="h-3.5 w-3.5 fill-accent text-accent" />
           </div>
-        </div>
+        </div>,
       );
     } else {
       stars.push(<Star key={i} className="h-3.5 w-3.5 text-ink" strokeWidth={1} />);
@@ -94,9 +88,7 @@ const TitleCell = memo(function TitleCell({
       params={{ id: String(id) }}
       className="group flex items-center gap-3 min-w-0"
     >
-      <div
-        className="relative flex-shrink-0 w-9 h-12 rounded bg-parchment-dark overflow-hidden flex items-center justify-center border border-ink"
-      >
+      <div className="relative flex-shrink-0 w-9 h-12 rounded bg-parchment-dark overflow-hidden flex items-center justify-center border border-ink">
         {hasCover ? (
           <img
             src={`/api/books/${id}/thumb`}
@@ -117,17 +109,11 @@ const TitleCell = memo(function TitleCell({
   );
 });
 
-const AuthorsCell = memo(function AuthorsCell({
-  authors,
-}: {
-  authors?: string[];
-}) {
+const AuthorsCell = memo(function AuthorsCell({ authors }: { authors?: string[] }) {
   if (!authors || authors.length === 0) {
     return <span className="text-ink-muted italic">Unknown</span>;
   }
-  return (
-    <span className="text-ink-tertiary truncate">{authors.join(", ")}</span>
-  );
+  return <span className="text-ink-tertiary truncate">{authors.join(", ")}</span>;
 });
 
 const SeriesCell = memo(function SeriesCell({
@@ -155,9 +141,7 @@ const TagsCell = memo(function TagsCell({ tags }: { tags?: string[] }) {
           {tag}
         </span>
       ))}
-      {tags.length > 2 && (
-        <span className="text-xs text-ink-muted">+{tags.length - 2}</span>
-      )}
+      {tags.length > 2 && <span className="text-xs text-ink-muted">+{tags.length - 2}</span>}
     </div>
   );
 });
@@ -193,9 +177,7 @@ const FormatsCell = memo(function FormatsCell({
           {fmt}
         </button>
       ))}
-      {formats.length > 3 && (
-        <span className="text-xs text-ink-muted">+{formats.length - 3}</span>
-      )}
+      {formats.length > 3 && <span className="text-xs text-ink-muted">+{formats.length - 3}</span>}
     </div>
   );
 });
@@ -233,7 +215,9 @@ const TableRow = memo(function TableRow({ book }: TableRowProps) {
           <TitleCell title={book.title} id={book.id} hasCover={book.has_cover} />
         </div>
         <div className="flex items-center min-w-0 py-2 overflow-hidden">
-          <span className="text-xs text-ink-tertiary truncate">{book.authors?.length ? book.authors[0] : "Unknown"}</span>
+          <span className="text-xs text-ink-tertiary truncate">
+            {book.authors?.length ? book.authors[0] : "Unknown"}
+          </span>
         </div>
         <div className="flex items-center justify-end py-2">
           <ActionsCell id={book.id} />
@@ -271,11 +255,7 @@ const TableRow = memo(function TableRow({ book }: TableRowProps) {
 });
 
 // Empty state
-const EmptyState = memo(function EmptyState({
-  searchQuery,
-}: {
-  searchQuery: string;
-}) {
+const EmptyState = memo(function EmptyState({ searchQuery }: { searchQuery: string }) {
   return (
     <div className="flex flex-col items-center justify-center h-64 text-center px-8">
       <div className="w-14 h-14 rounded-full bg-parchment-dark flex items-center justify-center mb-3 border border-ink">
@@ -354,7 +334,10 @@ interface TableHeaderProps {
   onSortChange: (config: SortConfig) => void;
 }
 
-export const TableHeader = memo(function TableHeader({ sortConfig, onSortChange }: TableHeaderProps) {
+export const TableHeader = memo(function TableHeader({
+  sortConfig,
+  onSortChange,
+}: TableHeaderProps) {
   const handleSort = useCallback(
     (field: SortField) => {
       if (sortConfig.field === field) {
@@ -366,44 +349,44 @@ export const TableHeader = memo(function TableHeader({ sortConfig, onSortChange 
         onSortChange({ field, order: "asc" });
       }
     },
-    [sortConfig, onSortChange]
+    [sortConfig, onSortChange],
   );
 
   return (
     <>
       {/* Mobile header */}
-      <div className="px-3 h-10 items-center border-b border-ink grid sm:!hidden" style={{ gridTemplateColumns: GRID_TEMPLATE_MOBILE, gap: "0.5rem" }}>
+      <div
+        className="px-3 h-10 items-center border-b border-ink grid sm:!hidden"
+        style={{ gridTemplateColumns: GRID_TEMPLATE_MOBILE, gap: "0.5rem" }}
+      >
         <SortHeader label="Title" field="title" currentSort={sortConfig} onSort={handleSort} />
         <SortHeader label="Author" field="author" currentSort={sortConfig} onSort={handleSort} />
         <span></span>
       </div>
       {/* Desktop header */}
-      <div className="px-4 h-12 items-center border-b border-ink hidden sm:!grid" style={{ gridTemplateColumns: GRID_TEMPLATE, gap: "1rem" }}>
+      <div
+        className="px-4 h-12 items-center border-b border-ink hidden sm:!grid"
+        style={{ gridTemplateColumns: GRID_TEMPLATE, gap: "1rem" }}
+      >
         <SortHeader label="Title" field="title" currentSort={sortConfig} onSort={handleSort} />
         <SortHeader label="Author" field="author" currentSort={sortConfig} onSort={handleSort} />
-        <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">Series</span>
+        <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">
+          Series
+        </span>
         <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">Tags</span>
         <SortHeader label="Rating" field="rating" currentSort={sortConfig} onSort={handleSort} />
-        <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">Formats</span>
+        <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">
+          Formats
+        </span>
         <span></span>
       </div>
     </>
   );
 });
 
-export function BookTableInfinite({
-  searchQuery,
-  sortConfig,
-}: BookTableInfiniteProps) {
-  const {
-    books,
-    hasNextPage,
-    fetchNextPage,
-    isFetchingNextPage,
-    isLoading,
-    isError,
-    error,
-  } = useFlattenedBooks(searchQuery, sortConfig);
+export function BookTableInfinite({ searchQuery, sortConfig }: BookTableInfiniteProps) {
+  const { books, hasNextPage, fetchNextPage, isFetchingNextPage, isLoading, isError, error } =
+    useFlattenedBooks(searchQuery, sortConfig);
 
   // Set up window virtualizer - uses window scroll
   const virtualizer = useWindowVirtualizer({
@@ -418,8 +401,11 @@ export function BookTableInfinite({
 
   // Infinite scroll — no extra state, just derive from virtualizer position
   const lastVirtualItem = virtualItems[virtualItems.length - 1];
-  const shouldFetch = lastVirtualItem && lastVirtualItem.index >= books.length - 30
-    && hasNextPage && !isFetchingNextPage;
+  const shouldFetch =
+    lastVirtualItem &&
+    lastVirtualItem.index >= books.length - 30 &&
+    hasNextPage &&
+    !isFetchingNextPage;
 
   const fetchRef = useRef(fetchNextPage);
   fetchRef.current = fetchNextPage;
@@ -432,6 +418,7 @@ export function BookTableInfinite({
 
   // Scroll to top when search or sort changes (skip initial mount for scroll restoration)
   const hasMountedTable = useRef(false);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional - scroll to top when search/sort changes
   useEffect(() => {
     if (hasMountedTable.current) {
       window.scrollTo({ top: 0 });
@@ -444,8 +431,12 @@ export function BookTableInfinite({
       <div className="overflow-hidden">
         <div className="table-header">
           <div className="px-3 sm:px-4 h-10 sm:h-12 flex items-center gap-4">
-            <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">Title</span>
-            <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">Author</span>
+            <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">
+              Title
+            </span>
+            <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">
+              Author
+            </span>
           </div>
         </div>
         <TableSkeleton />
@@ -460,7 +451,9 @@ export function BookTableInfinite({
           <BookOpen className="h-5 w-5 text-error" strokeWidth={1.5} />
         </div>
         <h3 className="text-base font-semibold text-ink mb-1">Failed to load books</h3>
-        <p className="text-sm text-ink-tertiary">{error instanceof Error ? error.message : "Unknown error"}</p>
+        <p className="text-sm text-ink-tertiary">
+          {error instanceof Error ? error.message : "Unknown error"}
+        </p>
       </div>
     );
   }

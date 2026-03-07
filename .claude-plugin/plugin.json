@@ -9,11 +9,9 @@
   "mcpServers": {
     "caliber": {
       "command": "bun",
-      "args": ["run", "/Volumes/Storage/code/caliber/src/mcp-server.ts"],
-      "env": {
-        "CALIBRE_LIBRARY_PATH": "/Users/bsunter/Desktop",
-        "CALIBRE_DB_NAME": "metadata 3.db"
-      }
+      "args": ["run", "src/mcp-server.ts"],
+      "env": {}
+
     }
   },
   "skills": ["./skills/"]

@@ -127,7 +127,9 @@ function getDb(): Database {
     return db;
   }
   // Round-robin through pool
-  const db = dbPool[Math.floor(Math.random() * dbPool.length)]!;
+  const idx = Math.floor(Math.random() * dbPool.length);
+  const db = dbPool[idx];
+  if (!db) throw new Error("DB pool unexpectedly empty");
   return db;
 }
 
@@ -169,69 +171,6 @@ export function initFTS(): void {
     ORDER BY b.sort ASC LIMIT 1
   `).get();
   console.log("🔥 Database warm");
-}
-
-// Build the optimized query using CTE for fast pagination
-// This avoids scanning the entire table when using OFFSET/Cursor
-function _getPagedBooksCTE(
-  whereClause: string,
-  orderByClause: string,
-  limit: number
-): string {
-  return `
-    WITH book_page AS (
-      SELECT
-        b.id,
-        b.title,
-        b.sort,
-        b.author_sort,
-        b.series_index,
-        b.has_cover,
-        b.pubdate,
-        b.timestamp,
-        b.isbn,
-        b.uuid,
-        b.path
-      FROM books b
-      ${whereClause}
-      ${orderByClause}
-      LIMIT ${limit}
-    )
-    SELECT
-      b.id,
-      b.title,
-      b.sort,
-      b.author_sort,
-      b.series_index,
-      b.has_cover,
-      b.pubdate,
-      b.timestamp,
-      b.isbn,
-      b.uuid,
-      b.path,
-      s.name as series,
-      r.rating,
-      p.name as publisher,
-      c.text as comments,
-      GROUP_CONCAT(DISTINCT a.name) as authors,
-      GROUP_CONCAT(DISTINCT t.name) as tags,
-      GROUP_CONCAT(DISTINCT d.format) as formats
-    FROM book_page b
-    LEFT JOIN books_authors_link bal ON b.id = bal.book
-    LEFT JOIN authors a ON bal.author = a.id
-    LEFT JOIN books_series_link bsl ON b.id = bsl.book
-    LEFT JOIN series s ON bsl.series = s.id
-    LEFT JOIN books_tags_link btl ON b.id = btl.book
-    LEFT JOIN tags t ON btl.tag = t.id
-    LEFT JOIN data d ON b.id = d.book
-    LEFT JOIN books_ratings_link brl ON b.id = brl.book
-    LEFT JOIN ratings r ON brl.rating = r.id
-    LEFT JOIN books_publishers_link bpl ON b.id = bpl.book
-    LEFT JOIN publishers p ON bpl.publisher = p.id
-    LEFT JOIN comments c ON b.id = c.book
-    GROUP BY b.id
-    ${orderByClause.replace('b.sort', 'b.title').replace('b.', 'b.').replace('ORDER BY', 'ORDER BY')}
-  `;
 }
 
 // Parse book row with aggregated fields
@@ -394,12 +333,7 @@ interface SearchOptions extends ListOptions {
 }
 
 // Helper function to build lightweight list query with CTE
-function buildBookQuery(
-  bookWhere: string,
-  bookOrderBy: string,
-  limit: number,
-  _params: (string | number)[]
-): string {
+function buildBookQuery(bookWhere: string, bookOrderBy: string, limit: number): string {
   return `
     WITH book_page AS (
       SELECT b.id, b.title, b.sort, b.author_sort, b.series_index, b.has_cover, b.pubdate, b.timestamp
@@ -432,8 +366,6 @@ function buildBookQuery(
 
 // FTS-powered search with cursor pagination
 export function searchBooksCursor(options: SearchOptions): CursorPaginatedResult<BookListItem> {
-  const _db = getDb();
-  const _limit = Math.min(options.limit || 100, 200);
   const searchQuery = options.query.trim();
 
   if (!searchQuery) {
@@ -450,13 +382,16 @@ function ftsSearch(options: SearchOptions): CursorPaginatedResult<BookListItem> 
   const limit = Math.min(options.limit || 100, 200);
 
   // Build FTS query: quote each word and join with AND
-  const words = options.query.trim().split(/\s+/).filter(w => w.length > 0);
+  const words = options.query
+    .trim()
+    .split(/\s+/)
+    .filter((w) => w.length > 0);
   if (words.length === 0) {
     return listBooksCursor({ ...options, limit });
   }
 
   // Escape double quotes and wrap each word as a prefix search
-  const ftsQuery = words.map(w => `"${w.replace(/"/g, '""')}"*`).join(" AND ");
+  const ftsQuery = words.map((w) => `"${w.replace(/"/g, '""')}"*`).join(" AND ");
   const params: (string | number)[] = [ftsQuery];
 
   let bookWhere = `WHERE b.id IN (SELECT rowid FROM books_fts WHERE books_fts MATCH ?)`;
@@ -498,7 +433,7 @@ function ftsSearch(options: SearchOptions): CursorPaginatedResult<BookListItem> 
     default:
       bookOrderBy = `ORDER BY b.sort ${dir}, b.id ${dir}`;
   }
-  const query = buildBookQuery(bookWhere, bookOrderBy, limit + 1, params);
+  const query = buildBookQuery(bookWhere, bookOrderBy, limit + 1);
   const rows = db.query(query).all(...params) as BookRow[];
 
   const hasMore = rows.length > limit;
@@ -507,70 +442,6 @@ function ftsSearch(options: SearchOptions): CursorPaginatedResult<BookListItem> 
   const nextCursor = hasMore && lastItem ? encodeCursor(lastItem, sortBy) : null;
 
   return { items, nextCursor, hasMore };
-}
-
-// Fallback LIKE-based search - searches title, author, and series
-// Supports multi-word queries - all words must match (AND logic)
-function _fallbackSearch(options: SearchOptions): CursorPaginatedResult<BookListItem> {
-  const db = getDb();
-  const limit = Math.min(options.limit || 100, 200);
-
-  // Split query into words and create individual search terms
-  const words = options.query.trim().split(/\s+/).filter(w => w.length > 0);
-  if (words.length === 0) {
-    return listBooksCursor({ ...options, limit });
-  }
-
-  // Build WHERE clause that requires ALL words to match (AND logic)
-  // Each word can match title, author, OR series
-  const wordConditions: string[] = [];
-  const params: (string | number)[] = [];
-
-  for (const word of words) {
-    const searchTerm = `%${word}%`;
-    wordConditions.push(`(
-      b.title LIKE ?
-      OR b.id IN (
-        SELECT bal.book FROM books_authors_link bal
-        JOIN authors a ON bal.author = a.id
-        WHERE a.name LIKE ? OR a.sort LIKE ?
-      )
-      OR b.id IN (
-        SELECT bsl.book FROM books_series_link bsl
-        JOIN series s ON bsl.series = s.id
-        WHERE s.name LIKE ?
-      )
-    )`);
-    params.push(searchTerm, searchTerm, searchTerm, searchTerm);
-  }
-
-  let bookWhere = `WHERE ${wordConditions.join(" AND ")}`;
-
-  if (options.cursor) {
-    const cursorData = decodeCursor(options.cursor);
-    if (cursorData) {
-      bookWhere += " AND b.id > ?";
-      params.push(cursorData.id);
-    }
-  }
-
-  const bookOrderBy = `ORDER BY b.sort ASC, b.id ASC`;
-
-  const query = buildBookQuery(bookWhere, bookOrderBy, limit + 1, params);
-
-  const rows = db.query(query).all(...params) as BookRow[];
-
-  const hasMore = rows.length > limit;
-  const items = rows.slice(0, limit).map(parseBookRow);
-
-  const lastItem = items[items.length - 1];
-  const nextCursor = hasMore && lastItem ? encodeCursor(lastItem, "title") : null;
-
-  return {
-    items,
-    nextCursor,
-    hasMore,
-  };
 }
 
 // Get book details by ID
@@ -700,22 +571,9 @@ export function searchBooksByTitle(title: string, limit: number = 10): BookListI
     LIMIT ?
   `;
 
-  const results = db.query(query).all(searchTerm, limit) as any[];
+  const results = db.query(query).all(searchTerm, limit) as BookRow[];
 
-  return results.map(row => ({
-    id: row.id,
-    title: row.title,
-    author_sort: row.author_sort,
-    authors: splitAggregatedField(row.authors),
-    series: row.series,
-    series_index: row.series_index || 1,
-    tags: splitAggregatedField(row.tags),
-    formats: splitAggregatedField(row.formats),
-    has_cover: !!row.has_cover,
-    pubdate: row.pubdate,
-    timestamp: row.timestamp,
-    rating: row.rating,
-  }));
+  return results.map(parseBookRow);
 }
 
 // Search books by author name
@@ -758,9 +616,9 @@ export function searchBooksByAuthor(authorName: string, limit: number = 10): Boo
     LIMIT ?
   `;
 
-  const results = db.query(query).all(searchTerm, searchTerm, limit) as any[];
+  const results = db.query(query).all(searchTerm, searchTerm, limit) as BookRow[];
 
-  return results.map(row => ({
+  return results.map((row) => ({
     id: row.id,
     title: row.title,
     author_sort: row.author_sort,
@@ -791,7 +649,10 @@ export function getAuthorByName(authorName: string): { name: string; bookCount: 
     LIMIT 1
   `;
 
-  const result = db.query(query).get(searchTerm, searchTerm) as any;
+  const result = db.query(query).get(searchTerm, searchTerm) as {
+    name: string;
+    book_count: number;
+  } | null;
 
   if (!result) return null;
 
@@ -803,7 +664,7 @@ export function getAuthorByName(authorName: string): { name: string; bookCount: 
 
 // Stream books in chunks for massive exports
 export async function* streamBooks(
-  batchSize: number = 1000
+  batchSize: number = 1000,
 ): AsyncGenerator<BookListItem[], void, unknown> {
   const db = getDb();
   let lastId = 0;
@@ -887,12 +748,14 @@ export function getLibraryPath(): string {
 export function getBookFormatPath(bookId: number, format: string): string | null {
   const db = getDb();
 
-  const row = db.query(`
+  const row = db
+    .query(`
     SELECT b.path, d.name
     FROM books b
     JOIN data d ON b.id = d.book
     WHERE b.id = ? AND d.format = ?
-  `).get(bookId, format.toUpperCase()) as { path: string; name: string } | undefined;
+  `)
+    .get(bookId, format.toUpperCase()) as { path: string; name: string } | undefined;
 
   if (!row) return null;
 

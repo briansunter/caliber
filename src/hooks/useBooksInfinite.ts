@@ -84,7 +84,10 @@ export function useBooksInfinite(sortConfig: SortConfig = { field: "title", orde
 }
 
 // Infinite scroll hook for search
-export function useSearchInfinite(query: string, sortConfig: SortConfig = { field: "title", order: "asc" }) {
+export function useSearchInfinite(
+  query: string,
+  sortConfig: SortConfig = { field: "title", order: "asc" },
+) {
   return useInfiniteQuery({
     queryKey: ["books", "search", "infinite", query, sortConfig.field, sortConfig.order],
     queryFn: ({ pageParam, signal }) =>

@@ -96,20 +96,31 @@ src/
 ├── index.ts              # Bun server entry (API routes + HTML serving)
 ├── frontend.tsx          # React entry point
 ├── index.html            # HTML template
+├── cli.ts                # CLI entry point
+├── mcp.ts                # MCP protocol handler (used by server)
+├── mcp-server.ts         # Standalone MCP server (stdio transport)
 ├── routes/               # TanStack Router routes
 │   ├── __root.tsx        # Root layout
 │   ├── index.tsx         # Home page (book listing with stats/search)
-│   └── book.$id.tsx      # Book detail page
+│   ├── book.$id.tsx      # Book detail page
+│   └── read.$id.$format.tsx  # EPUB/PDF reader
 ├── components/
 │   ├── BookTableInfinite.tsx  # Virtual scroll table with sorting
+│   ├── BookGridInfinite.tsx   # Grid view with covers
+│   ├── BookDetail.tsx    # Book detail view
 │   ├── BookSearch.tsx    # Search input
+│   ├── EpubReader.tsx    # EPUB reader component
+│   ├── PdfReader.tsx     # PDF reader component
 │   └── ui/               # shadcn/ui components
 ├── hooks/
 │   └── useBooksInfinite.ts    # Infinite scroll + sort hooks
 ├── lib/
 │   ├── calibre-optimized.ts   # Database layer (read-only SQLite)
-│   └── query-client.ts   # TanStack Query client config
-└── index.css             # Tailwind CSS entry
+│   ├── query-client.ts   # TanStack Query client config
+│   ├── http.ts           # HTTP utility helpers
+│   └── utils.ts          # General utilities (cn, etc.)
+├── index.css             # Tailwind CSS entry
+└── routeTree.gen.ts      # Auto-generated route tree
 ```
 
 ## Technology Stack

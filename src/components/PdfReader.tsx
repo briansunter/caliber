@@ -25,7 +25,7 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const pdfRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
-  const renderTaskRef = useRef<any>(null);
+  const renderTaskRef = useRef<pdfjsLib.RenderTask | null>(null);
   const touchRef = useRef<{ x: number; y: number; t: number } | null>(null);
 
   const posKey = `caliber-pos-${bookId}-pdf`;
@@ -35,7 +35,7 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
   const [totalPages, setTotalPages] = useState(0);
   const [showUI, setShowUI] = useState(true);
   const [zoom, setZoom] = useState(1);
-  const [_rendering, setRendering] = useState(false);
+  const [, setRendering] = useState(false);
 
   const goNext = useCallback(() => {
     setCurrentPage((p) => Math.min(p + 1, totalPages || p));
@@ -84,7 +84,7 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
         else toggleUI();
       }
     },
-    [goPrev, goNext, toggleUI]
+    [goPrev, goNext, toggleUI],
   );
 
   const onClick = useCallback(
@@ -94,7 +94,7 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
       else if (e.clientX > w * 0.7) goNext();
       else toggleUI();
     },
-    [goPrev, goNext, toggleUI]
+    [goPrev, goNext, toggleUI],
   );
 
   // Load PDF document
@@ -138,15 +138,14 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
       canvas.style.width = `${viewport.width}px`;
       canvas.style.height = `${viewport.height}px`;
 
-      const ctx = canvas.getContext("2d")!;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
       ctx.scale(dpr, dpr);
 
       const renderTask = page.render({ canvasContext: ctx, viewport });
       renderTaskRef.current = renderTask;
 
-      renderTask.promise
-        .then(() => setRendering(false))
-        .catch(() => {}); // Ignore cancellation
+      renderTask.promise.then(() => setRendering(false)).catch(() => {}); // Ignore cancellation
     });
 
     // Save position
@@ -192,7 +191,11 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
         }}
       >
         <div className="flex items-center justify-between px-3 h-12">
-          <button onClick={onBack} className="p-2 -ml-1 rounded-lg text-white active:opacity-60">
+          <button
+            type="button"
+            onClick={onBack}
+            className="p-2 -ml-1 rounded-lg text-white active:opacity-60"
+          >
             <ArrowLeft className="h-5 w-5" />
           </button>
           <span className="text-sm text-white truncate mx-2 flex-1 text-center font-medium">
@@ -200,6 +203,7 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
           </span>
           <div className="flex items-center gap-1">
             <button
+              type="button"
               onClick={() => setZoom((z) => Math.max(0.5, z - 0.25))}
               className="p-2 rounded-lg text-white active:opacity-60"
             >
@@ -209,6 +213,7 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
               {Math.round(zoom * 100)}%
             </span>
             <button
+              type="button"
               onClick={() => setZoom((z) => Math.min(3, z + 0.25))}
               className="p-2 -mr-1 rounded-lg text-white active:opacity-60"
             >
@@ -224,10 +229,11 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
           <canvas ref={canvasRef} className="block" />
         </div>
 
-        {/* Touch overlay — only when not zoomed (zoom breaks swipe UX) */}
         {!isLoading && zoom === 1 && (
-          <div
-            className="absolute inset-0 z-[106]"
+          <button
+            type="button"
+            aria-label="Page navigation overlay"
+            className="absolute inset-0 z-[106] cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none block w-full h-full"
             onTouchStart={onTouchStart}
             onTouchEnd={onTouchEnd}
             onClick={onClick}
@@ -258,6 +264,7 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
           {/* Page controls */}
           <div className="flex items-center justify-between">
             <button
+              type="button"
               onClick={goPrev}
               disabled={currentPage <= 1}
               className="p-1.5 rounded-lg text-white disabled:opacity-20 active:opacity-60"
@@ -268,6 +275,7 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
               {currentPage} / {totalPages}
             </span>
             <button
+              type="button"
               onClick={goNext}
               disabled={currentPage >= totalPages}
               className="p-1.5 rounded-lg text-white disabled:opacity-20 active:opacity-60"

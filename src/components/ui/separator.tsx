@@ -6,11 +6,7 @@ interface SeparatorProps extends React.ComponentProps<"div"> {
   orientation?: "horizontal" | "vertical";
 }
 
-function Separator({
-  className,
-  orientation = "horizontal",
-  ...props
-}: SeparatorProps) {
+function Separator({ className, orientation = "horizontal", ...props }: SeparatorProps) {
   return (
     <div
       className={cn(

@@ -49,9 +49,7 @@ const BookCover = memo(function BookCover({
 
   if (!hasCover || hasError) {
     return (
-      <div
-        className="relative w-full aspect-[2/3] bg-parchment-dark rounded-lg flex flex-col items-center justify-center text-ink-muted border border-ink"
-      >
+      <div className="relative w-full aspect-[2/3] bg-parchment-dark rounded-lg flex flex-col items-center justify-center text-ink-muted border border-ink">
         <BookText className="h-12 w-12 mb-2 text-ink-muted/40" strokeWidth={1.5} />
         <span className="text-xs text-ink-muted/60">No Cover</span>
       </div>
@@ -61,9 +59,7 @@ const BookCover = memo(function BookCover({
   return (
     <div className="relative group">
       {/* Book frame */}
-      <div
-        className="relative bg-parchment-dark rounded-lg p-1.5 border border-ink shadow-lg"
-      >
+      <div className="relative bg-parchment-dark rounded-lg p-1.5 border border-ink shadow-lg">
         <div className="relative overflow-hidden rounded-md border border-ink">
           {!isLoaded && (
             <div className="absolute inset-0 flex items-center justify-center bg-parchment-dark">
@@ -75,7 +71,7 @@ const BookCover = memo(function BookCover({
             alt={title}
             className={cn(
               "w-full aspect-[2/3] object-cover transition-all duration-500",
-              isLoaded ? "opacity-100 scale-100" : "opacity-0 scale-105"
+              isLoaded ? "opacity-100 scale-100" : "opacity-0 scale-105",
             )}
             loading="lazy"
             decoding="async"
@@ -110,7 +106,7 @@ const MetadataRow = memo(function MetadataRow({
         <p
           className={cn(
             "text-sm truncate",
-            highlight ? "font-semibold text-accent" : "text-ink-secondary"
+            highlight ? "font-semibold text-accent" : "text-ink-secondary",
           )}
         >
           {value}
@@ -121,11 +117,7 @@ const MetadataRow = memo(function MetadataRow({
 });
 
 // Star rating display
-const StarRating = memo(function StarRating({
-  rating,
-}: {
-  rating: number | null;
-}) {
+const StarRating = memo(function StarRating({ rating }: { rating: number | null }) {
   const stars = useMemo(() => {
     if (!rating || rating <= 0) return null;
     const fullStars = Math.floor(rating / 2);
@@ -146,7 +138,7 @@ const StarRating = memo(function StarRating({
               ? "fill-accent text-accent"
               : i === stars.fullStars && stars.hasHalfStar
                 ? "fill-accent/50 text-accent"
-                : "fill-parchment-dark text-ink-muted"
+                : "fill-parchment-dark text-ink-muted",
           )}
           strokeWidth={1.5}
         />
@@ -268,7 +260,9 @@ export function BookDetail({ bookId }: BookDetailProps) {
             <BookText className="h-6 w-6 text-ink-muted" strokeWidth={1.5} />
           </div>
           <h3 className="text-base font-semibold mb-1 text-ink">Book not found</h3>
-          <p className="text-sm text-ink-muted">The book you&apos;re looking for doesn&apos;t exist.</p>
+          <p className="text-sm text-ink-muted">
+            The book you&apos;re looking for doesn&apos;t exist.
+          </p>
         </div>
       </div>
     );
@@ -289,7 +283,9 @@ export function BookDetail({ bookId }: BookDetailProps) {
             {/* Read button */}
             {book.formats.some((f) => f === "EPUB" || f === "PDF") && (
               <div className="space-y-3">
-                <h3 className="text-xs font-semibold text-ink-muted uppercase tracking-widest">Read</h3>
+                <h3 className="text-xs font-semibold text-ink-muted uppercase tracking-widest">
+                  Read
+                </h3>
                 <div className="flex flex-wrap gap-2">
                   {book.formats
                     .filter((f) => f === "EPUB" || f === "PDF")
@@ -318,7 +314,9 @@ export function BookDetail({ bookId }: BookDetailProps) {
             {/* Download section */}
             {book.formats.length > 0 && (
               <div className="space-y-3">
-                <h3 className="text-xs font-semibold text-ink-muted uppercase tracking-widest">Download</h3>
+                <h3 className="text-xs font-semibold text-ink-muted uppercase tracking-widest">
+                  Download
+                </h3>
                 <div className="flex flex-wrap gap-2">
                   {book.formats.map((format) => (
                     <FormatButton key={format} format={format} bookId={bookId} />
@@ -330,7 +328,11 @@ export function BookDetail({ bookId }: BookDetailProps) {
             {/* Quick metadata */}
             <div className="pt-4 border-t border-ink space-y-1">
               {book.rating && book.rating > 0 && (
-                <MetadataRow icon={Star} label="Rating" value={<StarRating rating={book.rating} />} />
+                <MetadataRow
+                  icon={Star}
+                  label="Rating"
+                  value={<StarRating rating={book.rating} />}
+                />
               )}
               <MetadataRow icon={Calendar} label="Published" value={formattedPubDate} />
               {formattedTimestamp && (
@@ -379,14 +381,18 @@ export function BookDetail({ bookId }: BookDetailProps) {
 
           {/* Metadata grid */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-2">
-            {book.publisher && <MetadataRow icon={Building2} label="Publisher" value={book.publisher} />}
+            {book.publisher && (
+              <MetadataRow icon={Building2} label="Publisher" value={book.publisher} />
+            )}
             {book.isbn && <MetadataRow icon={Hash} label="ISBN" value={book.isbn} />}
           </div>
 
           {/* Tags */}
           {book.tags.length > 0 && (
             <div className="space-y-3">
-              <h3 className="text-xs font-semibold text-ink-muted uppercase tracking-widest">Tags</h3>
+              <h3 className="text-xs font-semibold text-ink-muted uppercase tracking-widest">
+                Tags
+              </h3>
               <div className="flex flex-wrap gap-2">
                 {book.tags.map((tag) => (
                   <TagPill key={tag} tag={tag} />

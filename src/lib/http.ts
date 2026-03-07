@@ -12,7 +12,7 @@ export class HttpError extends Error {
     message: string,
     readonly status: number,
     readonly statusText: string,
-    readonly payload?: unknown
+    readonly payload?: unknown,
   ) {
     super(message);
     this.name = "HttpError";

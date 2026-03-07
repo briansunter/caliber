@@ -53,7 +53,8 @@ const serverCapabilities = {
 const tools = [
   {
     name: "search_book_title",
-    description: "Search the local library for books by title. Returns matching books with authors, series, and formats.",
+    description:
+      "Search the local library for books by title. Returns matching books with authors, series, and formats.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -72,7 +73,8 @@ const tools = [
   },
   {
     name: "search_author",
-    description: "Search the local library for books by author name. Returns all books by matching authors.",
+    description:
+      "Search the local library for books by author name. Returns all books by matching authors.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -91,7 +93,8 @@ const tools = [
   },
   {
     name: "search_library",
-    description: "General search across the local library (title, author, series). Returns matching books.",
+    description:
+      "General search across the local library (title, author, series). Returns matching books.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -137,8 +140,8 @@ async function executeTool(name: string, args: Record<string, unknown>): Promise
         output += "No books found with that title.\n";
       } else {
         output += `Found ${books.length} book(s):\n\n`;
-        for (let i = 0; i < books.length; i++) {
-          output += `${i + 1}. ${formatBook(books[i]!)}\n`;
+        for (const [i, book] of books.entries()) {
+          output += `${i + 1}. ${formatBook(book)}\n`;
         }
       }
 
@@ -188,8 +191,8 @@ async function executeTool(name: string, args: Record<string, unknown>): Promise
         output += "No books found matching that query.\n";
       } else {
         output += `Found ${result.items.length} book(s):\n\n`;
-        for (let i = 0; i < result.items.length; i++) {
-          output += `${i + 1}. ${formatBook(result.items[i]!)}\n`;
+        for (const [i, item] of result.items.entries()) {
+          output += `${i + 1}. ${formatBook(item)}\n`;
         }
       }
 

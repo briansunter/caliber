@@ -58,7 +58,8 @@ const serverCapabilities = {
 const tools: MCPTool[] = [
   {
     name: "search_book_title",
-    description: "Search the local library for books by title. Returns matching books with authors, series, and formats.",
+    description:
+      "Search the local library for books by title. Returns matching books with authors, series, and formats.",
     inputSchema: {
       type: "object",
       properties: {
@@ -77,7 +78,8 @@ const tools: MCPTool[] = [
   },
   {
     name: "search_author",
-    description: "Search the local library for books by author name. Returns all books by matching authors.",
+    description:
+      "Search the local library for books by author name. Returns all books by matching authors.",
     inputSchema: {
       type: "object",
       properties: {
@@ -96,7 +98,8 @@ const tools: MCPTool[] = [
   },
   {
     name: "search_library",
-    description: "General search across the local library (title, author, series). Returns matching books.",
+    description:
+      "General search across the local library (title, author, series). Returns matching books.",
     inputSchema: {
       type: "object",
       properties: {
@@ -144,9 +147,8 @@ async function executeTool(name: string, args: Record<string, unknown>): Promise
         output += "No books found with that title.\n";
       } else {
         output += `Found ${books.length} book(s):\n\n`;
-        for (let i = 0; i < books.length; i++) {
-          output += `${i + 1}. ${formatBook(books[i]!)}
-`;
+        for (const [i, book] of books.entries()) {
+          output += `${i + 1}. ${formatBook(book)}\n`;
         }
       }
 
@@ -198,9 +200,8 @@ async function executeTool(name: string, args: Record<string, unknown>): Promise
         output += "No books found matching that query.\n";
       } else {
         output += `Found ${result.items.length} book(s):\n\n`;
-        for (let i = 0; i < result.items.length; i++) {
-          output += `${i + 1}. ${formatBook(result.items[i]!)}
-`;
+        for (const [i, item] of result.items.entries()) {
+          output += `${i + 1}. ${formatBook(item)}\n`;
         }
       }
 
@@ -309,7 +310,7 @@ export async function handleMCPRequest(req: Request): Promise<Response> {
           message: "Invalid request method. Use POST.",
         },
       },
-      { status: 405 }
+      { status: 405 },
     );
   }
 
@@ -318,9 +319,7 @@ export async function handleMCPRequest(req: Request): Promise<Response> {
 
     // Handle batch requests
     if (Array.isArray(body)) {
-      const responses = await Promise.all(
-        body.map((req) => handleJSONRPC(req as MCPRequest))
-      );
+      const responses = await Promise.all(body.map((req) => handleJSONRPC(req as MCPRequest)));
       return Response.json(responses, {
         headers: {
           "Access-Control-Allow-Origin": "*",
@@ -351,7 +350,7 @@ export async function handleMCPRequest(req: Request): Promise<Response> {
         headers: {
           "Access-Control-Allow-Origin": "*",
         },
-      }
+      },
     );
   }
 }

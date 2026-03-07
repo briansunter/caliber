@@ -13,13 +13,13 @@
     "rules": {
       "recommended": true,
       "suspicious": {
-        "noExplicitAny": "warn",
-        "noArrayIndexKey": "warn"
+        "noExplicitAny": "error",
+        "noArrayIndexKey": "error"
       },
       "a11y": {
-        "useButtonType": "warn",
-        "noStaticElementInteractions": "warn",
-        "useKeyWithClickEvents": "warn"
+        "useButtonType": "error",
+        "noStaticElementInteractions": "error",
+        "useKeyWithClickEvents": "error"
       },
       "complexity": {
         "noForEach": "off"
@@ -34,13 +34,7 @@
   },
   "files": {
     "ignoreUnknown": true,
-    "includes": [
-      "src/**",
-      "scripts/**",
-      "build.ts",
-      "mcp-server/**",
-      "package.json"
-    ]
+    "includes": ["src/**", "!src/routeTree.gen.ts", "scripts/**", "build.ts", "package.json"]
   },
   "css": {
     "parser": {

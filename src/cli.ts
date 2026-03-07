@@ -356,7 +356,8 @@ function printBookTable(books: BookListItem[]): void {
 }
 
 async function handleStream(parsed: ParsedArgs): Promise<void> {
-  const batchSize = getNumberArg(parsed, "batchSize", { defaultValue: 1000, min: 1, max: 10000 }) ?? 1000;
+  const batchSize =
+    getNumberArg(parsed, "batchSize", { defaultValue: 1000, min: 1, max: 10000 }) ?? 1000;
   const limit = getNumberArg(parsed, "limit", { min: 1 });
   const jsonl = hasFlag(parsed, "jsonl");
 

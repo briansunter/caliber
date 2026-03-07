@@ -11,7 +11,11 @@ type ViewMode = "list" | "grid";
 const STORAGE_KEY = "caliber-ui";
 const SCROLL_KEY = "caliber-scroll";
 
-interface UIState { view: ViewMode; sort: SortConfig; search: string }
+interface UIState {
+  view: ViewMode;
+  sort: SortConfig;
+  search: string;
+}
 
 function loadUIState(): UIState {
   try {
@@ -23,11 +27,15 @@ function loadUIState(): UIState {
 }
 
 function saveUIState(state: UIState) {
-  try { sessionStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch {}
+  try {
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch {}
 }
 
 function saveScrollPos() {
-  try { sessionStorage.setItem(SCROLL_KEY, String(window.scrollY)); } catch {}
+  try {
+    sessionStorage.setItem(SCROLL_KEY, String(window.scrollY));
+  } catch {}
 }
 
 function popScrollPos(): number | null {
@@ -35,7 +43,9 @@ function popScrollPos(): number | null {
     const v = sessionStorage.getItem(SCROLL_KEY);
     sessionStorage.removeItem(SCROLL_KEY);
     return v ? Number(v) : null;
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
 export const Route = createFileRoute("/")({
@@ -49,7 +59,7 @@ function IndexComponent() {
   const sortConfig = uiState.sort;
 
   const setSearchQuery = useCallback((q: string) => {
-    setUIState(prev => {
+    setUIState((prev) => {
       const next = { ...prev, search: q };
       saveUIState(next);
       return next;
@@ -57,7 +67,7 @@ function IndexComponent() {
   }, []);
 
   const setViewMode = useCallback((v: ViewMode) => {
-    setUIState(prev => {
+    setUIState((prev) => {
       const next = { ...prev, view: v };
       saveUIState(next);
       return next;
@@ -65,7 +75,7 @@ function IndexComponent() {
   }, []);
 
   const setSortConfig = useCallback((config: SortConfig) => {
-    setUIState(prev => {
+    setUIState((prev) => {
       const next = { ...prev, sort: config };
       saveUIState(next);
       return next;
@@ -117,9 +127,7 @@ function IndexComponent() {
             <div className="w-7 h-7 sm:w-9 sm:h-9 bg-ink rounded-lg flex items-center justify-center">
               <Library className="h-3.5 w-3.5 sm:h-4 sm:w-4 text-white" strokeWidth={1.5} />
             </div>
-            <h1 className="text-lg sm:text-2xl font-semibold text-ink tracking-tight">
-              Caliber
-            </h1>
+            <h1 className="text-lg sm:text-2xl font-semibold text-ink tracking-tight">Caliber</h1>
           </div>
           <p className="hidden sm:block text-sm text-ink-tertiary max-w-2xl">
             Browse, search, and download from your personal digital library.
@@ -154,6 +162,7 @@ function IndexComponent() {
             </div>
             <div className="flex-shrink-0 flex items-center border border-ink rounded-lg overflow-hidden">
               <button
+                type="button"
                 onClick={() => setViewMode("list")}
                 className={`p-2 transition-colors ${viewMode === "list" ? "bg-ink text-white" : "bg-white text-ink-muted hover:text-ink"}`}
                 title="List view"
@@ -161,6 +170,7 @@ function IndexComponent() {
                 <List className="h-4 w-4" strokeWidth={1.5} />
               </button>
               <button
+                type="button"
                 onClick={() => setViewMode("grid")}
                 className={`p-2 transition-colors ${viewMode === "grid" ? "bg-ink text-white" : "bg-white text-ink-muted hover:text-ink"}`}
                 title="Grid view"
@@ -183,20 +193,14 @@ function IndexComponent() {
 
             {/* Table Section */}
             <div className="bg-white border-x border-b border-ink rounded-b-lg shadow-sm">
-              <BookTableInfinite
-                searchQuery={searchQuery}
-                sortConfig={sortConfig}
-              />
+              <BookTableInfinite searchQuery={searchQuery} sortConfig={sortConfig} />
             </div>
           </>
         )}
 
         {viewMode === "grid" && (
           <div className="bg-white border-x border-b border-ink rounded-b-lg shadow-sm pt-4">
-            <BookGridInfinite
-              searchQuery={searchQuery}
-              sortConfig={sortConfig}
-            />
+            <BookGridInfinite searchQuery={searchQuery} sortConfig={sortConfig} />
           </div>
         )}
       </main>
@@ -219,7 +223,13 @@ interface StatCardProps {
   label: string;
 }
 
-function GridSortBar({ sortConfig, onSortChange }: { sortConfig: SortConfig; onSortChange: (config: SortConfig) => void }) {
+function GridSortBar({
+  sortConfig,
+  onSortChange,
+}: {
+  sortConfig: SortConfig;
+  onSortChange: (config: SortConfig) => void;
+}) {
   const handleSort = useCallback(
     (field: SortField) => {
       if (sortConfig.field === field) {
@@ -228,12 +238,14 @@ function GridSortBar({ sortConfig, onSortChange }: { sortConfig: SortConfig; onS
         onSortChange({ field, order: "asc" });
       }
     },
-    [sortConfig, onSortChange]
+    [sortConfig, onSortChange],
   );
 
   return (
     <div className="flex items-center gap-3 mt-2 pt-2 border-t border-ink/20">
-      <span className="text-xs text-ink-muted uppercase tracking-wider font-semibold shrink-0">Sort</span>
+      <span className="text-xs text-ink-muted uppercase tracking-wider font-semibold shrink-0">
+        Sort
+      </span>
       <div className="flex items-center gap-2 overflow-x-auto">
         <SortHeader label="Title" field="title" currentSort={sortConfig} onSort={handleSort} />
         <SortHeader label="Author" field="author" currentSort={sortConfig} onSort={handleSort} />

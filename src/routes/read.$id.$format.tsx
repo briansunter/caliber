@@ -35,7 +35,7 @@ function ReaderPage() {
           <p className="text-white/60 text-sm">
             {error ? "Failed to load book" : "Book not found"}
           </p>
-          <button onClick={goBack} className="mt-4 text-blue-400 text-sm underline">
+          <button type="button" onClick={goBack} className="mt-4 text-blue-400 text-sm underline">
             Go back
           </button>
         </div>
@@ -58,11 +58,9 @@ function ReaderPage() {
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-neutral-900">
       <div className="text-center">
         <BookOpen className="h-10 w-10 text-white/30 mx-auto mb-3" />
-        <p className="text-white/60 text-sm">
-          Reading {fmt} format is not supported yet.
-        </p>
+        <p className="text-white/60 text-sm">Reading {fmt} format is not supported yet.</p>
         <p className="text-white/40 text-xs mt-1">Supported: EPUB, PDF</p>
-        <button onClick={goBack} className="mt-4 text-blue-400 text-sm underline">
+        <button type="button" onClick={goBack} className="mt-4 text-blue-400 text-sm underline">
           Go back
         </button>
       </div>

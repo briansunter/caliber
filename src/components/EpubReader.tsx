@@ -1,14 +1,11 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import ePub from "epubjs";
-import type { NavItem } from "epubjs";
-import {
-  ArrowLeft,
-  Settings,
-  List,
-  Minus,
-  Plus,
-  X,
-} from "lucide-react";
+import type Book from "epubjs/types/book";
+import type Rendition from "epubjs/types/rendition";
+import type { Location } from "epubjs/types/rendition";
+import type { NavItem } from "epubjs/types/navigation";
+import type Navigation from "epubjs/types/navigation";
+import { ArrowLeft, Settings, List, Minus, Plus, X } from "lucide-react";
 
 interface EpubReaderProps {
   url: string;
@@ -74,8 +71,8 @@ function stored<T>(key: string, fallback: T): T {
 
 export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
   const viewerRef = useRef<HTMLDivElement>(null);
-  const renditionRef = useRef<any>(null);
-  const bookRef = useRef<any>(null);
+  const renditionRef = useRef<Rendition | null>(null);
+  const bookRef = useRef<Book | null>(null);
   const touchRef = useRef<{ x: number; y: number; t: number } | null>(null);
 
   const [isLoading, setIsLoading] = useState(true);
@@ -85,7 +82,9 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
   const [progress, setProgress] = useState(0);
   const [toc, setToc] = useState<NavItem[]>([]);
   const [fontSize, setFontSize] = useState(() => stored("caliber-fontsize", 100));
-  const [theme, setTheme] = useState<ReaderTheme>(() => stored("caliber-reader-theme", "light" as ReaderTheme));
+  const [theme, setTheme] = useState<ReaderTheme>(() =>
+    stored("caliber-reader-theme", "light" as ReaderTheme),
+  );
   const [locationsReady, setLocationsReady] = useState(false);
 
   const posKey = `caliber-pos-${bookId}-epub`;
@@ -136,7 +135,7 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
         else toggleUI();
       }
     },
-    [goPrev, goNext, toggleUI]
+    [goPrev, goNext, toggleUI],
   );
 
   // Click handler for desktop
@@ -147,7 +146,7 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
       else if (e.clientX > w * 0.7) goNext();
       else toggleUI();
     },
-    [goPrev, goNext, toggleUI]
+    [goPrev, goNext, toggleUI],
   );
 
   // Initialize epub.js
@@ -162,10 +161,11 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
       .then((data) => {
         if (cancelled || !viewerRef.current) return;
 
-        const book = ePub(data as any);
+        const book = ePub(data as ArrayBuffer & string);
         bookRef.current = book;
 
-        const rendition = book.renderTo(viewerRef.current!, {
+        if (!viewerRef.current) return;
+        const rendition = book.renderTo(viewerRef.current, {
           width: "100%",
           height: "100%",
           flow: "paginated",
@@ -193,12 +193,12 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
         });
 
         // TOC
-        book.loaded.navigation.then((nav: any) => {
+        book.loaded.navigation.then((nav: Navigation) => {
           if (!cancelled) setToc(nav.toc);
         });
 
         // Location tracking
-        rendition.on("relocated", (location: any) => {
+        rendition.on("relocated", (location: Location) => {
           const cfi = location.start?.cfi;
           if (cfi) {
             try {
@@ -221,7 +221,8 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
         // Keyboard
         keyHandler = (e: KeyboardEvent) => {
           if (e.key === "ArrowLeft" || e.key === "ArrowUp") rendition.prev();
-          else if (e.key === "ArrowRight" || e.key === "ArrowDown" || e.key === " ") rendition.next();
+          else if (e.key === "ArrowRight" || e.key === "ArrowDown" || e.key === " ")
+            rendition.next();
           else if (e.key === "Escape") onBack();
         };
         rendition.on("keyup", keyHandler);
@@ -235,8 +236,14 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
       const b = bookRef.current;
       renditionRef.current = null;
       bookRef.current = null;
-      if (r) try { r.destroy(); } catch {}
-      if (b) try { b.destroy(); } catch {}
+      if (r)
+        try {
+          r.destroy();
+        } catch {}
+      if (b)
+        try {
+          b.destroy();
+        } catch {}
     };
   }, [url, fontSize, onBack, posKey, theme]);
 
@@ -246,7 +253,7 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
     const rendition = renditionRef.current;
     const book = bookRef.current;
 
-    const updateProgress = (location: any) => {
+    const updateProgress = (location: Location) => {
       try {
         if (!book.locations || !location?.start?.cfi) return;
         const pct = book.locations.percentageFromCfi(location.start.cfi);
@@ -265,13 +272,17 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
   // Theme changes
   useEffect(() => {
     renditionRef.current?.themes.select(theme);
-    try { localStorage.setItem("caliber-reader-theme", JSON.stringify(theme)); } catch {}
+    try {
+      localStorage.setItem("caliber-reader-theme", JSON.stringify(theme));
+    } catch {}
   }, [theme]);
 
   // Font size changes
   useEffect(() => {
     renditionRef.current?.themes.fontSize(`${fontSize}%`);
-    try { localStorage.setItem("caliber-fontsize", JSON.stringify(fontSize)); } catch {}
+    try {
+      localStorage.setItem("caliber-fontsize", JSON.stringify(fontSize));
+    } catch {}
   }, [fontSize]);
 
   const handleTocNav = useCallback((href: string) => {
@@ -290,10 +301,18 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
     <div className="fixed inset-0 z-[100] flex flex-col select-none" style={{ background: bg }}>
       {/* Loading */}
       {isLoading && (
-        <div className="absolute inset-0 z-[115] flex items-center justify-center" style={{ background: bg }}>
+        <div
+          className="absolute inset-0 z-[115] flex items-center justify-center"
+          style={{ background: bg }}
+        >
           <div className="flex flex-col items-center gap-3">
-            <div className="h-8 w-8 animate-spin rounded-full border-2 border-current/30 border-t-current" style={{ color: fg }} />
-            <p className="text-sm" style={{ color: fg, opacity: 0.6 }}>Loading book...</p>
+            <div
+              className="h-8 w-8 animate-spin rounded-full border-2 border-current/30 border-t-current"
+              style={{ color: fg }}
+            />
+            <p className="text-sm" style={{ color: fg, opacity: 0.6 }}>
+              Loading book...
+            </p>
           </div>
         </div>
       )}
@@ -310,17 +329,38 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
         }}
       >
         <div className="flex items-center justify-between px-3 h-12">
-          <button onClick={onBack} className="p-2 -ml-1 rounded-lg active:opacity-60" style={{ color: fg }}>
+          <button
+            type="button"
+            onClick={onBack}
+            className="p-2 -ml-1 rounded-lg active:opacity-60"
+            style={{ color: fg }}
+          >
             <ArrowLeft className="h-5 w-5" />
           </button>
-          <span className="text-sm truncate mx-2 flex-1 text-center font-medium" style={{ color: fg }}>
+          <span
+            className="text-sm truncate mx-2 flex-1 text-center font-medium"
+            style={{ color: fg }}
+          >
             {title}
           </span>
           <div className="flex items-center">
-            <button onClick={() => { setShowToc(true); setShowSettings(false); }} className="p-2 rounded-lg active:opacity-60" style={{ color: fg }}>
+            <button
+              type="button"
+              onClick={() => {
+                setShowToc(true);
+                setShowSettings(false);
+              }}
+              className="p-2 rounded-lg active:opacity-60"
+              style={{ color: fg }}
+            >
               <List className="h-5 w-5" />
             </button>
-            <button onClick={() => setShowSettings((s) => !s)} className="p-2 -mr-1 rounded-lg active:opacity-60" style={{ color: fg }}>
+            <button
+              type="button"
+              onClick={() => setShowSettings((s) => !s)}
+              className="p-2 -mr-1 rounded-lg active:opacity-60"
+              style={{ color: fg }}
+            >
               <Settings className="h-5 w-5" />
             </button>
           </div>
@@ -332,10 +372,11 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
         {/* epub.js renders here */}
         <div ref={viewerRef} className="absolute inset-0" />
 
-        {/* Touch/click overlay */}
         {!isLoading && (
-          <div
-            className="absolute inset-0 z-[106]"
+          <button
+            type="button"
+            aria-label="Page navigation overlay"
+            className="absolute inset-0 z-[106] cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none block w-full h-full"
             onTouchStart={onTouchStart}
             onTouchEnd={onTouchEnd}
             onClick={onClick}
@@ -374,7 +415,12 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
       {/* Settings panel */}
       {showSettings && (
         <>
-          <div className="fixed inset-0 z-[109]" onClick={() => setShowSettings(false)} />
+          <button
+            type="button"
+            aria-label="Close settings"
+            className="fixed inset-0 z-[109] cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none block w-full h-full"
+            onClick={() => setShowSettings(false)}
+          />
           <div
             className="absolute bottom-0 left-0 right-0 z-[110] rounded-t-2xl shadow-2xl"
             style={{
@@ -393,6 +439,7 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
                 </span>
                 <div className="flex items-center gap-3">
                   <button
+                    type="button"
                     onClick={() => setFontSize((s) => Math.max(60, s - 10))}
                     className="w-9 h-9 rounded-full flex items-center justify-center border active:opacity-60"
                     style={{ color: fg, borderColor: subtle }}
@@ -403,6 +450,7 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
                     {fontSize}%
                   </span>
                   <button
+                    type="button"
                     onClick={() => setFontSize((s) => Math.min(200, s + 10))}
                     className="w-9 h-9 rounded-full flex items-center justify-center border active:opacity-60"
                     style={{ color: fg, borderColor: subtle }}
@@ -420,6 +468,7 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
                 <div className="flex items-center gap-3">
                   {(["light", "dark", "sepia"] as ReaderTheme[]).map((t) => (
                     <button
+                      type="button"
                       key={t}
                       onClick={() => setTheme(t)}
                       className="w-10 h-10 rounded-full border-2 transition-all active:scale-95"
@@ -451,14 +500,20 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
             <h2 className="text-sm font-semibold" style={{ color: fg }}>
               Contents
             </h2>
-            <button onClick={() => setShowToc(false)} className="p-2 -mr-2 active:opacity-60" style={{ color: fg }}>
+            <button
+              type="button"
+              onClick={() => setShowToc(false)}
+              className="p-2 -mr-2 active:opacity-60"
+              style={{ color: fg }}
+            >
               <X className="h-5 w-5" />
             </button>
           </div>
           <div className="flex-1 overflow-y-auto overscroll-contain">
-            {toc.map((item, i) => (
+            {toc.map((item) => (
               <button
-                key={i}
+                type="button"
+                key={item.href}
                 onClick={() => handleTocNav(item.href)}
                 className="w-full text-left px-5 py-3.5 text-sm active:opacity-60 transition-opacity"
                 style={{

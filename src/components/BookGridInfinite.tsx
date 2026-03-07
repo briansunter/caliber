@@ -48,15 +48,8 @@ const GridCard = memo(function GridCard({ book }: { book: BookListItem }) {
 });
 
 export function BookGridInfinite({ searchQuery, sortConfig }: BookGridInfiniteProps) {
-  const {
-    books,
-    hasNextPage,
-    fetchNextPage,
-    isFetchingNextPage,
-    isLoading,
-    isError,
-    error,
-  } = useFlattenedBooks(searchQuery, sortConfig);
+  const { books, hasNextPage, fetchNextPage, isFetchingNextPage, isLoading, isError, error } =
+    useFlattenedBooks(searchQuery, sortConfig);
 
   const [columns, setColumns] = useState(() => {
     const available = Math.min(window.innerWidth - 48, 1280 - 48);
@@ -91,8 +84,8 @@ export function BookGridInfinite({ searchQuery, sortConfig }: BookGridInfinitePr
 
   // Infinite scroll — just use isFetchingNextPage, no extra state
   const lastVirtualItem = virtualItems[virtualItems.length - 1];
-  const shouldFetch = lastVirtualItem && lastVirtualItem.index >= rowCount - 5
-    && hasNextPage && !isFetchingNextPage;
+  const shouldFetch =
+    lastVirtualItem && lastVirtualItem.index >= rowCount - 5 && hasNextPage && !isFetchingNextPage;
 
   const fetchRef = useRef(fetchNextPage);
   fetchRef.current = fetchNextPage;
@@ -115,8 +108,12 @@ export function BookGridInfinite({ searchQuery, sortConfig }: BookGridInfinitePr
   if (isLoading) {
     return (
       <div className="grid gap-4 p-4" style={{ gridTemplateColumns: `repeat(${columns}, 1fr)` }}>
-        {Array.from({ length: columns * 2 }).map((_, i) => (
-          <div key={i} className="aspect-[2/3] bg-parchment-dark/70 rounded-lg animate-pulse" style={{ animationDelay: `${i * 50}ms` }} />
+        {Array.from({ length: columns * 2 }, (_, i) => `skeleton-${i}`).map((key, i) => (
+          <div
+            key={key}
+            className="aspect-[2/3] bg-parchment-dark/70 rounded-lg animate-pulse"
+            style={{ animationDelay: `${i * 50}ms` }}
+          />
         ))}
       </div>
     );
@@ -129,7 +126,9 @@ export function BookGridInfinite({ searchQuery, sortConfig }: BookGridInfinitePr
           <BookOpen className="h-5 w-5 text-error" strokeWidth={1.5} />
         </div>
         <h3 className="text-base font-semibold text-ink mb-1">Failed to load books</h3>
-        <p className="text-sm text-ink-tertiary">{error instanceof Error ? error.message : "Unknown error"}</p>
+        <p className="text-sm text-ink-tertiary">
+          {error instanceof Error ? error.message : "Unknown error"}
+        </p>
       </div>
     );
   }

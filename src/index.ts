@@ -31,7 +31,7 @@ type SortOrder = (typeof SORT_ORDERS)[number];
 function parseBoundedInt(
   value: string | null | undefined,
   fallback: number,
-  bounds: { min: number; max: number }
+  bounds: { min: number; max: number },
 ): number {
   const parsed = Number.parseInt(value ?? "", 10);
   if (!Number.isFinite(parsed)) return fallback;
@@ -135,7 +135,7 @@ function getCachedResponse(cacheKey: string, data: unknown, req: Request): Respo
 
 // Streaming JSON response for large datasets
 async function* streamBooksJSON(
-  generator: AsyncGenerator<BookListItem[], void, unknown>
+  generator: AsyncGenerator<BookListItem[], void, unknown>,
 ): AsyncGenerator<string, void, unknown> {
   yield "[";
   let first = true;
@@ -226,10 +226,7 @@ const server = serve({
           return getCachedResponse(cacheKey, result, req);
         } catch (error) {
           console.error("Error listing books:", error);
-          return Response.json(
-            { error: "Failed to list books" },
-            { status: 500 }
-          );
+          return Response.json({ error: "Failed to list books" }, { status: 500 });
         }
       },
     },
@@ -250,7 +247,11 @@ const server = serve({
 
           if (!query.trim()) {
             const result = listBooksCursor({ cursor, limit, sortBy, sortOrder });
-            return getCachedResponse(`books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}`, result, req);
+            return getCachedResponse(
+              `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}`,
+              result,
+              req,
+            );
           }
 
           const result = searchBooksCursor({ query, cursor, limit, sortBy, sortOrder });
@@ -263,10 +264,7 @@ const server = serve({
           });
         } catch (error) {
           console.error("Error searching books:", error);
-          return Response.json(
-            { error: "Failed to search books" },
-            { status: 500 }
-          );
+          return Response.json({ error: "Failed to search books" }, { status: 500 });
         }
       },
     },
@@ -278,28 +276,19 @@ const server = serve({
           const id = parseInt(req.params.id, 10);
 
           if (Number.isNaN(id)) {
-            return Response.json(
-              { error: "Invalid book ID" },
-              { status: 400 }
-            );
+            return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
 
           const book = getBookByIdOptimized(id);
 
           if (!book) {
-            return Response.json(
-              { error: "Book not found" },
-              { status: 404 }
-            );
+            return Response.json({ error: "Book not found" }, { status: 404 });
           }
 
           return getCachedResponse(`book:${id}`, book, req);
         } catch (error) {
           console.error("Error getting book:", error);
-          return Response.json(
-            { error: "Failed to get book" },
-            { status: 500 }
-          );
+          return Response.json({ error: "Failed to get book" }, { status: 500 });
         }
       },
     },
@@ -312,28 +301,19 @@ const server = serve({
           const format = req.params.format.toUpperCase();
 
           if (Number.isNaN(id)) {
-            return Response.json(
-              { error: "Invalid book ID" },
-              { status: 400 }
-            );
+            return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
 
           const filePath = getBookFormatPath(id, format);
 
           if (!filePath) {
-            return Response.json(
-              { error: `Format ${format} not found` },
-              { status: 404 }
-            );
+            return Response.json({ error: `Format ${format} not found` }, { status: 404 });
           }
 
           const file = Bun.file(filePath);
 
           if (!(await file.exists())) {
-            return Response.json(
-              { error: "File not found" },
-              { status: 404 }
-            );
+            return Response.json({ error: "File not found" }, { status: 404 });
           }
 
           const contentTypeMap: Record<string, string> = {
@@ -348,9 +328,8 @@ const server = serve({
           };
 
           const book = getBookByIdOptimized(id);
-          const safeTitle = book?.title
-            .replace(/[^a-zA-Z0-9\s-]/g, "")
-            .replace(/\s+/g, "_") || "book";
+          const safeTitle =
+            book?.title.replace(/[^a-zA-Z0-9\s-]/g, "").replace(/\s+/g, "_") || "book";
           const filename = `${safeTitle}.${format.toLowerCase()}`;
 
           const fileStat = await file.stat();
@@ -371,10 +350,7 @@ const server = serve({
           });
         } catch (error) {
           console.error("Error downloading book:", error);
-          return Response.json(
-            { error: "Failed to download book" },
-            { status: 500 }
-          );
+          return Response.json({ error: "Failed to download book" }, { status: 500 });
         }
       },
     },
@@ -494,7 +470,7 @@ const server = serve({
           "node_modules",
           "pdfjs-dist",
           "build",
-          "pdf.worker.min.mjs"
+          "pdf.worker.min.mjs",
         );
         const file = Bun.file(workerPath);
         return new Response(file, {
@@ -514,10 +490,7 @@ const server = serve({
           return result;
         } catch (error) {
           console.error("MCP error:", error);
-          return Response.json(
-            { error: "MCP request failed" },
-            { status: 500 }
-          );
+          return Response.json({ error: "MCP request failed" }, { status: 500 });
         }
       },
     },

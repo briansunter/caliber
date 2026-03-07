@@ -6,7 +6,10 @@ interface BookSearchProps {
   initialValue?: string;
 }
 
-export const BookSearch = memo(function BookSearch({ onSearch, initialValue = "" }: BookSearchProps) {
+export const BookSearch = memo(function BookSearch({
+  onSearch,
+  initialValue = "",
+}: BookSearchProps) {
   const [inputValue, setInputValue] = useState(initialValue);
 
   useEffect(() => {
@@ -26,7 +29,10 @@ export const BookSearch = memo(function BookSearch({ onSearch, initialValue = ""
 
   return (
     <div className="relative">
-      <Search className="absolute left-3 sm:left-4 top-1/2 -translate-y-1/2 h-4 w-4 sm:h-5 sm:w-5 text-ink-muted" strokeWidth={1.5} />
+      <Search
+        className="absolute left-3 sm:left-4 top-1/2 -translate-y-1/2 h-4 w-4 sm:h-5 sm:w-5 text-ink-muted"
+        strokeWidth={1.5}
+      />
       <input
         type="text"
         placeholder="Search books..."
@@ -37,6 +43,7 @@ export const BookSearch = memo(function BookSearch({ onSearch, initialValue = ""
       />
       {inputValue && (
         <button
+          type="button"
           onClick={handleClear}
           className="absolute right-3 sm:right-4 top-1/2 -translate-y-1/2 p-0.5 rounded-full text-ink-muted hover:text-ink hover:bg-parchment-dark transition-colors"
           aria-label="Clear search"
