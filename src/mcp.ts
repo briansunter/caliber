@@ -8,8 +8,8 @@ import {
   searchBooksByAuthor,
   getAuthorByName,
   searchBooksCursor,
-  type BookListItem,
 } from "./lib/calibre-optimized";
+import { formatBook } from "./lib/mcp-utils";
 
 // MCP Protocol types
 interface MCPRequest {
@@ -118,17 +118,6 @@ const tools: MCPTool[] = [
   },
 ];
 
-// Format book for display
-function formatBook(book: BookListItem): string {
-  const parts = [
-    `"${book.title}"`,
-    book.authors.length > 0 ? `by ${book.authors.join(", ")}` : "",
-    book.series ? `(Book ${book.series_index} in ${book.series})` : "",
-    book.formats.length > 0 ? `[${book.formats.join(", ")}]` : "",
-  ];
-  return parts.filter(Boolean).join(" ");
-}
-
 /**
  * Execute a tool call
  */
@@ -174,13 +163,8 @@ async function executeTool(name: string, args: Record<string, unknown>): Promise
         output += "No books found by that author.\n";
       } else {
         output += `Showing ${books.length} book(s):\n\n`;
-        for (let i = 0; i < books.length; i++) {
-          output += `${i + 1}. "${books[i]?.title}"`;
-          if (books[i]?.series) {
-            output += ` (Book ${books[i]?.series_index} in ${books[i]?.series})`;
-          }
-          output += ` [${books[i]?.formats.join(", ")}]
-`;
+        for (const [i, book] of books.entries()) {
+          output += `${i + 1}. ${formatBook(book)}\n`;
         }
       }
 

@@ -98,12 +98,13 @@ export function BookGridInfinite({ searchQuery, sortConfig }: BookGridInfinitePr
 
   // Scroll to top on search/sort change (skip initial mount for scroll restoration)
   const hasMountedGrid = useRef(false);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional - scroll to top when search/sort changes
   useEffect(() => {
     if (hasMountedGrid.current) {
       window.scrollTo({ top: 0 });
     }
     hasMountedGrid.current = true;
-  }, []);
+  }, [searchQuery, sortConfig]);
 
   if (isLoading) {
     return (

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import * as pdfjsLib from "pdfjs-dist";
 import { ArrowLeft, ZoomIn, ZoomOut, ChevronLeft, ChevronRight } from "lucide-react";
+import { stored } from "@/lib/utils";
 
 // Worker setup — served from our API (versioned URL to bust cache)
 pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdfjs/pdf.worker.min.mjs?v=4.10.38";
@@ -10,15 +11,6 @@ interface PdfReaderProps {
   bookId: number;
   onBack: () => void;
   title: string;
-}
-
-function stored<T>(key: string, fallback: T): T {
-  try {
-    const v = localStorage.getItem(key);
-    return v ? JSON.parse(v) : fallback;
-  } catch {
-    return fallback;
-  }
 }
 
 export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {

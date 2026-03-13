@@ -523,17 +523,17 @@ export function getLibraryStats(): {
 } {
   const db = getDb();
 
-  const books = db.query("SELECT COUNT(*) as count FROM books").get() as { count: number };
-  const authors = db.query("SELECT COUNT(*) as count FROM authors").get() as { count: number };
-  const series = db.query("SELECT COUNT(*) as count FROM series").get() as { count: number };
-  const tags = db.query("SELECT COUNT(*) as count FROM tags").get() as { count: number };
+  const stats = db
+    .query(
+      `SELECT
+        (SELECT COUNT(*) FROM books) as totalBooks,
+        (SELECT COUNT(*) FROM authors) as totalAuthors,
+        (SELECT COUNT(*) FROM series) as totalSeries,
+        (SELECT COUNT(*) FROM tags) as totalTags`,
+    )
+    .get() as { totalBooks: number; totalAuthors: number; totalSeries: number; totalTags: number };
 
-  return {
-    totalBooks: books.count,
-    totalAuthors: authors.count,
-    totalSeries: series.count,
-    totalTags: tags.count,
-  };
+  return stats;
 }
 
 // Search books by title only
@@ -618,20 +618,7 @@ export function searchBooksByAuthor(authorName: string, limit: number = 10): Boo
 
   const results = db.query(query).all(searchTerm, searchTerm, limit) as BookRow[];
 
-  return results.map((row) => ({
-    id: row.id,
-    title: row.title,
-    author_sort: row.author_sort,
-    authors: splitAggregatedField(row.authors),
-    series: row.series,
-    series_index: row.series_index || 1,
-    tags: splitAggregatedField(row.tags),
-    formats: splitAggregatedField(row.formats),
-    has_cover: !!row.has_cover,
-    pubdate: row.pubdate,
-    timestamp: row.timestamp,
-    rating: row.rating,
-  }));
+  return results.map(parseBookRow);
 }
 
 // Get author info by name

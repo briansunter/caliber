@@ -6,6 +6,7 @@ import type { Location } from "epubjs/types/rendition";
 import type { NavItem } from "epubjs/types/navigation";
 import type Navigation from "epubjs/types/navigation";
 import { ArrowLeft, Settings, List, Minus, Plus, X } from "lucide-react";
+import { stored } from "@/lib/utils";
 
 interface EpubReaderProps {
   url: string;
@@ -59,15 +60,6 @@ const FG: Record<ReaderTheme, string> = {
   dark: "#d4d4d4",
   sepia: "#433422",
 };
-
-function stored<T>(key: string, fallback: T): T {
-  try {
-    const v = localStorage.getItem(key);
-    return v ? JSON.parse(v) : fallback;
-  } catch {
-    return fallback;
-  }
-}
 
 export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
   const viewerRef = useRef<HTMLDivElement>(null);
