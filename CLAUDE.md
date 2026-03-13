@@ -41,7 +41,7 @@ The app connects directly to Calibre's `metadata.db` SQLite database in **read-o
 
 ```typescript
 // Library path is configurable via CALIBRE_LIBRARY_PATH env var
-const LIBRARY_PATH = process.env.CALIBRE_LIBRARY_PATH || "/Users/bsunter/Desktop";
+const LIBRARY_PATH = process.env.CALIBRE_LIBRARY_PATH || join(homedir(), "Calibre Library");
 ```
 
 Key architectural decisions:
@@ -134,7 +134,7 @@ src/
 ## Environment Variables
 
 ```bash
-CALIBRE_LIBRARY_PATH=/path/to/calibre/library  # Default: /Users/bsunter/Desktop
+CALIBRE_LIBRARY_PATH=/path/to/calibre/library  # Default: ~/Calibre Library
 NODE_ENV=production                            # Set for production mode
 ```
 

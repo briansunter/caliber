@@ -3,8 +3,8 @@ import { join } from "node:path";
 import { copyFileSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 
-// Use Desktop Calibre library
-const LIBRARY_PATH = process.env.CALIBRE_LIBRARY_PATH || "/Users/bsunter/Calibre Library";
+// Calibre library path (set CALIBRE_LIBRARY_PATH env var to your library location)
+const LIBRARY_PATH = process.env.CALIBRE_LIBRARY_PATH || join(homedir(), "Calibre Library");
 const DB_NAME = process.env.CALIBRE_DB_NAME || "metadata.db";
 const DB_PATH = join(LIBRARY_PATH, DB_NAME);
 
