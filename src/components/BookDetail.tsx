@@ -164,7 +164,7 @@ const FormatButton = memo(function FormatButton({
       variant="outline"
       size="sm"
       onClick={handleDownload}
-      className="group bg-text hover:bg-accent hover:text-white border-text hover:border-accent text-white transition-all duration-150 rounded text-xs uppercase tracking-wider font-semibold"
+      className="group bg-foreground hover:bg-accent text-background hover:text-white border-foreground hover:border-accent transition-all duration-150 rounded text-xs uppercase tracking-wider font-semibold"
     >
       <span className="flex items-center gap-2">
         <Download className="h-3.5 w-3.5" strokeWidth={2} />
@@ -298,7 +298,7 @@ export function BookDetail({ bookId }: BookDetailProps) {
                         <Button
                           variant="outline"
                           size="sm"
-                          className="group bg-accent hover:bg-accent/90 border-accent text-white transition-all duration-150 rounded text-xs uppercase tracking-wider font-semibold cursor-pointer"
+                          className="group bg-primary hover:bg-primary/90 border-primary text-primary-foreground transition-all duration-150 rounded text-xs uppercase tracking-wider font-semibold cursor-pointer"
                         >
                           <span className="flex items-center gap-2">
                             <BookOpen className="h-3.5 w-3.5" strokeWidth={2} />

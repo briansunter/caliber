@@ -1,19 +1,22 @@
 import { Database } from "bun:sqlite";
 import { join } from "node:path";
-import { copyFileSync, existsSync, mkdirSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { copyFileSync, existsSync, mkdirSync, statSync, unlinkSync } from "node:fs";
+import { LIBRARY_PATH, DB_NAME, CONFIG_DIR_PATH } from "./config";
 
-// Calibre library path (set CALIBRE_LIBRARY_PATH env var to your library location)
-const LIBRARY_PATH = process.env.CALIBRE_LIBRARY_PATH || join(homedir(), "Calibre Library");
-const DB_NAME = process.env.CALIBRE_DB_NAME || "metadata.db";
 const DB_PATH = join(LIBRARY_PATH, DB_NAME);
 
 // Writable copy in ~/.config/caliber for FTS support
-const WORK_DIR = join(homedir(), ".config", "caliber");
+const WORK_DIR = CONFIG_DIR_PATH;
 const WRITABLE_DB_PATH = join(WORK_DIR, "metadata.db");
 
 function copyDbToWritable(): void {
   mkdirSync(WORK_DIR, { recursive: true });
+  // Remove stale WAL/SHM files before copying — they reference the old DB
+  // and cause SQLITE_CORRUPT if left alongside a freshly copied file
+  for (const suffix of ["-wal", "-shm"]) {
+    const p = WRITABLE_DB_PATH + suffix;
+    if (existsSync(p)) unlinkSync(p);
+  }
   copyFileSync(DB_PATH, WRITABLE_DB_PATH);
   console.log(`📋 Copied database to ${WRITABLE_DB_PATH}`);
 }

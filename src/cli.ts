@@ -17,6 +17,7 @@ import {
   streamBooks,
   type BookListItem,
 } from "./lib/calibre-optimized";
+import { DB_NAME } from "./lib/config";
 
 type SortField = "title" | "author" | "added" | "rating";
 type SortOrder = "asc" | "desc";
@@ -411,7 +412,7 @@ async function runCommand(parsed: ParsedArgs): Promise<void> {
       validateFlags(parsed, command);
       validatePositionals(parsed, command, 0);
       const libraryPath = getLibraryPath();
-      const dbPath = join(libraryPath, process.env.CALIBRE_DB_NAME || "metadata.db");
+      const dbPath = join(libraryPath, DB_NAME);
       const sourceExists = await Bun.file(dbPath).exists();
       let dbOk = false;
       let bookCount = 0;
