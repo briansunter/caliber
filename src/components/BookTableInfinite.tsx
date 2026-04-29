@@ -13,6 +13,8 @@ import {
   ChevronDown,
   ArrowUpDown,
 } from "lucide-react";
+import { isUnknownAuthor } from "@/lib/utils";
+import { CoverFallback } from "./CoverFallback";
 
 interface BookTableInfiniteProps {
   searchQuery: string;
@@ -86,23 +88,27 @@ const TitleCell = memo(function TitleCell({
     <Link
       to="/book/$id"
       params={{ id: String(id) }}
-      className="group flex items-center gap-3 min-w-0"
+      aria-label={title}
+      className="group flex items-center gap-3 min-w-0 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
     >
       <div className="relative flex-shrink-0 w-9 h-12 rounded bg-parchment-dark overflow-hidden flex items-center justify-center border border-ink">
         {hasCover ? (
           <img
             src={`/api/books/${id}/thumb`}
-            alt=""
+            alt={title}
             loading="lazy"
             decoding="async"
             fetchPriority="low"
             className="w-full h-full object-cover"
           />
         ) : (
-          <BookOpen className="h-4 w-4 text-ink-muted" strokeWidth={1.5} />
+          <CoverFallback title={title} size="sm" />
         )}
       </div>
-      <span className="font-medium text-ink-secondary group-hover:text-accent transition-colors line-clamp-2">
+      <span
+        title={title}
+        className="font-medium text-ink group-hover:text-accent transition-colors line-clamp-2"
+      >
         {title}
       </span>
     </Link>
@@ -110,10 +116,10 @@ const TitleCell = memo(function TitleCell({
 });
 
 const AuthorsCell = memo(function AuthorsCell({ authors }: { authors?: string[] }) {
-  if (!authors || authors.length === 0) {
-    return <span className="text-ink-muted italic">Unknown</span>;
+  if (isUnknownAuthor(authors)) {
+    return <span className="text-ink-muted">—</span>;
   }
-  return <span className="text-ink-tertiary truncate">{authors.join(", ")}</span>;
+  return <span className="text-ink-tertiary truncate">{authors!.join(", ")}</span>;
 });
 
 const SeriesCell = memo(function SeriesCell({
@@ -203,7 +209,7 @@ interface TableRowProps {
 const TableRow = memo(function TableRow({ book }: TableRowProps) {
   return (
     <div
-      className="flex items-center px-3 sm:px-4 border-b border-parchment hover:bg-parchment-dark transition-colors"
+      className="flex items-center px-3 sm:px-4 border-b border-parchment hover:bg-parchment-dark focus-within:bg-parchment-dark transition-colors"
       style={{ height: `${ROW_HEIGHT}px` }}
     >
       {/* Mobile layout */}
@@ -216,7 +222,7 @@ const TableRow = memo(function TableRow({ book }: TableRowProps) {
         </div>
         <div className="flex items-center min-w-0 py-2 overflow-hidden">
           <span className="text-xs text-ink-tertiary truncate">
-            {book.authors?.length ? book.authors[0] : "Unknown"}
+            {isUnknownAuthor(book.authors) ? "—" : book.authors![0]}
           </span>
         </div>
         <div className="flex items-center justify-end py-2">

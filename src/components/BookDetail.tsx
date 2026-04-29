@@ -15,7 +15,7 @@ import {
   ChevronRight,
   BookOpen,
 } from "lucide-react";
-import { useState, useCallback, memo, useMemo } from "react";
+import { useState, useCallback, memo, useMemo, useEffect } from "react";
 import { cn, stripHtmlTags } from "@/lib/utils";
 import { Link } from "@tanstack/react-router";
 
@@ -200,13 +200,24 @@ export function BookDetail({ bookId }: BookDetailProps) {
   const { data: book, isLoading, error } = useBook(bookId);
 
   const formattedPubDate = useMemo(() => {
-    if (!book?.pubdate) return "Unknown";
+    if (!book?.pubdate) return null;
     const date = new Date(book.pubdate);
+    if (Number.isNaN(date.getTime()) || date.getFullYear() < 1000) return null;
     return date.toLocaleDateString(undefined, {
       year: "numeric",
       month: "long",
     });
   }, [book?.pubdate]);
+
+  useEffect(() => {
+    if (book?.title) {
+      const previous = document.title;
+      document.title = `${book.title} – Caliber`;
+      return () => {
+        document.title = previous;
+      };
+    }
+  }, [book?.title]);
 
   const formattedTimestamp = useMemo(() => {
     if (!book?.timestamp) return "";
@@ -334,7 +345,9 @@ export function BookDetail({ bookId }: BookDetailProps) {
                   value={<StarRating rating={book.rating} />}
                 />
               )}
-              <MetadataRow icon={Calendar} label="Published" value={formattedPubDate} />
+              {formattedPubDate && (
+                <MetadataRow icon={Calendar} label="Published" value={formattedPubDate} />
+              )}
               {formattedTimestamp && (
                 <MetadataRow icon={Clock} label="Added to library" value={formattedTimestamp} />
               )}

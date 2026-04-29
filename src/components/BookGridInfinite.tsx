@@ -5,6 +5,8 @@ import { useFlattenedBooks, type SortConfig } from "@/hooks/useBooksInfinite";
 import type { BookListItem } from "@/lib/calibre-optimized";
 import { Link } from "@tanstack/react-router";
 import { BookOpen, Search, Loader2 } from "lucide-react";
+import { isUnknownAuthor } from "@/lib/utils";
+import { CoverFallback } from "./CoverFallback";
 
 interface BookGridInfiniteProps {
   searchQuery: string;
@@ -15,33 +17,38 @@ const CARD_GAP = 16;
 const CARD_MIN_WIDTH = 140;
 
 const GridCard = memo(function GridCard({ book }: { book: BookListItem }) {
+  const unknown = isUnknownAuthor(book.authors);
   return (
     <Link
       to="/book/$id"
       params={{ id: String(book.id) }}
-      className="group flex flex-col overflow-hidden rounded-lg border border-ink bg-white hover:shadow-md transition-shadow"
+      aria-label={book.title}
+      className="group flex flex-col overflow-hidden rounded-lg border border-ink bg-white hover:shadow-md hover:border-accent/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 transition-all"
     >
       <div className="relative w-full aspect-[2/3] bg-parchment-dark flex items-center justify-center overflow-hidden">
         {book.has_cover ? (
           <img
             src={`/api/books/${book.id}/thumb`}
-            alt=""
+            alt={book.title}
             loading="lazy"
             decoding="async"
             fetchPriority="low"
-            className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200"
+            className="w-full h-full object-cover group-hover:brightness-[1.04] transition-[filter] duration-200"
           />
         ) : (
-          <BookOpen className="h-10 w-10 text-ink-muted" strokeWidth={1} />
+          <CoverFallback title={book.title} size="lg" />
         )}
       </div>
-      <div className="flex flex-col gap-0.5 p-2 min-h-[60px]">
-        <span className="text-sm font-medium text-ink leading-tight line-clamp-2 group-hover:text-accent transition-colors">
+      <div className="flex flex-col gap-0.5 p-2 min-h-[76px]">
+        <span
+          title={book.title}
+          className="text-[13px] font-semibold text-ink leading-snug line-clamp-3 group-hover:text-accent transition-colors"
+        >
           {book.title}
         </span>
-        <span className="text-xs text-ink-tertiary truncate">
-          {book.authors?.length ? book.authors.join(", ") : "Unknown"}
-        </span>
+        {!unknown && (
+          <span className="text-xs text-ink-tertiary truncate">{book.authors!.join(", ")}</span>
+        )}
       </div>
     </Link>
   );
@@ -63,7 +70,7 @@ export function BookGridInfinite({ searchQuery, sortConfig }: BookGridInfinitePr
       const cols = Math.max(2, Math.floor((available + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP)));
       setColumns(cols);
       const cardWidth = (available - CARD_GAP * (cols - 1)) / cols;
-      setCardHeight(Math.round(cardWidth * 1.5 + 60 + CARD_GAP));
+      setCardHeight(Math.round(cardWidth * 1.5 + 76 + CARD_GAP));
     }
     updateLayout();
     window.addEventListener("resize", updateLayout);

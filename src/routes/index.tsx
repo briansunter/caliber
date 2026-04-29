@@ -155,7 +155,7 @@ function IndexComponent() {
         </div>
 
         {/* Search Bar + View Toggle - Sticky at top */}
-        <div className="sticky top-0 z-40 -mx-1 sm:-mx-2 px-1 sm:px-2 py-1.5 sm:py-2.5 bg-parchment/95 backdrop-blur-sm border-y border-ink">
+        <div className="sticky top-0 z-40 -mx-1 sm:-mx-2 px-1 sm:px-2 py-1.5 sm:py-2.5 bg-parchment border-y border-ink-strong shadow-sm">
           <div className="flex items-center gap-2 sm:gap-3">
             <div className="flex-1 min-w-0">
               <BookSearch onSearch={setSearchQuery} initialValue={searchQuery} />
@@ -242,8 +242,8 @@ function GridSortBar({
   );
 
   return (
-    <div className="flex items-center gap-3 mt-2 pt-2 border-t border-ink/20">
-      <span className="text-xs text-ink-muted uppercase tracking-wider font-semibold shrink-0">
+    <div className="flex items-center gap-3 mt-2 pt-2 border-t border-ink">
+      <span className="text-xs text-ink-secondary uppercase tracking-wider font-semibold shrink-0">
         Sort
       </span>
       <div className="flex items-center gap-2 overflow-x-auto">

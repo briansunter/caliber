@@ -23,3 +23,20 @@ export function stripHtmlTags(input: string): string {
     .replace(/\s+/g, " ")
     .trim();
 }
+
+export function isUnknownAuthor(authors?: string[] | null): boolean {
+  if (!authors || authors.length === 0) return true;
+  return authors.every((a) => !a || a.trim().toLowerCase() === "unknown");
+}
+
+export function coverInitials(title: string): string {
+  const cleaned = title.replace(/[^A-Za-z0-9]+/g, " ").trim();
+  if (!cleaned) return "?";
+  const words = cleaned.split(" ");
+  const first = words[0];
+  const second = words[1];
+  if (first && second && first[0] && second[0]) {
+    return (first[0] + second[0]).toUpperCase();
+  }
+  return cleaned.slice(0, 2).toUpperCase();
+}
