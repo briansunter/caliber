@@ -1,7 +1,22 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import * as pdfjsLib from "pdfjs-dist";
-import { ArrowLeft, ZoomIn, ZoomOut, ChevronLeft, ChevronRight } from "lucide-react";
+import {
+  ArrowLeft,
+  ZoomIn,
+  ZoomOut,
+  ChevronLeft,
+  ChevronRight,
+  Download,
+  Wifi,
+} from "lucide-react";
 import { stored } from "@/lib/utils";
+import {
+  getNextReaderLoadMode,
+  READER_PREFETCH_AHEAD,
+  READER_PREFETCH_BEHIND,
+  replaceReaderLoadModeInUrl,
+  type ReaderLoadMode,
+} from "./reader-types";
 
 // Worker setup — served from our API (versioned URL to bust cache)
 pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdfjs/pdf.worker.min.mjs?v=4.10.38";
@@ -11,18 +26,28 @@ interface PdfReaderProps {
   bookId: number;
   onBack: () => void;
   title: string;
+  initialLoadMode?: ReaderLoadMode;
 }
 
-export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
+export function PdfReader({
+  url,
+  bookId,
+  onBack,
+  title,
+  initialLoadMode = "stream",
+}: PdfReaderProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const pdfRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
   const renderTaskRef = useRef<pdfjsLib.RenderTask | null>(null);
+  const prefetchRunRef = useRef(0);
   const touchRef = useRef<{ x: number; y: number; t: number } | null>(null);
 
   const posKey = `caliber-pos-${bookId}-pdf`;
 
   const [isLoading, setIsLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadMode, setLoadMode] = useState<ReaderLoadMode>(initialLoadMode);
   const [currentPage, setCurrentPage] = useState(() => stored(posKey, { page: 1 }).page as number);
   const [totalPages, setTotalPages] = useState(0);
   const [showUI, setShowUI] = useState(true);
@@ -38,6 +63,15 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
   }, []);
 
   const toggleUI = useCallback(() => setShowUI((p) => !p), []);
+  const toggleLoadMode = useCallback(() => {
+    const nextMode = getNextReaderLoadMode(loadMode);
+    replaceReaderLoadModeInUrl(nextMode);
+    setLoadMode(nextMode);
+  }, [loadMode]);
+
+  useEffect(() => {
+    setLoadMode(initialLoadMode);
+  }, [initialLoadMode]);
 
   // Touch handling
   const onTouchStart = useCallback((e: React.TouchEvent) => {
@@ -89,19 +123,78 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
     [goPrev, goNext, toggleUI],
   );
 
-  // Load PDF document
+  // Load PDF document. Stream mode lets PDF.js request byte ranges; full mode fetches once.
   useEffect(() => {
     let cancelled = false;
-    pdfjsLib.getDocument(url).promise.then((pdf) => {
-      if (cancelled) return;
-      pdfRef.current = pdf;
-      setTotalPages(pdf.numPages);
-      setIsLoading(false);
-    });
+    let loadingTask: pdfjsLib.PDFDocumentLoadingTask | null = null;
+
+    async function loadPdf() {
+      setIsLoading(true);
+      setLoadError(null);
+      setTotalPages(0);
+
+      if (renderTaskRef.current) {
+        renderTaskRef.current.cancel();
+        renderTaskRef.current = null;
+      }
+
+      if (pdfRef.current) {
+        try {
+          await pdfRef.current.destroy();
+        } catch {}
+        pdfRef.current = null;
+      }
+
+      try {
+        if (loadMode === "full") {
+          const response = await fetch(url);
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const data = await response.arrayBuffer();
+          if (cancelled) return;
+          loadingTask = pdfjsLib.getDocument({ data });
+        } else {
+          loadingTask = pdfjsLib.getDocument({
+            url,
+            rangeChunkSize: 256 * 1024,
+            disableAutoFetch: true,
+            disableRange: false,
+            disableStream: true,
+          });
+        }
+
+        const pdf = await loadingTask.promise;
+        if (cancelled) {
+          await pdf.destroy();
+          return;
+        }
+
+        pdfRef.current = pdf;
+        setTotalPages(pdf.numPages);
+        setIsLoading(false);
+      } catch (error) {
+        if (cancelled) return;
+
+        if (loadMode === "stream") {
+          setLoadMode("full");
+          return;
+        }
+
+        setLoadError(error instanceof Error ? error.message : "Failed to load PDF");
+        setIsLoading(false);
+      }
+    }
+
+    void loadPdf();
+
     return () => {
       cancelled = true;
+      if (loadingTask) {
+        try {
+          loadingTask.destroy();
+        } catch {}
+      }
     };
-  }, [url]);
+  }, [url, loadMode]);
 
   // Render current page
   useEffect(() => {
@@ -146,6 +239,29 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
     } catch {}
   }, [currentPage, isLoading, zoom, posKey]);
 
+  useEffect(() => {
+    const pdf = pdfRef.current;
+    if (!pdf || isLoading || totalPages === 0) return;
+
+    const run = prefetchRunRef.current + 1;
+    prefetchRunRef.current = run;
+    const start = Math.max(1, currentPage - READER_PREFETCH_BEHIND);
+    const end = Math.min(totalPages, currentPage + READER_PREFETCH_AHEAD);
+    const pagesToWarm: number[] = [];
+
+    for (let pageNumber = start; pageNumber <= end; pageNumber += 1) {
+      if (pageNumber !== currentPage) pagesToWarm.push(pageNumber);
+    }
+
+    void Promise.all(
+      pagesToWarm.map(async (pageNumber) => {
+        const page = await pdf.getPage(pageNumber);
+        if (prefetchRunRef.current !== run) return;
+        await page.getOperatorList().catch(() => undefined);
+      }),
+    ).catch(() => {});
+  }, [currentPage, isLoading, totalPages]);
+
   // Keyboard
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
@@ -166,7 +282,24 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
         <div className="absolute inset-0 z-[115] flex items-center justify-center bg-neutral-900">
           <div className="flex flex-col items-center gap-3">
             <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
-            <p className="text-sm text-white/50">Loading PDF...</p>
+            <p className="text-sm text-white/50">
+              {loadMode === "stream" ? "Streaming PDF..." : "Loading PDF..."}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {loadError && (
+        <div className="absolute inset-0 z-[115] flex items-center justify-center bg-neutral-900">
+          <div className="max-w-sm px-6 text-center">
+            <p className="text-sm text-white/70">Failed to load PDF: {loadError}</p>
+            <button
+              type="button"
+              onClick={() => setLoadMode("stream")}
+              className="mt-4 rounded bg-white/10 px-4 py-2 text-sm text-white active:opacity-70"
+            >
+              Try streaming
+            </button>
           </div>
         </div>
       )}
@@ -194,6 +327,20 @@ export function PdfReader({ url, bookId, onBack, title }: PdfReaderProps) {
             {title}
           </span>
           <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={toggleLoadMode}
+              className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs text-white active:opacity-60"
+              aria-label={loadMode === "stream" ? "Streaming pages" : "Full-file loading"}
+              title={loadMode === "stream" ? "Streaming pages" : "Full-file loading"}
+            >
+              {loadMode === "stream" ? (
+                <Wifi className="h-4 w-4" />
+              ) : (
+                <Download className="h-4 w-4" />
+              )}
+              <span className="hidden sm:inline">{loadMode === "stream" ? "Stream" : "Full"}</span>
+            </button>
             <button
               type="button"
               onClick={() => setZoom((z) => Math.max(0.5, z - 0.25))}

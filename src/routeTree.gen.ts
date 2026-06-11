@@ -13,7 +13,7 @@
 import { Route as rootRoute } from "./routes/__root";
 import { Route as IndexImport } from "./routes/index";
 import { Route as BookIdImport } from "./routes/book.$id";
-import { Route as ReadIdFormatImport } from "./routes/read.$id.$format";
+import { Route as ReadIdFormatImport } from "./routes/read-route";
 
 // Create/Update Routes
 

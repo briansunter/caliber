@@ -1,6 +1,14 @@
 import { Database } from "bun:sqlite";
 import { join } from "node:path";
-import { copyFileSync, existsSync, mkdirSync, statSync, unlinkSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { LIBRARY_PATH, DB_NAME, CONFIG_DIR_PATH } from "./config";
 
 const DB_PATH = join(LIBRARY_PATH, DB_NAME);
@@ -8,6 +16,32 @@ const DB_PATH = join(LIBRARY_PATH, DB_NAME);
 // Writable copy in ~/.config/caliber for FTS support
 const WORK_DIR = CONFIG_DIR_PATH;
 const WRITABLE_DB_PATH = join(WORK_DIR, "metadata.db");
+const DB_SOURCE_SIGNATURE_PATH = join(WORK_DIR, "metadata.source.json");
+
+interface SourceSignature {
+  size: number;
+  mtimeMs: number;
+}
+
+function getSourceSignature(): SourceSignature {
+  const stat = statSync(DB_PATH);
+  return {
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+  };
+}
+
+function readSourceSignature(): SourceSignature | null {
+  try {
+    return JSON.parse(readFileSync(DB_SOURCE_SIGNATURE_PATH, "utf8")) as SourceSignature;
+  } catch {
+    return null;
+  }
+}
+
+function isSameSignature(a: SourceSignature | null, b: SourceSignature): boolean {
+  return Boolean(a && a.size === b.size && a.mtimeMs === b.mtimeMs);
+}
 
 function copyDbToWritable(): void {
   mkdirSync(WORK_DIR, { recursive: true });
@@ -18,6 +52,7 @@ function copyDbToWritable(): void {
     if (existsSync(p)) unlinkSync(p);
   }
   copyFileSync(DB_PATH, WRITABLE_DB_PATH);
+  writeFileSync(DB_SOURCE_SIGNATURE_PATH, `${JSON.stringify(getSourceSignature())}\n`);
   console.log(`📋 Copied database to ${WRITABLE_DB_PATH}`);
 }
 
@@ -28,6 +63,7 @@ const MAX_POOL_SIZE = 5;
 export interface BookListItem {
   id: number;
   title: string;
+  sort: string | null;
   author_sort: string | null;
   authors: string[];
   series: string | null;
@@ -58,6 +94,15 @@ export interface CursorPaginatedResult<T> {
   nextCursor: string | null;
   hasMore: boolean;
   total?: number;
+}
+
+export type CatalogKind = "authors" | "series" | "tags" | "formats";
+
+export interface CatalogEntry {
+  id: number | string;
+  title: string;
+  sort: string;
+  bookCount: number;
 }
 
 interface BookRow {
@@ -96,11 +141,12 @@ function ensureWritableDb(): void {
     copyDbToWritable();
     return;
   }
-  // Refresh if source DB is newer than the writable copy
+
+  // Refresh only when the source Calibre DB changed. The writable DB mtime
+  // changes when we create FTS/indexes, so compare a sidecar source signature.
   try {
-    const srcMtime = statSync(DB_PATH).mtimeMs;
-    const dstMtime = statSync(WRITABLE_DB_PATH).mtimeMs;
-    if (srcMtime > dstMtime) {
+    const sourceSignature = getSourceSignature();
+    if (!isSameSignature(readSourceSignature(), sourceSignature)) {
       copyDbToWritable();
       dbPool.length = 0;
     }
@@ -138,14 +184,17 @@ function getDb(): Database {
 
 // Initialize FTS5 virtual table on writable copy
 export function initFTS(): void {
-  copyDbToWritable();
-  dbPool.length = 0;
+  ensureWritableDb();
   const db = getDb();
+  const sourceSignature = getSourceSignature();
+  const sourceSignatureValue = JSON.stringify(sourceSignature);
 
   // Add indexes for sort performance
   db.exec(`CREATE INDEX IF NOT EXISTS idx_books_sort ON books(sort, id);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_books_author_sort ON books(author_sort, id);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_books_timestamp ON books(timestamp, id);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_books_series_link_series ON books_series_link(series);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_books_tags_link_tag ON books_tags_link(tag);`);
 
   // Create FTS5 virtual table for full-text search
   db.exec(`
@@ -156,10 +205,27 @@ export function initFTS(): void {
       content_rowid='id'
     );
   `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS caliber_fts_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+  `);
 
-  // Always rebuild to ensure FTS content-sync table is populated correctly
-  console.log("🔍 Building FTS index...");
-  db.exec(`INSERT INTO books_fts(books_fts) VALUES('rebuild');`);
+  const bookCount = db.query("SELECT COUNT(*) as count FROM books").get() as { count: number };
+  const ftsCount = db.query("SELECT COUNT(*) as count FROM books_fts").get() as { count: number };
+  const meta = db
+    .query("SELECT value FROM caliber_fts_meta WHERE key = 'source_signature'")
+    .get() as { value: string } | null;
+
+  if (meta?.value !== sourceSignatureValue || ftsCount.count !== bookCount.count) {
+    console.log("🔍 Building FTS index...");
+    db.exec(`INSERT INTO books_fts(books_fts) VALUES('rebuild');`);
+    db.query(
+      "INSERT OR REPLACE INTO caliber_fts_meta (key, value) VALUES ('source_signature', ?)",
+    ).run(sourceSignatureValue);
+  }
+
   const total = db.query("SELECT COUNT(*) as count FROM books_fts").get() as { count: number };
   console.log(`🔍 FTS index ready (${total.count} books)`);
 
@@ -181,6 +247,7 @@ function parseBookRow(row: BookRow): BookListItem {
   return {
     id: row.id,
     title: row.title,
+    sort: row.sort,
     author_sort: row.author_sort,
     authors: splitAggregatedField(row.authors),
     series: row.series,
@@ -200,7 +267,7 @@ function parseBookDetailsRow(row: BookRow): BookWithDetails {
     ...parseBookRow(row),
     publisher: row.publisher,
     comments: row.comments,
-    isbn: row.isbn,
+    isbn: row.isbn ?? "",
     uuid: row.uuid,
     path: row.path,
   };
@@ -211,10 +278,13 @@ function encodeCursor(book: BookListItem, sortField: string): string {
   let sortVal: string | number;
   switch (sortField) {
     case "title":
-      sortVal = book.title.toLowerCase();
+      sortVal = (book.sort || book.title).toLowerCase();
       break;
     case "author":
       sortVal = (book.author_sort || "").toLowerCase();
+      break;
+    case "added":
+      sortVal = book.timestamp || "";
       break;
     default:
       sortVal = book.id;
@@ -240,51 +310,70 @@ interface ListOptions {
   sortOrder?: "asc" | "desc";
 }
 
-// Cursor-based paginated list with CTE for O(1) performance
-export function listBooksCursor(options: ListOptions = {}): CursorPaginatedResult<BookListItem> {
+function buildBookOrderBy(
+  sortBy: NonNullable<ListOptions["sortBy"]>,
+  sortOrder: NonNullable<ListOptions["sortOrder"]>,
+): string {
+  const dir = sortOrder.toUpperCase();
+  switch (sortBy) {
+    case "title":
+      return `ORDER BY b.sort ${dir}, b.id ${dir}`;
+    case "author":
+      return `ORDER BY b.author_sort ${dir}, b.id ${dir}`;
+    case "added":
+      return `ORDER BY b.timestamp ${dir}, b.id ${dir}`;
+    case "rating":
+      return `ORDER BY b.id ${dir}`;
+    default:
+      return `ORDER BY b.sort ASC, b.id ASC`;
+  }
+}
+
+function appendBookCursorWhere(
+  bookWhere: string,
+  params: (string | number)[],
+  options: ListOptions,
+): string {
+  if (!options.cursor) return bookWhere;
+
+  const cursorData = decodeCursor(options.cursor);
+  if (!cursorData) return bookWhere;
+
+  const sortBy = options.sortBy || "title";
+  const sortOrder = options.sortOrder || "asc";
+  const sortOp = sortOrder === "asc" ? ">" : "<";
+
+  if (sortBy === "title") {
+    params.push(cursorData.sort as string, cursorData.sort as string, cursorData.id);
+    return `${bookWhere} AND (LOWER(b.sort) ${sortOp} ? OR (LOWER(b.sort) = ? AND b.id ${sortOp} ?))`;
+  }
+
+  if (sortBy === "author") {
+    params.push(cursorData.sort as string, cursorData.sort as string, cursorData.id);
+    return `${bookWhere} AND (LOWER(b.author_sort) ${sortOp} ? OR (LOWER(b.author_sort) = ? AND b.id ${sortOp} ?))`;
+  }
+
+  if (sortBy === "added") {
+    params.push(cursorData.sort as string, cursorData.sort as string, cursorData.id);
+    return `${bookWhere} AND (b.timestamp ${sortOp} ? OR (b.timestamp = ? AND b.id ${sortOp} ?))`;
+  }
+
+  params.push(cursorData.id);
+  return `${bookWhere} AND b.id ${sortOp} ?`;
+}
+
+function listBooksWithWhere(
+  options: ListOptions = {},
+  initialWhere: string = "WHERE 1=1",
+  initialParams: (string | number)[] = [],
+): CursorPaginatedResult<BookListItem> {
   const db = getDb();
   const limit = Math.min(options.limit || 100, 200);
   const sortBy = options.sortBy || "title";
   const sortOrder = options.sortOrder || "asc";
-
-  let bookWhere = "WHERE 1=1";
-  const params: (string | number)[] = [];
-
-  if (options.cursor) {
-    const cursorData = decodeCursor(options.cursor);
-    if (cursorData) {
-      const sortOp = sortOrder === "asc" ? ">" : "<";
-      if (sortBy === "title") {
-        bookWhere += ` AND (b.sort ${sortOp} ? OR (b.sort = ? AND b.id ${sortOp} ?))`;
-        params.push(cursorData.sort as string, cursorData.sort as string, cursorData.id);
-      } else if (sortBy === "author") {
-        bookWhere += ` AND (b.author_sort ${sortOp} ? OR (b.author_sort = ? AND b.id ${sortOp} ?))`;
-        params.push(cursorData.sort as string, cursorData.sort as string, cursorData.id);
-      } else {
-        bookWhere += ` AND b.id ${sortOp} ?`;
-        params.push(cursorData.id);
-      }
-    }
-  }
-
-  // Build ORDER BY for books CTE
-  let bookOrderBy = "";
-  switch (sortBy) {
-    case "title":
-      bookOrderBy = `ORDER BY b.sort ${sortOrder.toUpperCase()}, b.id ${sortOrder.toUpperCase()}`;
-      break;
-    case "author":
-      bookOrderBy = `ORDER BY b.author_sort ${sortOrder.toUpperCase()}, b.id ${sortOrder.toUpperCase()}`;
-      break;
-    case "added":
-      bookOrderBy = `ORDER BY b.timestamp ${sortOrder.toUpperCase()}, b.id ${sortOrder.toUpperCase()}`;
-      break;
-    case "rating":
-      bookOrderBy = `ORDER BY b.id ${sortOrder.toUpperCase()}`; // Fallback for rating
-      break;
-    default:
-      bookOrderBy = `ORDER BY b.sort ASC, b.id ASC`;
-  }
+  const params = [...initialParams];
+  const bookWhere = appendBookCursorWhere(initialWhere, params, options);
+  const bookOrderBy = buildBookOrderBy(sortBy, sortOrder);
 
   // Lightweight list query — only fields needed for list/grid view
   const query = `
@@ -331,40 +420,13 @@ export function listBooksCursor(options: ListOptions = {}): CursorPaginatedResul
   };
 }
 
-interface SearchOptions extends ListOptions {
-  query: string;
+// Cursor-based paginated list with CTE for O(1) performance
+export function listBooksCursor(options: ListOptions = {}): CursorPaginatedResult<BookListItem> {
+  return listBooksWithWhere(options);
 }
 
-// Helper function to build lightweight list query with CTE
-function buildBookQuery(bookWhere: string, bookOrderBy: string, limit: number): string {
-  return `
-    WITH book_page AS (
-      SELECT b.id, b.title, b.sort, b.author_sort, b.series_index, b.has_cover, b.pubdate, b.timestamp
-      FROM books b
-      ${bookWhere}
-      ${bookOrderBy}
-      LIMIT ${limit}
-    )
-    SELECT
-      b.id, b.title, b.sort, b.author_sort, b.series_index, b.has_cover, b.pubdate, b.timestamp,
-      s.name as series,
-      r.rating,
-      GROUP_CONCAT(DISTINCT a.name) as authors,
-      GROUP_CONCAT(DISTINCT t.name) as tags,
-      GROUP_CONCAT(DISTINCT d.format) as formats
-    FROM book_page b
-    LEFT JOIN books_authors_link bal ON b.id = bal.book
-    LEFT JOIN authors a ON bal.author = a.id
-    LEFT JOIN books_series_link bsl ON b.id = bsl.book
-    LEFT JOIN series s ON bsl.series = s.id
-    LEFT JOIN books_tags_link btl ON b.id = btl.book
-    LEFT JOIN tags t ON btl.tag = t.id
-    LEFT JOIN data d ON b.id = d.book
-    LEFT JOIN books_ratings_link brl ON b.id = brl.book
-    LEFT JOIN ratings r ON brl.rating = r.id
-    GROUP BY b.id
-    ${bookOrderBy}
-  `;
+interface SearchOptions extends ListOptions {
+  query: string;
 }
 
 // FTS-powered search with cursor pagination
@@ -381,7 +443,6 @@ export function searchBooksCursor(options: SearchOptions): CursorPaginatedResult
 
 // FTS5-powered search
 function ftsSearch(options: SearchOptions): CursorPaginatedResult<BookListItem> {
-  const db = getDb();
   const limit = Math.min(options.limit || 100, 200);
 
   // Build FTS query: quote each word and join with AND
@@ -395,56 +456,55 @@ function ftsSearch(options: SearchOptions): CursorPaginatedResult<BookListItem> 
 
   // Escape double quotes and wrap each word as a prefix search
   const ftsQuery = words.map((w) => `"${w.replace(/"/g, '""')}"*`).join(" AND ");
-  const params: (string | number)[] = [ftsQuery];
+  return listBooksWithWhere(
+    { ...options, limit },
+    `WHERE b.id IN (SELECT rowid FROM books_fts WHERE books_fts MATCH ?)`,
+    [ftsQuery],
+  );
+}
 
-  let bookWhere = `WHERE b.id IN (SELECT rowid FROM books_fts WHERE books_fts MATCH ?)`;
+export function listBooksByAuthorCursor(
+  authorId: number,
+  options: ListOptions = {},
+): CursorPaginatedResult<BookListItem> {
+  return listBooksWithWhere(
+    options,
+    "WHERE b.id IN (SELECT book FROM books_authors_link WHERE author = ?)",
+    [authorId],
+  );
+}
 
-  const sortBy = options.sortBy || "title";
-  const sortOrder = options.sortOrder || "asc";
-  const dir = sortOrder.toUpperCase();
+export function listBooksBySeriesCursor(
+  seriesId: number,
+  options: ListOptions = {},
+): CursorPaginatedResult<BookListItem> {
+  return listBooksWithWhere(
+    options,
+    "WHERE b.id IN (SELECT book FROM books_series_link WHERE series = ?)",
+    [seriesId],
+  );
+}
 
-  if (options.cursor) {
-    const cursorData = decodeCursor(options.cursor);
-    if (cursorData) {
-      if (sortBy === "title") {
-        const sortOp = sortOrder === "asc" ? ">" : "<";
-        bookWhere += ` AND (b.sort ${sortOp} ? OR (b.sort = ? AND b.id ${sortOp} ?))`;
-        params.push(cursorData.sort as string, cursorData.sort as string, cursorData.id);
-      } else if (sortBy === "author") {
-        const sortOp = sortOrder === "asc" ? ">" : "<";
-        bookWhere += ` AND (b.author_sort ${sortOp} ? OR (b.author_sort = ? AND b.id ${sortOp} ?))`;
-        params.push(cursorData.sort as string, cursorData.sort as string, cursorData.id);
-      } else {
-        const sortOp = sortOrder === "asc" ? ">" : "<";
-        bookWhere += ` AND b.id ${sortOp} ?`;
-        params.push(cursorData.id);
-      }
-    }
-  }
+export function listBooksByTagCursor(
+  tagId: number,
+  options: ListOptions = {},
+): CursorPaginatedResult<BookListItem> {
+  return listBooksWithWhere(
+    options,
+    "WHERE b.id IN (SELECT book FROM books_tags_link WHERE tag = ?)",
+    [tagId],
+  );
+}
 
-  let bookOrderBy: string;
-  switch (sortBy) {
-    case "author":
-      bookOrderBy = `ORDER BY b.author_sort ${dir}, b.id ${dir}`;
-      break;
-    case "added":
-      bookOrderBy = `ORDER BY b.timestamp ${dir}, b.id ${dir}`;
-      break;
-    case "rating":
-      bookOrderBy = `ORDER BY b.id ${dir}`;
-      break;
-    default:
-      bookOrderBy = `ORDER BY b.sort ${dir}, b.id ${dir}`;
-  }
-  const query = buildBookQuery(bookWhere, bookOrderBy, limit + 1);
-  const rows = db.query(query).all(...params) as BookRow[];
-
-  const hasMore = rows.length > limit;
-  const items = rows.slice(0, limit).map(parseBookRow);
-  const lastItem = items[items.length - 1];
-  const nextCursor = hasMore && lastItem ? encodeCursor(lastItem, sortBy) : null;
-
-  return { items, nextCursor, hasMore };
+export function listBooksByFormatCursor(
+  format: string,
+  options: ListOptions = {},
+): CursorPaginatedResult<BookListItem> {
+  return listBooksWithWhere(
+    options,
+    "WHERE b.id IN (SELECT book FROM data WHERE format = ?)",
+    [format.toUpperCase()],
+  );
 }
 
 // Get book details by ID
@@ -462,10 +522,13 @@ export function getBookByIdOptimized(id: number): BookWithDetails | null {
         b.has_cover,
         b.pubdate,
         b.timestamp,
-        b.isbn,
+        isbn_identifier.val as isbn,
         b.uuid,
         b.path
       FROM books b
+      LEFT JOIN identifiers isbn_identifier
+        ON b.id = isbn_identifier.book
+        AND isbn_identifier.type = 'isbn'
       WHERE b.id = ?
     )
     SELECT
@@ -539,6 +602,188 @@ export function getLibraryStats(): {
   return stats;
 }
 
+interface CatalogOptions {
+  cursor?: string;
+  limit?: number;
+  sortOrder?: "asc" | "desc";
+}
+
+function encodeCatalogCursor(entry: CatalogEntry): string {
+  return Buffer.from(JSON.stringify({ id: entry.id, sort: entry.sort })).toString("base64url");
+}
+
+function decodeCatalogCursor(cursor: string): { id: number | string; sort: string } | null {
+  try {
+    const decoded = Buffer.from(cursor, "base64url").toString();
+    return JSON.parse(decoded);
+  } catch {
+    return null;
+  }
+}
+
+function listCatalogEntries(
+  kind: CatalogKind,
+  options: CatalogOptions = {},
+): CursorPaginatedResult<CatalogEntry> {
+  const db = getDb();
+  const limit = Math.min(options.limit || 100, 200);
+  const sortOrder = options.sortOrder || "asc";
+  const dir = sortOrder.toUpperCase();
+  const sortOp = sortOrder === "asc" ? ">" : "<";
+  const cursorData = options.cursor ? decodeCatalogCursor(options.cursor) : null;
+  const cursorWhere = cursorData
+    ? `WHERE (sort ${sortOp} ? OR (sort = ? AND id ${sortOp} ?))`
+    : "";
+  const cursorParams = cursorData ? [cursorData.sort, cursorData.sort, cursorData.id] : [];
+
+  let catalogCte: string;
+  switch (kind) {
+    case "authors":
+      catalogCte = `
+        SELECT
+          a.id,
+          a.name AS title,
+          LOWER(COALESCE(a.sort, a.name)) AS sort,
+          COUNT(DISTINCT bal.book) AS bookCount
+        FROM authors a
+        JOIN books_authors_link bal ON a.id = bal.author
+        GROUP BY a.id
+      `;
+      break;
+    case "series":
+      catalogCte = `
+        SELECT
+          s.id,
+          s.name AS title,
+          LOWER(COALESCE(s.sort, s.name)) AS sort,
+          COUNT(DISTINCT bsl.book) AS bookCount
+        FROM series s
+        JOIN books_series_link bsl ON s.id = bsl.series
+        GROUP BY s.id
+      `;
+      break;
+    case "tags":
+      catalogCte = `
+        SELECT
+          t.id,
+          t.name AS title,
+          LOWER(t.name) AS sort,
+          COUNT(DISTINCT btl.book) AS bookCount
+        FROM tags t
+        JOIN books_tags_link btl ON t.id = btl.tag
+        GROUP BY t.id
+      `;
+      break;
+    case "formats":
+      catalogCte = `
+        SELECT
+          UPPER(d.format) AS id,
+          UPPER(d.format) AS title,
+          LOWER(d.format) AS sort,
+          COUNT(DISTINCT d.book) AS bookCount
+        FROM data d
+        GROUP BY UPPER(d.format)
+      `;
+      break;
+  }
+
+  const query = `
+    WITH catalog AS (${catalogCte})
+    SELECT id, title, sort, bookCount
+    FROM catalog
+    ${cursorWhere}
+    ORDER BY sort ${dir}, id ${dir}
+    LIMIT ${limit + 1}
+  `;
+
+  const rows = db.query(query).all(...cursorParams) as CatalogEntry[];
+  const hasMore = rows.length > limit;
+  const items = rows.slice(0, limit);
+  const lastItem = items[items.length - 1];
+  const nextCursor = hasMore && lastItem ? encodeCatalogCursor(lastItem) : null;
+
+  return { items, nextCursor, hasMore };
+}
+
+export function listAuthorsCursor(options: CatalogOptions = {}): CursorPaginatedResult<CatalogEntry> {
+  return listCatalogEntries("authors", options);
+}
+
+export function listSeriesCursor(options: CatalogOptions = {}): CursorPaginatedResult<CatalogEntry> {
+  return listCatalogEntries("series", options);
+}
+
+export function listTagsCursor(options: CatalogOptions = {}): CursorPaginatedResult<CatalogEntry> {
+  return listCatalogEntries("tags", options);
+}
+
+export function listFormatsCursor(options: CatalogOptions = {}): CursorPaginatedResult<CatalogEntry> {
+  return listCatalogEntries("formats", options);
+}
+
+export function getCatalogEntry(kind: CatalogKind, id: number | string): CatalogEntry | null {
+  const db = getDb();
+
+  if (kind === "formats") {
+    const format = String(id).toUpperCase();
+    const row = db
+      .query(`
+        SELECT
+          UPPER(d.format) AS id,
+          UPPER(d.format) AS title,
+          LOWER(d.format) AS sort,
+          COUNT(DISTINCT d.book) AS bookCount
+        FROM data d
+        WHERE d.format = ?
+        GROUP BY UPPER(d.format)
+      `)
+      .get(format) as CatalogEntry | null;
+    return row ?? null;
+  }
+
+  const numericId = typeof id === "number" ? id : Number.parseInt(String(id), 10);
+  if (!Number.isFinite(numericId)) return null;
+
+  const catalogQueries: Record<Exclude<CatalogKind, "formats">, string> = {
+    authors: `
+      SELECT
+        a.id,
+        a.name AS title,
+        LOWER(COALESCE(a.sort, a.name)) AS sort,
+        COUNT(DISTINCT bal.book) AS bookCount
+      FROM authors a
+      JOIN books_authors_link bal ON a.id = bal.author
+      WHERE a.id = ?
+      GROUP BY a.id
+    `,
+    series: `
+      SELECT
+        s.id,
+        s.name AS title,
+        LOWER(COALESCE(s.sort, s.name)) AS sort,
+        COUNT(DISTINCT bsl.book) AS bookCount
+      FROM series s
+      JOIN books_series_link bsl ON s.id = bsl.series
+      WHERE s.id = ?
+      GROUP BY s.id
+    `,
+    tags: `
+      SELECT
+        t.id,
+        t.name AS title,
+        LOWER(t.name) AS sort,
+        COUNT(DISTINCT btl.book) AS bookCount
+      FROM tags t
+      JOIN books_tags_link btl ON t.id = btl.tag
+      WHERE t.id = ?
+      GROUP BY t.id
+    `,
+  };
+
+  const row = db.query(catalogQueries[kind]).get(numericId) as CatalogEntry | null;
+  return row ?? null;
+}
+
 // Search books by title only
 export function searchBooksByTitle(title: string, limit: number = 10): BookListItem[] {
   const db = getDb();
@@ -548,6 +793,7 @@ export function searchBooksByTitle(title: string, limit: number = 10): BookListI
     SELECT
       b.id,
       b.title,
+      b.sort,
       b.author_sort,
       b.series_index,
       b.has_cover,
@@ -588,6 +834,7 @@ export function searchBooksByAuthor(authorName: string, limit: number = 10): Boo
     SELECT
       b.id,
       b.title,
+      b.sort,
       b.author_sort,
       b.series_index,
       b.has_cover,
@@ -671,10 +918,13 @@ export async function* streamBooks(
           b.has_cover,
           b.pubdate,
           b.timestamp,
-          b.isbn,
+          isbn_identifier.val as isbn,
           b.uuid,
           b.path
         FROM books b
+        LEFT JOIN identifiers isbn_identifier
+          ON b.id = isbn_identifier.book
+          AND isbn_identifier.type = 'isbn'
         WHERE b.id > ?
         ORDER BY b.id ASC
         LIMIT ?

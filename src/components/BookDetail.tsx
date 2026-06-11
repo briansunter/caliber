@@ -292,14 +292,14 @@ export function BookDetail({ bookId }: BookDetailProps) {
             </div>
 
             {/* Read button */}
-            {book.formats.some((f) => f === "EPUB" || f === "PDF") && (
+            {book.formats.some((f) => f === "EPUB" || f === "PDF" || f === "CBZ" || f === "CBR") && (
               <div className="space-y-3">
                 <h3 className="text-xs font-semibold text-ink-muted uppercase tracking-widest">
                   Read
                 </h3>
                 <div className="flex flex-wrap gap-2">
                   {book.formats
-                    .filter((f) => f === "EPUB" || f === "PDF")
+                    .filter((f) => f === "EPUB" || f === "PDF" || f === "CBZ" || f === "CBR")
                     .map((format) => (
                       <Link
                         key={format}

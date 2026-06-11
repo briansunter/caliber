@@ -5,17 +5,29 @@ import type Rendition from "epubjs/types/rendition";
 import type { Location } from "epubjs/types/rendition";
 import type { NavItem } from "epubjs/types/navigation";
 import type Navigation from "epubjs/types/navigation";
-import { ArrowLeft, Settings, List, Minus, Plus, X } from "lucide-react";
+import { ArrowLeft, Settings, List, Minus, Plus, X, Download, Wifi } from "lucide-react";
 import { stored } from "@/lib/utils";
+import {
+  getNextReaderLoadMode,
+  replaceReaderLoadModeInUrl,
+  type ReaderLoadMode,
+} from "./reader-types";
 
 interface EpubReaderProps {
-  url: string;
+  streamUrl: string;
+  fullUrl: string;
   bookId: number;
   onBack: () => void;
   title: string;
+  initialLoadMode?: ReaderLoadMode;
 }
 
 type ReaderTheme = "light" | "dark" | "sepia";
+
+interface SpineItemLike {
+  index?: number;
+  linear?: boolean | string;
+}
 
 const THEME_STYLES: Record<ReaderTheme, Record<string, Record<string, string>>> = {
   light: {
@@ -61,13 +73,153 @@ const FG: Record<ReaderTheme, string> = {
   sepia: "#433422",
 };
 
-export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
+function streamEntryUrl(streamUrl: string, entryPath: string): string {
+  return new URL(entryPath, new URL(streamUrl, window.location.href)).toString();
+}
+
+async function errorText(response: Response): Promise<string> {
+  try {
+    const data = (await response.json()) as { error?: string };
+    if (data.error) return data.error;
+  } catch {}
+
+  return `HTTP ${response.status}`;
+}
+
+function isZipArchive(data: ArrayBuffer): boolean {
+  const bytes = new Uint8Array(data, 0, Math.min(4, data.byteLength));
+  return bytes[0] === 0x50 && bytes[1] === 0x4b;
+}
+
+async function fetchFileBytes(url: string, range?: string): Promise<ArrayBuffer> {
+  const response = await fetch(url, range ? { headers: { Range: range } } : undefined);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.arrayBuffer();
+}
+
+function decodeMaybeHtml(data: ArrayBuffer): string | null {
+  const text = new TextDecoder("utf-8", { fatal: false }).decode(data);
+  const start = text.slice(0, 512).trimStart().toLowerCase();
+
+  if (
+    start.startsWith("<!doctype html") ||
+    start.startsWith("<html") ||
+    start.startsWith("<head") ||
+    start.startsWith("<body")
+  ) {
+    return text;
+  }
+
+  return null;
+}
+
+async function loadHtmlFallback(fullUrl: string, prefix?: ArrayBuffer): Promise<string | null> {
+  if (prefix && !decodeMaybeHtml(prefix)) return null;
+
+  const data = await fetchFileBytes(fullUrl);
+  return decodeMaybeHtml(data);
+}
+
+function clampProgress(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(100, Math.max(0, value));
+}
+
+function roundProgress(value: number): number {
+  const clamped = clampProgress(value);
+  if (clamped > 0 && clamped < 10) return Math.round(clamped * 10) / 10;
+  return Math.round(clamped);
+}
+
+function formatProgress(value: number): string {
+  if (value > 0 && value < 10 && !Number.isInteger(value)) {
+    return `${value.toFixed(1)}%`;
+  }
+  return `${Math.round(value)}%`;
+}
+
+function fractionToPercent(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return clampProgress(value <= 1 ? value * 100 : value);
+}
+
+function getLinearSpineItems(book: Book | null): SpineItemLike[] {
+  const spineItems = (book?.spine as unknown as { spineItems?: SpineItemLike[] } | undefined)
+    ?.spineItems;
+  if (!Array.isArray(spineItems)) return [];
+  return spineItems.filter((item) => item.linear !== false && item.linear !== "no");
+}
+
+function getSpineProgress(location: Location, book: Book | null): number | null {
+  const startIndex = Number(location.start?.index);
+  if (!Number.isFinite(startIndex)) return null;
+
+  const linearItems = getLinearSpineItems(book);
+  let sectionCount = linearItems.length;
+  let sectionPosition = linearItems.findIndex((item) => item.index === startIndex);
+
+  if (sectionCount === 0) {
+    let lastIndex = startIndex;
+    try {
+      const last = book?.spine?.last();
+      if (typeof last?.index === "number") lastIndex = last.index;
+    } catch {}
+    sectionCount = Math.max(lastIndex + 1, startIndex + 1);
+    sectionPosition = startIndex;
+  } else if (sectionPosition < 0) {
+    sectionPosition = Math.min(Math.max(startIndex, 0), sectionCount - 1);
+  }
+
+  if (sectionCount <= 0) return null;
+
+  const page = Number(location.start?.displayed?.page);
+  const pageCount = Number(location.start?.displayed?.total);
+  const sectionOffset =
+    Number.isFinite(page) && Number.isFinite(pageCount) && pageCount > 0
+      ? Math.min(Math.max((page - 1) / pageCount, 0), 1)
+      : 0;
+
+  return clampProgress(((sectionPosition + sectionOffset) / sectionCount) * 100);
+}
+
+function getEpubProgress(location: Location | null | undefined, book: Book | null): number {
+  if (!location?.start) return 0;
+  if (location.atStart) return 0;
+  if (location.atEnd) return 100;
+
+  const locationPercent = fractionToPercent(location.start.percentage);
+  if (locationPercent !== null && locationPercent > 0) return roundProgress(locationPercent);
+
+  try {
+    const cfi = location.start.cfi;
+    const cfiPercent = cfi ? fractionToPercent(book?.locations?.percentageFromCfi(cfi)) : null;
+    if (cfiPercent !== null && cfiPercent > 0) return roundProgress(cfiPercent);
+  } catch {}
+
+  const spinePercent = getSpineProgress(location, book);
+  if (spinePercent !== null) return roundProgress(spinePercent);
+
+  return 0;
+}
+
+export function EpubReader({
+  streamUrl,
+  fullUrl,
+  bookId,
+  onBack,
+  title,
+  initialLoadMode = "stream",
+}: EpubReaderProps) {
   const viewerRef = useRef<HTMLDivElement>(null);
   const renditionRef = useRef<Rendition | null>(null);
   const bookRef = useRef<Book | null>(null);
+  const lastLocationRef = useRef<Location | null>(null);
   const touchRef = useRef<{ x: number; y: number; t: number } | null>(null);
 
   const [isLoading, setIsLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [htmlDocument, setHtmlDocument] = useState<string | null>(null);
+  const [loadMode, setLoadMode] = useState<ReaderLoadMode>(initialLoadMode);
   const [showUI, setShowUI] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
   const [showToc, setShowToc] = useState(false);
@@ -77,7 +229,8 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
   const [theme, setTheme] = useState<ReaderTheme>(() =>
     stored("caliber-reader-theme", "light" as ReaderTheme),
   );
-  const [locationsReady, setLocationsReady] = useState(false);
+  const fontSizeRef = useRef(fontSize);
+  const themeRef = useRef(theme);
 
   const posKey = `caliber-pos-${bookId}-epub`;
 
@@ -87,6 +240,23 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
     setShowUI((p) => !p);
     setShowSettings(false);
   }, []);
+  const toggleLoadMode = useCallback(() => {
+    const nextMode = getNextReaderLoadMode(loadMode);
+    replaceReaderLoadModeInUrl(nextMode);
+    setLoadMode(nextMode);
+  }, [loadMode]);
+
+  useEffect(() => {
+    setLoadMode(initialLoadMode);
+  }, [initialLoadMode]);
+
+  useEffect(() => {
+    fontSizeRef.current = fontSize;
+  }, [fontSize]);
+
+  useEffect(() => {
+    themeRef.current = theme;
+  }, [theme]);
 
   // Touch handling on the overlay
   const onTouchStart = useCallback((e: React.TouchEvent) => {
@@ -141,22 +311,62 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
     [goPrev, goNext, toggleUI],
   );
 
-  // Initialize epub.js
+  // Initialize epub.js. Stream mode reads unpacked entries; full mode loads the archive once.
   useEffect(() => {
     if (!viewerRef.current) return;
     let cancelled = false;
     let keyHandler: ((e: KeyboardEvent) => void) | null = null;
 
-    // Fetch the EPUB as binary first (epub.js needs this for zip files served from API)
-    fetch(url)
-      .then((res) => res.arrayBuffer())
-      .then((data) => {
-        if (cancelled || !viewerRef.current) return;
+    async function openBook() {
+      setIsLoading(true);
+      setLoadError(null);
+      setHtmlDocument(null);
+      setProgress(0);
+      setToc([]);
+      lastLocationRef.current = null;
 
-        const book = ePub(data as ArrayBuffer & string);
+      try {
+        let book: Book;
+        if (loadMode === "stream") {
+          const prefix = await fetchFileBytes(fullUrl, "bytes=0-2047");
+          if (!isZipArchive(prefix)) {
+            const html = await loadHtmlFallback(fullUrl, prefix);
+            if (!html) throw new Error("Invalid EPUB archive");
+            if (!cancelled) {
+              setLoadMode("full");
+              replaceReaderLoadModeInUrl("full");
+              setHtmlDocument(html);
+              setIsLoading(false);
+            }
+            return;
+          }
+
+          const container = await fetch(streamEntryUrl(streamUrl, "META-INF/container.xml"));
+          if (!container.ok) throw new Error(await errorText(container));
+          book = ePub(streamUrl, { openAs: "directory" });
+        } else {
+          const data = await fetchFileBytes(fullUrl);
+          if (!isZipArchive(data)) {
+            const html = decodeMaybeHtml(data);
+            if (!html) throw new Error("Invalid EPUB archive");
+            if (!cancelled) {
+              setHtmlDocument(html);
+              setIsLoading(false);
+            }
+            return;
+          }
+          book = ePub(data as ArrayBuffer & string);
+        }
+
+        if (cancelled || !viewerRef.current) {
+          try {
+            book.destroy();
+          } catch {}
+          return;
+        }
+
         bookRef.current = book;
 
-        if (!viewerRef.current) return;
         const rendition = book.renderTo(viewerRef.current, {
           width: "100%",
           height: "100%",
@@ -170,27 +380,14 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
         for (const [name, styles] of Object.entries(THEME_STYLES)) {
           rendition.themes.register(name, styles);
         }
-        rendition.themes.select(theme);
-        rendition.themes.fontSize(`${fontSize}%`);
-
-        // Restore position
-        let savedCfi: string | null = null;
-        try {
-          const s = localStorage.getItem(posKey);
-          if (s) savedCfi = JSON.parse(s).cfi;
-        } catch {}
-
-        rendition.display(savedCfi || undefined).then(() => {
-          if (!cancelled) setIsLoading(false);
-        });
-
-        // TOC
-        book.loaded.navigation.then((nav: Navigation) => {
-          if (!cancelled) setToc(nav.toc);
-        });
+        rendition.themes.select(themeRef.current);
+        rendition.themes.fontSize(`${fontSizeRef.current}%`);
 
         // Location tracking
         rendition.on("relocated", (location: Location) => {
+          lastLocationRef.current = location;
+          setProgress(getEpubProgress(location, bookRef.current));
+
           const cfi = location.start?.cfi;
           if (cfi) {
             try {
@@ -199,6 +396,27 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
           }
         });
 
+        // Restore position
+        let savedCfi: string | null = null;
+        try {
+          const s = localStorage.getItem(posKey);
+          if (s) savedCfi = JSON.parse(s).cfi;
+        } catch {}
+
+        await rendition.display(savedCfi || undefined);
+        if (rendition.location) {
+          lastLocationRef.current = rendition.location;
+          setProgress(getEpubProgress(rendition.location, bookRef.current));
+        }
+        if (!cancelled) setIsLoading(false);
+
+        // TOC
+        book.loaded.navigation
+          .then((nav: Navigation) => {
+            if (!cancelled) setToc(nav.toc);
+          })
+          .catch(() => {});
+
         // Generate locations for progress (async, doesn't block)
         book.ready
           .then(() => {
@@ -206,7 +424,10 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
             return book.locations.generate(1600);
           })
           .then(() => {
-            if (!cancelled) setLocationsReady(true);
+            if (!cancelled) {
+              const location = lastLocationRef.current ?? rendition.location;
+              if (location) setProgress(getEpubProgress(location, bookRef.current));
+            }
           })
           .catch(() => {});
 
@@ -219,7 +440,20 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
         };
         rendition.on("keyup", keyHandler);
         document.addEventListener("keyup", keyHandler);
-      });
+      } catch (error) {
+        if (cancelled) return;
+
+        if (loadMode === "stream") {
+          setLoadMode("full");
+          return;
+        }
+
+        setLoadError(error instanceof Error ? error.message : "Failed to load EPUB");
+        setIsLoading(false);
+      }
+    }
+
+    void openBook();
 
     return () => {
       cancelled = true;
@@ -237,29 +471,7 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
           b.destroy();
         } catch {}
     };
-  }, [url, fontSize, onBack, posKey, theme]);
-
-  // Update progress when locations are ready
-  useEffect(() => {
-    if (!locationsReady || !renditionRef.current || !bookRef.current) return;
-    const rendition = renditionRef.current;
-    const book = bookRef.current;
-
-    const updateProgress = (location: Location) => {
-      try {
-        if (!book.locations || !location?.start?.cfi) return;
-        const pct = book.locations.percentageFromCfi(location.start.cfi);
-        setProgress(Math.round(pct * 100));
-      } catch {}
-    };
-
-    rendition.on("relocated", updateProgress);
-    // Set initial progress
-    if (rendition.location?.start?.cfi) {
-      updateProgress(rendition.location);
-    }
-    return () => rendition.off("relocated", updateProgress);
-  }, [locationsReady]);
+  }, [streamUrl, fullUrl, loadMode, onBack, posKey]);
 
   // Theme changes
   useEffect(() => {
@@ -303,8 +515,29 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
               style={{ color: fg }}
             />
             <p className="text-sm" style={{ color: fg, opacity: 0.6 }}>
-              Loading book...
+              {loadMode === "stream" ? "Streaming book..." : "Loading book..."}
             </p>
+          </div>
+        </div>
+      )}
+
+      {loadError && (
+        <div
+          className="absolute inset-0 z-[115] flex items-center justify-center"
+          style={{ background: bg }}
+        >
+          <div className="max-w-sm px-6 text-center">
+            <p className="text-sm" style={{ color: fg, opacity: 0.75 }}>
+              Failed to load EPUB: {loadError}
+            </p>
+            <button
+              type="button"
+              onClick={() => setLoadMode("stream")}
+              className="mt-4 rounded px-4 py-2 text-sm active:opacity-70"
+              style={{ color: fg, border: `1px solid ${subtle}` }}
+            >
+              Try streaming
+            </button>
           </div>
         </div>
       )}
@@ -338,6 +571,21 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
           <div className="flex items-center">
             <button
               type="button"
+              onClick={toggleLoadMode}
+              className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs active:opacity-60"
+              style={{ color: fg }}
+              aria-label={loadMode === "stream" ? "Streaming book" : "Full-file loading"}
+              title={loadMode === "stream" ? "Streaming book" : "Full-file loading"}
+            >
+              {loadMode === "stream" ? (
+                <Wifi className="h-4 w-4" />
+              ) : (
+                <Download className="h-4 w-4" />
+              )}
+              <span className="hidden sm:inline">{loadMode === "stream" ? "Stream" : "Full"}</span>
+            </button>
+            <button
+              type="button"
               onClick={() => {
                 setShowToc(true);
                 setShowSettings(false);
@@ -361,10 +609,19 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
 
       {/* Book viewer + touch overlay */}
       <div className="flex-1 relative min-h-0">
-        {/* epub.js renders here */}
-        <div ref={viewerRef} className="absolute inset-0" />
+        {htmlDocument ? (
+          <iframe
+            className="absolute inset-0 h-full w-full border-0"
+            title={title}
+            sandbox=""
+            referrerPolicy="no-referrer"
+            srcDoc={htmlDocument}
+          />
+        ) : (
+          <div ref={viewerRef} className="absolute inset-0" />
+        )}
 
-        {!isLoading && (
+        {!isLoading && !htmlDocument && (
           <button
             type="button"
             aria-label="Page navigation overlay"
@@ -398,7 +655,7 @@ export function EpubReader({ url, bookId, onBack, title }: EpubReaderProps) {
             />
           </div>
           <div className="flex justify-between mt-1.5 text-xs" style={{ color: fg, opacity: 0.45 }}>
-            <span>{progress}% read</span>
+            <span>{formatProgress(progress)} read</span>
             <span>Tap edges to turn pages</span>
           </div>
         </div>

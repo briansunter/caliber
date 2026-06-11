@@ -6,7 +6,7 @@ interface CoverFallbackProps {
   size?: "sm" | "lg";
 }
 
-const PALETTE: ReadonlyArray<readonly [string, string, string]> = [
+const PALETTE = [
   ["#eef2ff", "#c7d2fe", "#4338ca"],
   ["#fef3c7", "#fde68a", "#b45309"],
   ["#dcfce7", "#bbf7d0", "#15803d"],
@@ -15,14 +15,14 @@ const PALETTE: ReadonlyArray<readonly [string, string, string]> = [
   ["#cffafe", "#a5f3fc", "#0e7490"],
   ["#fce7f3", "#fbcfe8", "#be185d"],
   ["#e0e7ff", "#c7d2fe", "#3730a3"],
-];
+] as const;
 
 function pickPalette(title: string): readonly [string, string, string] {
   let h = 0;
   for (let i = 0; i < title.length; i++) {
     h = (h * 31 + title.charCodeAt(i)) | 0;
   }
-  return PALETTE[Math.abs(h) % PALETTE.length] ?? PALETTE[0]!;
+  return PALETTE[Math.abs(h) % PALETTE.length] ?? PALETTE[0];
 }
 
 export const CoverFallback = memo(function CoverFallback({

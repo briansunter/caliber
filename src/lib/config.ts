@@ -19,7 +19,7 @@ function loadConfig(): Config {
   mkdirSync(CONFIG_DIR, { recursive: true });
 
   if (!existsSync(CONFIG_PATH)) {
-    writeFileSync(CONFIG_PATH, JSON.stringify(DEFAULTS, null, 2) + "\n");
+    writeFileSync(CONFIG_PATH, `${JSON.stringify(DEFAULTS, null, 2)}\n`);
     return { ...DEFAULTS };
   }
 

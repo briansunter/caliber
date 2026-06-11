@@ -119,7 +119,7 @@ const AuthorsCell = memo(function AuthorsCell({ authors }: { authors?: string[] 
   if (isUnknownAuthor(authors)) {
     return <span className="text-ink-muted">—</span>;
   }
-  return <span className="text-ink-tertiary truncate">{authors!.join(", ")}</span>;
+  return <span className="text-ink-tertiary truncate">{authors?.join(", ")}</span>;
 });
 
 const SeriesCell = memo(function SeriesCell({
@@ -222,7 +222,7 @@ const TableRow = memo(function TableRow({ book }: TableRowProps) {
         </div>
         <div className="flex items-center min-w-0 py-2 overflow-hidden">
           <span className="text-xs text-ink-tertiary truncate">
-            {isUnknownAuthor(book.authors) ? "—" : book.authors![0]}
+            {isUnknownAuthor(book.authors) ? "—" : book.authors?.[0]}
           </span>
         </div>
         <div className="flex items-center justify-end py-2">

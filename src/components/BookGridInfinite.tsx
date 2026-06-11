@@ -47,7 +47,7 @@ const GridCard = memo(function GridCard({ book }: { book: BookListItem }) {
           {book.title}
         </span>
         {!unknown && (
-          <span className="text-xs text-ink-tertiary truncate">{book.authors!.join(", ")}</span>
+          <span className="text-xs text-ink-tertiary truncate">{book.authors?.join(", ")}</span>
         )}
       </div>
     </Link>

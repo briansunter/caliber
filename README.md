@@ -5,8 +5,9 @@ A fast, modern web interface for browsing, reading, and downloading books from y
 ## Highlights
 
 - **Fast** — cursor-based pagination instead of OFFSET queries, so browsing stays instant no matter how large your library gets
-- **Read in the browser** — built-in EPUB and PDF readers
+- **Read in the browser** — built-in EPUB, PDF, CBZ, and CBR readers
 - **Download books** — access any format stored in your library
+- **OPDS catalog** — browse from OPDS-compatible reader apps with download and inline file links
 - **Modern UI** — infinite scroll, virtual rendering, responsive design
 - **Lightweight** — single process, minimal dependencies
 
@@ -23,6 +24,11 @@ bun dev
 ```
 
 Open [http://localhost:3003](http://localhost:3003).
+
+OPDS clients can use [http://localhost:3003/opds](http://localhost:3003/opds). The web reader
+defaults to streaming mode and also supports full-file loading with `?mode=full` where the
+format supports it. EPUB streams unpacked entries, PDF uses HTTP byte ranges, CBZ supports
+streamed pages or full-archive loading, and CBR streams extracted pages.
 
 ## CLI
 
@@ -58,7 +64,20 @@ GET /api/books/search?q=               Search books
 GET /api/books/:id                     Book details
 GET /api/books/:id/cover               Cover image
 GET /api/books/:id/download/:format    Download book file
+GET /api/books/:id/file/:format        Open/stream book file inline with byte ranges
+GET /api/books/:id/epub/*              Stream unpacked EPUB entries
+GET /api/books/:id/pages/:format/manifest
+GET /api/books/:id/pages/:format/:page Stream CBZ/CBR/PDF page images
 GET /api/stats                         Library statistics
+GET /opds                              OPDS catalog root
+GET /opds/books                        OPDS paged acquisition feed
+GET /opds/authors                      OPDS author navigation feed
+GET /opds/series                       OPDS series navigation feed
+GET /opds/tags                         OPDS tag navigation feed
+GET /opds/formats                      OPDS format navigation feed
+GET /opds/recent                       OPDS recently-added feed
+GET /opds/search?q=                    OPDS search feed
+GET /opds/search.xml                   OPDS OpenSearch descriptor
 ```
 
 ## Tech Stack
