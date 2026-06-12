@@ -13,8 +13,7 @@ import {
 import { stored } from "@/lib/utils";
 import {
   getNextReaderLoadMode,
-  READER_PREFETCH_AHEAD,
-  READER_PREFETCH_BEHIND,
+  prefetchOrder,
   replaceReaderLoadModeInUrl,
   type ReaderLoadMode,
 } from "./reader-types";
@@ -478,21 +477,19 @@ export function PdfReader({
 
     const run = prefetchRunRef.current + 1;
     prefetchRunRef.current = run;
-    const start = Math.max(1, currentPage - READER_PREFETCH_BEHIND);
-    const end = Math.min(totalPages, currentPage + READER_PREFETCH_AHEAD);
-    const pagesToWarm: number[] = [];
 
-    for (let pageNumber = start; pageNumber <= end; pageNumber += 1) {
-      if (pageNumber !== currentPage) pagesToWarm.push(pageNumber);
-    }
-
-    void Promise.all(
-      pagesToWarm.map(async (pageNumber) => {
-        const page = await pdf.getPage(pageNumber);
+    // Warm sequentially, closest page first, so the most likely next page
+    // never waits behind further-out pages
+    void (async () => {
+      for (const pageNumber of prefetchOrder(currentPage, 1, totalPages)) {
         if (prefetchRunRef.current !== run) return;
-        await page.getOperatorList().catch(() => undefined);
-      }),
-    ).catch(() => {});
+        try {
+          const page = await pdf.getPage(pageNumber);
+          if (prefetchRunRef.current !== run) return;
+          await page.getOperatorList();
+        } catch {}
+      }
+    })();
   }, [currentPage, isLoading, totalPages]);
 
   // Keyboard

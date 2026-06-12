@@ -4,8 +4,7 @@ import { ArrowLeft, ChevronLeft, ChevronRight, Download, Wifi, ZoomIn, ZoomOut }
 import { stored } from "@/lib/utils";
 import {
   getNextReaderLoadMode,
-  READER_PREFETCH_AHEAD,
-  READER_PREFETCH_BEHIND,
+  prefetchOrder,
   replaceReaderLoadModeInUrl,
   type ReaderLoadMode,
 } from "./reader-types";
@@ -210,28 +209,43 @@ export function ComicReader({
   useEffect(() => {
     if (isLoading || pages.length === 0) return;
 
+    const warmOrder = prefetchOrder(currentPage, 1, pages.length);
     const keep = new Set<string>();
-    const start = Math.max(0, currentPage - 1 - READER_PREFETCH_BEHIND);
-    const end = Math.min(pages.length - 1, currentPage - 1 + READER_PREFETCH_AHEAD);
+    const currentHref = pages[currentPage - 1]?.href;
+    if (currentHref) keep.add(currentHref);
 
-    for (let index = start; index <= end; index += 1) {
-      const candidate = pages[index];
-      if (!candidate) continue;
+    // Kick off fetch+decode sequentially, nearest-forward first, so the next
+    // page always wins the bandwidth race over further-out pages
+    let cancelled = false;
+    void (async () => {
+      for (const pageNumber of warmOrder) {
+        if (cancelled) return;
+        const candidate = pages[pageNumber - 1];
+        if (!candidate) continue;
 
-      keep.add(candidate.href);
-      if (candidate.href === page?.href || preloadedImagesRef.current.has(candidate.href)) continue;
+        keep.add(candidate.href);
+        let image = preloadedImagesRef.current.get(candidate.href);
+        if (!image) {
+          image = new Image();
+          image.decoding = "async";
+          image.src = candidate.href;
+          preloadedImagesRef.current.set(candidate.href, image);
+        }
+        await image.decode?.().catch(() => {
+          preloadedImagesRef.current.delete(candidate.href);
+        });
+      }
 
-      const image = new Image();
-      image.decoding = "async";
-      image.src = candidate.href;
-      preloadedImagesRef.current.set(candidate.href, image);
-      void image.decode?.().catch(() => {});
-    }
+      if (cancelled) return;
+      for (const href of preloadedImagesRef.current.keys()) {
+        if (!keep.has(href)) preloadedImagesRef.current.delete(href);
+      }
+    })();
 
-    for (const href of preloadedImagesRef.current.keys()) {
-      if (!keep.has(href)) preloadedImagesRef.current.delete(href);
-    }
-  }, [currentPage, isLoading, page?.href, pages]);
+    return () => {
+      cancelled = true;
+    };
+  }, [currentPage, isLoading, pages]);
 
   useEffect(() => {
     try {
@@ -241,6 +255,7 @@ export function ComicReader({
 
   // Double-buffer page turns: keep the current image on screen until the next
   // one is fully decoded, then swap in a single frame — no blank flash.
+  // biome-ignore lint/correctness/useExhaustiveDependencies(retryToken): retryToken re-triggers the decode after a failed page load
   useEffect(() => {
     if (isLoading || !page) return;
     if (displayed?.href === page.href) return;
