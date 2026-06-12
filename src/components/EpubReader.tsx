@@ -204,6 +204,24 @@ function getEpubProgress(location: Location | null | undefined, book: Book | nul
   return 0;
 }
 
+interface EpubPageInfo {
+  current: number;
+  total: number;
+}
+
+function getEpubPageInfo(location: Location | null | undefined, book: Book | null): EpubPageInfo | null {
+  const total = book?.locations?.length() ?? 0;
+  const cfi = location?.start?.cfi;
+  if (!total || !cfi) return null;
+  try {
+    const index = Number(book?.locations?.locationFromCfi(cfi));
+    if (!Number.isFinite(index) || index < 0) return null;
+    return { current: Math.min(index + 1, total), total };
+  } catch {
+    return null;
+  }
+}
+
 function closestElement(target: ReaderPointerTarget): Element | null {
   const node = target as (Node & { closest?: (selector: string) => Element | null }) | null;
   if (!node) return null;
@@ -251,6 +269,7 @@ export function EpubReader({
   const [showSettings, setShowSettings] = useState(false);
   const [showToc, setShowToc] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [pageInfo, setPageInfo] = useState<EpubPageInfo | null>(null);
   const [toc, setToc] = useState<NavItem[]>([]);
   const [fontSize, setFontSize] = useState(() => stored("caliber-fontsize", 100));
   const [theme, setTheme] = useState<ReaderTheme>(() =>
@@ -371,6 +390,7 @@ export function EpubReader({
         rendition.on("relocated", (location: Location) => {
           lastLocationRef.current = location;
           setProgress(getEpubProgress(location, bookRef.current));
+          setPageInfo(getEpubPageInfo(location, bookRef.current));
 
           const cfi = location.start?.cfi;
           if (cfi) {
@@ -391,6 +411,7 @@ export function EpubReader({
         if (rendition.location) {
           lastLocationRef.current = rendition.location;
           setProgress(getEpubProgress(rendition.location, bookRef.current));
+          setPageInfo(getEpubPageInfo(rendition.location, bookRef.current));
         }
         if (!cancelled) setIsLoading(false);
 
@@ -410,7 +431,10 @@ export function EpubReader({
           .then(() => {
             if (!cancelled) {
               const location = lastLocationRef.current ?? rendition.location;
-              if (location) setProgress(getEpubProgress(location, bookRef.current));
+              if (location) {
+                setProgress(getEpubProgress(location, bookRef.current));
+                setPageInfo(getEpubPageInfo(location, bookRef.current));
+              }
             }
           })
           .catch(() => {});
@@ -728,7 +752,10 @@ export function EpubReader({
             />
           </div>
           <div className="flex justify-between mt-1.5 text-xs" style={{ color: fg, opacity: 0.45 }}>
-            <span>{formatProgress(progress)} read</span>
+            <span className="tabular-nums">
+              {formatProgress(progress)} read
+              {pageInfo ? ` (${pageInfo.current} / ${pageInfo.total})` : ""}
+            </span>
             <span>{isTouchDevice ? "Tap edges to turn pages" : "Click edges or use ← → keys"}</span>
           </div>
         </div>

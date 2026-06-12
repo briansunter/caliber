@@ -83,6 +83,7 @@ export function PdfReader({
   const renderTokenRef = useRef(0);
   const prefetchRunRef = useRef(0);
   const touchRef = useRef<{ x: number; y: number; t: number } | null>(null);
+  const lastTouchEndRef = useRef(0);
 
   const posKey = `caliber-pos-${bookId}-pdf`;
   const zoomKey = `caliber-zoom-${bookId}-pdf`;
@@ -259,6 +260,10 @@ export function PdfReader({
       if (!start) return;
       touchRef.current = null;
 
+      // The browser fires a synthesized click after touchend for the same tap;
+      // mark the touch as handled so onClick ignores it (else one tap = two pages)
+      lastTouchEndRef.current = Date.now();
+
       const touch = e.changedTouches[0];
       if (!touch) return;
       const dx = touch.clientX - start.x;
@@ -285,6 +290,8 @@ export function PdfReader({
   const onClick = useCallback(
     (e: React.MouseEvent) => {
       if (zoom !== 1 || isInteractiveTarget(e.target)) return;
+      // Ignore the click synthesized from a touch we already handled
+      if (Date.now() - lastTouchEndRef.current < 700) return;
 
       const w = window.innerWidth;
       if (e.clientX < w * 0.3) goPrev();
