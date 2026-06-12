@@ -5,6 +5,8 @@ import { BookSearch } from "@/components/BookSearch";
 import { useState, useCallback, useEffect, useRef } from "react";
 import { BookOpen, Users, Layers, Library, LayoutGrid, List, Settings } from "lucide-react";
 import { useLibraryStats, type SortConfig, type SortField } from "@/hooks/useBooksInfinite";
+import { UserMenu } from "@/components/UserMenu";
+import { RecentlyRead } from "@/components/RecentlyRead";
 
 type ViewMode = "list" | "grid";
 
@@ -128,14 +130,17 @@ function IndexComponent() {
               <Library className="h-3.5 w-3.5 sm:h-4 sm:w-4 text-white" strokeWidth={1.5} />
             </div>
             <h1 className="text-lg sm:text-2xl font-semibold text-ink tracking-tight">Caliber</h1>
-            <Link
-              to="/settings"
-              className="ml-auto p-2 rounded-lg text-ink-muted hover:text-ink hover:bg-ink/5 transition-colors"
-              aria-label="Settings"
-              title="Settings"
-            >
-              <Settings className="h-5 w-5" strokeWidth={1.5} />
-            </Link>
+            <div className="ml-auto flex items-center gap-1.5">
+              <UserMenu />
+              <Link
+                to="/settings"
+                className="p-2 rounded-lg text-ink-muted hover:text-ink hover:bg-ink/5 transition-colors"
+                aria-label="Settings"
+                title="Settings"
+              >
+                <Settings className="h-5 w-5" strokeWidth={1.5} />
+              </Link>
+            </div>
           </div>
           <p className="hidden sm:block text-sm text-ink-tertiary max-w-2xl">
             Browse, search, and download from your personal digital library.
@@ -161,6 +166,9 @@ function IndexComponent() {
             label="Series"
           />
         </div>
+
+        {/* Recently read shelf (only shown when signed in with history) */}
+        <RecentlyRead />
 
         {/* Search Bar + View Toggle - Sticky at top */}
         <div className="sticky top-0 z-40 -mx-1 sm:-mx-2 px-1 sm:px-2 py-1.5 sm:py-2.5 bg-parchment border-y border-ink-strong shadow-sm">

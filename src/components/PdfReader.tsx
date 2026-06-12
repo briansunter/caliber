@@ -15,6 +15,7 @@ import {
 import { stored } from "@/lib/utils";
 import { useReaderSettings } from "@/lib/reader-settings";
 import { useFullscreen } from "@/lib/use-fullscreen";
+import { fetchBookProgress, saveBookProgress } from "@/lib/reading-progress";
 import {
   getNextReaderLoadMode,
   prefetchOrder,
@@ -508,6 +509,15 @@ export function PdfReader({
     try {
       localStorage.setItem(posKey, JSON.stringify({ page: currentPage, ts: Date.now() }));
     } catch {}
+    // Sync to the signed-in user's server-side progress (debounced).
+    if (totalPages > 0) {
+      saveBookProgress(bookId, {
+        format: "PDF",
+        location: String(currentPage),
+        percentage: (currentPage / totalPages) * 100,
+        finished: currentPage >= totalPages,
+      });
+    }
     // Save zoom
     try {
       localStorage.setItem(zoomKey, JSON.stringify({ zoom, ts: Date.now() }));
@@ -521,7 +531,27 @@ export function PdfReader({
     zoomKey,
     pdfLinkService,
     settings.maxRenderScale,
+    bookId,
+    totalPages,
   ]);
+
+  // Restore the signed-in user's server-side page once, after the doc loads.
+  const serverRestoredRef = useRef(false);
+  useEffect(() => {
+    if (serverRestoredRef.current || isLoading || totalPages === 0) return;
+    serverRestoredRef.current = true;
+    let cancelled = false;
+    fetchBookProgress(bookId).then((p) => {
+      if (cancelled || !p?.location) return;
+      const page = Number.parseInt(p.location, 10);
+      if (Number.isFinite(page) && page >= 1 && page <= totalPages) {
+        setCurrentPage(page);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [bookId, isLoading, totalPages]);
 
   useEffect(() => {
     const pdf = pdfRef.current;

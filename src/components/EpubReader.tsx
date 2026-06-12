@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { stored } from "@/lib/utils";
 import { useFullscreen } from "@/lib/use-fullscreen";
+import { fetchBookProgress, saveBookProgress } from "@/lib/reading-progress";
 import {
   getNextReaderLoadMode,
   replaceReaderLoadModeInUrl,
@@ -416,7 +417,8 @@ export function EpubReader({
         // Location tracking
         rendition.on("relocated", (location: Location) => {
           lastLocationRef.current = location;
-          setProgress(getEpubProgress(location, bookRef.current));
+          const pct = getEpubProgress(location, bookRef.current);
+          setProgress(pct);
           setPageInfo(getEpubPageInfo(location, bookRef.current));
 
           const cfi = location.start?.cfi;
@@ -424,15 +426,29 @@ export function EpubReader({
             try {
               localStorage.setItem(posKey, JSON.stringify({ cfi, ts: Date.now() }));
             } catch {}
+            // Sync to the signed-in user's server-side progress (debounced).
+            saveBookProgress(bookId, {
+              format: "EPUB",
+              location: cfi,
+              percentage: pct,
+              finished: Boolean(location.atEnd) || pct >= 99,
+            });
           }
         });
 
-        // Restore position
+        // Restore position: prefer the signed-in user's server progress, then
+        // fall back to this device's localStorage.
         let savedCfi: string | null = null;
         try {
-          const s = localStorage.getItem(posKey);
-          if (s) savedCfi = JSON.parse(s).cfi;
+          const serverProgress = await fetchBookProgress(bookId);
+          if (serverProgress?.location) savedCfi = serverProgress.location;
         } catch {}
+        if (!savedCfi) {
+          try {
+            const s = localStorage.getItem(posKey);
+            if (s) savedCfi = JSON.parse(s).cfi;
+          } catch {}
+        }
 
         await rendition.display(savedCfi || undefined);
         if (rendition.location) {
@@ -588,7 +604,7 @@ export function EpubReader({
           b.destroy();
         } catch {}
     };
-  }, [streamUrl, fullUrl, loadMode, onBack, posKey, toggleUI, toggleImmersive]);
+  }, [streamUrl, fullUrl, loadMode, onBack, posKey, toggleUI, toggleImmersive, bookId]);
 
   // Theme changes
   useEffect(() => {

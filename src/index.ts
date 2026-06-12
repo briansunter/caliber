@@ -41,6 +41,16 @@ import { getFormatContentType, getPathContentType, getSafeBookFilename } from ".
 import { EpubCacheError, getEpubEntryPath } from "./lib/epub-cache";
 import { getPageFile, getPageManifest, PageStreamingError } from "./lib/page-streaming";
 import { handleMCPRequest } from "./mcp";
+import {
+  getOrCreateUser,
+  getUserByUsername,
+  isValidUsername,
+  getProgress,
+  listProgress,
+  upsertProgress,
+  deleteProgress,
+  type User,
+} from "./lib/user-db";
 import { join } from "node:path";
 import { CONFIG_DIR_PATH } from "./lib/config";
 
@@ -75,6 +85,44 @@ function parseSortField(value: string | null): SortField {
 
 function parseSortOrder(value: string | null): SortOrder {
   return SORT_ORDERS.includes(value as SortOrder) ? (value as SortOrder) : "asc";
+}
+
+// --- User session cookie (no auth yet: cookie just remembers a username) ---
+const USER_COOKIE = "caliber-user";
+const USER_COOKIE_MAX_AGE = 60 * 60 * 24 * 365; // 1 year
+
+function parseCookies(req: Request): Record<string, string> {
+  const header = req.headers.get("Cookie");
+  if (!header) return {};
+  const out: Record<string, string> = {};
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq < 0) continue;
+    const name = part.slice(0, eq).trim();
+    const value = part.slice(eq + 1).trim();
+    if (name) out[name] = decodeURIComponent(value);
+  }
+  return out;
+}
+
+function userCookieHeader(username: string | null): string {
+  const base = `${USER_COOKIE}=`;
+  const attrs = "Path=/; HttpOnly; SameSite=Lax";
+  if (username === null) {
+    return `${base}; ${attrs}; Max-Age=0`;
+  }
+  return `${base}${encodeURIComponent(username)}; ${attrs}; Max-Age=${USER_COOKIE_MAX_AGE}`;
+}
+
+// Resolve the current user from the cookie. Does NOT create a user — login does.
+function currentUser(req: Request): User | null {
+  const username = parseCookies(req)[USER_COOKIE];
+  if (!username) return null;
+  return getUserByUsername(username);
+}
+
+function publicUser(user: User) {
+  return { id: user.id, username: user.username };
 }
 
 // Initialize FTS on startup
@@ -611,6 +659,128 @@ const server = serve({
       GET: (req) => {
         const count = getBookCount();
         return getCachedResponse("count", { count }, req);
+      },
+    },
+
+    // --- Users & reading progress (server-side, no auth) ---
+
+    // Who am I? (reads the cookie)
+    "/api/user/me": {
+      GET: (req) => {
+        const user = currentUser(req);
+        return Response.json({ user: user ? publicUser(user) : null });
+      },
+    },
+
+    // "Log in" = remember a username and set the cookie.
+    "/api/user/login": {
+      POST: async (req) => {
+        let body: { username?: unknown };
+        try {
+          body = await req.json();
+        } catch {
+          return Response.json({ error: "Invalid JSON" }, { status: 400 });
+        }
+        const username = typeof body.username === "string" ? body.username : "";
+        if (!isValidUsername(username)) {
+          return Response.json({ error: "Invalid username" }, { status: 400 });
+        }
+        const user = getOrCreateUser(username);
+        if (!user) {
+          return Response.json({ error: "Could not create user" }, { status: 500 });
+        }
+        return Response.json(
+          { user: publicUser(user) },
+          { headers: { "Set-Cookie": userCookieHeader(user.username) } },
+        );
+      },
+    },
+
+    // Forget the current user (clear cookie)
+    "/api/user/logout": {
+      POST: () =>
+        Response.json({ ok: true }, { headers: { "Set-Cookie": userCookieHeader(null) } }),
+    },
+
+    // Recently-read shelf: progress rows enriched with book metadata for cards.
+    "/api/user/reading": {
+      GET: (req) => {
+        const user = currentUser(req);
+        if (!user) return Response.json({ items: [] });
+        const url = new URL(req.url);
+        const limit = parseBoundedInt(url.searchParams.get("limit"), 200, { min: 1, max: 500 });
+        const rows = listProgress(user.id, limit);
+        const items = [];
+        for (const row of rows) {
+          const book = getBookByIdOptimized(row.bookId);
+          if (!book) continue; // book removed from library — skip
+          items.push({
+            book: {
+              id: book.id,
+              title: book.title,
+              authors: book.authors,
+              series: book.series,
+              series_index: book.series_index,
+              formats: book.formats,
+              has_cover: book.has_cover,
+            },
+            progress: {
+              format: row.format,
+              percentage: row.percentage,
+              finished: row.finished,
+              updatedAt: row.updatedAt,
+            },
+          });
+        }
+        return Response.json({ items });
+      },
+    },
+
+    // Per-book progress for the active reader
+    "/api/user/progress/:bookId": {
+      GET: (req) => {
+        const user = currentUser(req);
+        if (!user) return Response.json({ progress: null });
+        const bookId = Number.parseInt(req.params.bookId, 10);
+        if (!Number.isFinite(bookId)) {
+          return Response.json({ error: "Invalid book id" }, { status: 400 });
+        }
+        return Response.json({ progress: getProgress(user.id, bookId) });
+      },
+      PUT: async (req) => {
+        const user = currentUser(req);
+        if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
+        const bookId = Number.parseInt(req.params.bookId, 10);
+        if (!Number.isFinite(bookId)) {
+          return Response.json({ error: "Invalid book id" }, { status: 400 });
+        }
+        let body: {
+          format?: unknown;
+          location?: unknown;
+          percentage?: unknown;
+          finished?: unknown;
+        };
+        try {
+          body = await req.json();
+        } catch {
+          return Response.json({ error: "Invalid JSON" }, { status: 400 });
+        }
+        const progress = upsertProgress(user.id, bookId, {
+          format: typeof body.format === "string" ? body.format : "",
+          location: typeof body.location === "string" ? body.location : null,
+          percentage: typeof body.percentage === "number" ? body.percentage : 0,
+          finished: body.finished === true,
+        });
+        return Response.json({ progress });
+      },
+      DELETE: (req) => {
+        const user = currentUser(req);
+        if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
+        const bookId = Number.parseInt(req.params.bookId, 10);
+        if (!Number.isFinite(bookId)) {
+          return Response.json({ error: "Invalid book id" }, { status: 400 });
+        }
+        return Response.json({ removed: deleteProgress(user.id, bookId) });
       },
     },
 

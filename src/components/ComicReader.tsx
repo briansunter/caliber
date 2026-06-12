@@ -3,6 +3,7 @@ import JSZip from "jszip";
 import { ArrowLeft, ChevronLeft, ChevronRight, Download, Wifi, ZoomIn, ZoomOut } from "lucide-react";
 import { stored } from "@/lib/utils";
 import { useReaderSettings } from "@/lib/reader-settings";
+import { fetchBookProgress, saveBookProgress } from "@/lib/reading-progress";
 import {
   getNextReaderLoadMode,
   prefetchOrder,
@@ -270,7 +271,34 @@ export function ComicReader({
     try {
       localStorage.setItem(posKey, JSON.stringify({ page: currentPage, ts: Date.now() }));
     } catch {}
-  }, [currentPage, posKey]);
+    // Sync to the signed-in user's server-side progress (debounced).
+    if (totalPages > 0) {
+      saveBookProgress(bookId, {
+        format: "CBZ",
+        location: String(currentPage),
+        percentage: (currentPage / totalPages) * 100,
+        finished: currentPage >= totalPages,
+      });
+    }
+  }, [currentPage, posKey, bookId, totalPages]);
+
+  // Restore the signed-in user's server-side page once, after pages load.
+  const serverRestoredRef = useRef(false);
+  useEffect(() => {
+    if (serverRestoredRef.current || totalPages === 0) return;
+    serverRestoredRef.current = true;
+    let cancelled = false;
+    fetchBookProgress(bookId).then((p) => {
+      if (cancelled || !p?.location) return;
+      const page = Number.parseInt(p.location, 10);
+      if (Number.isFinite(page) && page >= 1 && page <= totalPages) {
+        setCurrentPage(page);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [bookId, totalPages]);
 
   // Double-buffer page turns: if the target page is already decoded (warm
   // buffer), swap instantly with no flash. Otherwise hold the old page only
