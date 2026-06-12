@@ -23,7 +23,7 @@ function loadUIState(): UIState {
     if (saved) return JSON.parse(saved);
   } catch {}
   const defaultView = window.innerWidth < 768 ? "grid" : "list";
-  return { view: defaultView, sort: { field: "title", order: "asc" }, search: "" };
+  return { view: defaultView, sort: { field: "added", order: "desc" }, search: "" };
 }
 
 function saveUIState(state: UIState) {

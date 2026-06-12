@@ -158,6 +158,20 @@ export function PdfReader({
     setLoadMode(nextMode);
   }, [loadMode]);
 
+  // "Immersive" = no top/bottom bars. Where the native Fullscreen API exists
+  // (desktop, iPad) we also enter real fullscreen; on iPhone the API is absent,
+  // so the button just hides the reader's own bars.
+  const immersive = fullscreenSupported ? isFullscreen : !showUI;
+  const toggleImmersive = useCallback(() => {
+    if (fullscreenSupported) toggleFullscreen();
+    else setShowUI((v) => !v);
+  }, [fullscreenSupported, toggleFullscreen]);
+
+  // Keep the reader's bars hidden while in native fullscreen; restore on exit.
+  useEffect(() => {
+    if (fullscreenSupported) setShowUI(!isFullscreen);
+  }, [isFullscreen, fullscreenSupported]);
+
   useEffect(() => {
     setLoadMode(initialLoadMode);
   }, [initialLoadMode]);
@@ -555,12 +569,12 @@ export function PdfReader({
       if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
       if (e.key === "ArrowLeft" || e.key === "ArrowUp") goPrev();
       else if (e.key === "ArrowRight" || e.key === "ArrowDown" || e.key === " ") goNext();
-      else if (e.key === "f" || e.key === "F") toggleFullscreen();
+      else if (e.key === "f" || e.key === "F") toggleImmersive();
       else if (e.key === "Escape") onBack();
     };
     document.addEventListener("keyup", handleKey);
     return () => document.removeEventListener("keyup", handleKey);
-  }, [goPrev, goNext, onBack, toggleFullscreen]);
+  }, [goPrev, goNext, onBack, toggleImmersive]);
 
   const progress = totalPages > 0 ? Math.round((currentPage / totalPages) * 100) : 0;
 
@@ -630,21 +644,15 @@ export function PdfReader({
               )}
               <span className="hidden sm:inline">{loadMode === "stream" ? "Stream" : "Full"}</span>
             </button>
-            {fullscreenSupported && (
-              <button
-                type="button"
-                onClick={toggleFullscreen}
-                className="p-2 rounded-lg text-white active:opacity-60"
-                aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
-                title={isFullscreen ? "Exit fullscreen (f)" : "Fullscreen (f)"}
-              >
-                {isFullscreen ? (
-                  <Minimize className="h-5 w-5" />
-                ) : (
-                  <Maximize className="h-5 w-5" />
-                )}
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={toggleImmersive}
+              className="p-2 rounded-lg text-white active:opacity-60"
+              aria-label={immersive ? "Show toolbars" : "Hide toolbars"}
+              title={immersive ? "Show toolbars (f)" : "Hide toolbars / fullscreen (f)"}
+            >
+              {immersive ? <Minimize className="h-5 w-5" /> : <Maximize className="h-5 w-5" />}
+            </button>
             <button
               type="button"
               onClick={() => setZoom((z) => Math.max(0.5, z - 0.25))}
