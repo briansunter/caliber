@@ -1,11 +1,12 @@
 import { useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
-import { X, Check, ChevronDown, ChevronUp } from "lucide-react";
+import { X, Check, ChevronDown, ChevronUp, Trash2 } from "lucide-react";
 import { CoverFallback } from "./CoverFallback";
 import { isUnknownAuthor } from "@/lib/utils";
 import {
   useReadingList,
   useRemoveFromReadingList,
+  useClearReadingList,
   sortReadingList,
   type ReadingListItem,
   type ReadingSort,
@@ -22,8 +23,10 @@ const SORT_OPTIONS: { value: ReadingSort; label: string }[] = [
 export function RecentlyRead() {
   const { data, isLoading } = useReadingList();
   const remove = useRemoveFromReadingList();
+  const clear = useClearReadingList();
   const [expanded, setExpanded] = useState(false);
   const [sort, setSort] = useState<ReadingSort>("recent");
+  const [confirmClear, setConfirmClear] = useState(false);
 
   const items = useMemo(() => sortReadingList(data?.items ?? [], sort), [data?.items, sort]);
 
@@ -56,6 +59,38 @@ export function RecentlyRead() {
               </option>
             ))}
           </select>
+          {confirmClear ? (
+            <span className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => {
+                  clear.mutate();
+                  setConfirmClear(false);
+                  setExpanded(false);
+                }}
+                className="rounded-md bg-red-600 px-2 py-1 text-xs font-semibold text-white hover:bg-red-700 transition-colors"
+              >
+                Clear all
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmClear(false)}
+                className="rounded-md border border-ink px-2 py-1 text-xs text-ink hover:bg-parchment-dark transition-colors"
+              >
+                Cancel
+              </button>
+            </span>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setConfirmClear(true)}
+              className="flex items-center gap-1 rounded-md border border-ink px-2 py-1 text-xs text-ink-secondary hover:text-ink hover:bg-parchment-dark transition-colors"
+              title="Clear recently read"
+            >
+              <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
+              <span className="hidden sm:inline">Clear</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -108,9 +143,9 @@ function ReadingCard({ item, onRemove }: { item: ReadingListItem; onRemove: () =
         }}
         aria-label={`Remove ${book.title} from recently read`}
         title="Remove"
-        className="absolute right-1 top-1 z-10 flex h-6 w-6 items-center justify-center rounded-full bg-ink/70 text-white opacity-0 transition-opacity hover:bg-ink focus:opacity-100 group-hover:opacity-100"
+        className="absolute right-1 top-1 z-10 flex h-8 w-8 items-center justify-center rounded-full bg-ink/80 text-white shadow-sm transition-opacity hover:bg-ink sm:h-6 sm:w-6 sm:opacity-0 sm:group-hover:opacity-100 sm:focus:opacity-100"
       >
-        <X className="h-3.5 w-3.5" strokeWidth={2} />
+        <X className="h-4 w-4 sm:h-3.5 sm:w-3.5" strokeWidth={2} />
       </button>
 
       <Link

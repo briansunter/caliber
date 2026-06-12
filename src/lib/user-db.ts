@@ -220,6 +220,11 @@ export function deleteProgress(userId: number, bookId: number): boolean {
   return result.changes > 0;
 }
 
+export function clearProgress(userId: number): number {
+  const result = getDb().query("DELETE FROM progress WHERE user_id = ?").run(userId);
+  return result.changes;
+}
+
 export function setFinished(userId: number, bookId: number, finished: boolean): ProgressRow | null {
   const existing = getProgress(userId, bookId);
   if (!existing) return null;

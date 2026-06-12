@@ -49,6 +49,7 @@ import {
   listProgress,
   upsertProgress,
   deleteProgress,
+  clearProgress,
   type User,
 } from "./lib/user-db";
 import { join } from "node:path";
@@ -704,6 +705,11 @@ const server = serve({
 
     // Recently-read shelf: progress rows enriched with book metadata for cards.
     "/api/user/reading": {
+      DELETE: (req) => {
+        const user = currentUser(req);
+        if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
+        return Response.json({ removed: clearProgress(user.id) });
+      },
       GET: (req) => {
         const user = currentUser(req);
         if (!user) return Response.json({ items: [] });

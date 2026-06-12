@@ -148,6 +148,26 @@ export function useRemoveFromReadingList() {
   });
 }
 
+export function useClearReadingList() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      fetchJson<{ removed: number }>("/api/user/reading", { method: "DELETE" }),
+    onMutate: async () => {
+      await qc.cancelQueries({ queryKey: ["reading-list"] });
+      const prev = qc.getQueryData<{ items: ReadingListItem[] }>(["reading-list"]);
+      qc.setQueryData(["reading-list"], { items: [] });
+      return { prev };
+    },
+    onError: (_e, _v, ctx) => {
+      if (ctx?.prev) qc.setQueryData(["reading-list"], ctx.prev);
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ["reading-list"] });
+    },
+  });
+}
+
 export function sortReadingList(items: ReadingListItem[], sort: ReadingSort): ReadingListItem[] {
   const copy = [...items];
   switch (sort) {
