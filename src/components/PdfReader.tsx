@@ -391,7 +391,6 @@ export function PdfReader({
     }
 
     setRendering(true);
-    annotationLayer.innerHTML = "";
 
     const effectiveWidth = containerWidth > 0 ? containerWidth : container.clientWidth;
 
@@ -403,27 +402,40 @@ export function PdfReader({
       const viewport = page.getViewport({ scale: fitScale * zoom });
       const dpr = window.devicePixelRatio || 1;
 
-      canvas.width = viewport.width * dpr;
-      canvas.height = viewport.height * dpr;
-      canvas.style.width = `${viewport.width}px`;
-      canvas.style.height = `${viewport.height}px`;
-      pageLayer.style.width = `${viewport.width}px`;
-      pageLayer.style.height = `${viewport.height}px`;
-      annotationLayer.style.setProperty("--scale-factor", String(viewport.scale));
-
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
+      // Double-buffer: render offscreen, then blit to the visible canvas in one
+      // step so the previous page stays on screen until the new one is ready.
+      const offscreen = document.createElement("canvas");
+      offscreen.width = viewport.width * dpr;
+      offscreen.height = viewport.height * dpr;
+      const offCtx = offscreen.getContext("2d");
+      if (!offCtx) return;
 
       const renderTask = page.render({
-        canvasContext: ctx,
+        canvasContext: offCtx,
         viewport,
         transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
       });
       renderTaskRef.current = renderTask;
 
-      renderTask.promise.then(() => setRendering(false)).catch(() => {}); // Ignore cancellation
+      renderTask.promise
+        .then(() => {
+          if (renderTokenRef.current !== token) return;
+          canvas.width = offscreen.width;
+          canvas.height = offscreen.height;
+          canvas.style.width = `${viewport.width}px`;
+          canvas.style.height = `${viewport.height}px`;
+          pageLayer.style.width = `${viewport.width}px`;
+          pageLayer.style.height = `${viewport.height}px`;
+          annotationLayer.style.setProperty("--scale-factor", String(viewport.scale));
+          canvas.getContext("2d")?.drawImage(offscreen, 0, 0);
+          setRendering(false);
+        })
+        .catch(() => {}); // Ignore cancellation
 
       try {
+        // Wait for the canvas swap so the layer renders against the new
+        // viewport/scale-factor, not the previous page's
+        await renderTask.promise;
         const annotations = await page.getAnnotations({ intent: "display" });
         if (renderTokenRef.current !== token) return;
         annotationLayer.innerHTML = "";

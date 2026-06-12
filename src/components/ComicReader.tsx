@@ -86,8 +86,10 @@ export function ComicReader({
   const [currentPage, setCurrentPage] = useState(() => stored(posKey, { page: 1 }).page as number);
   const [showUI, setShowUI] = useState(true);
   const [zoom, setZoom] = useState(1);
-  const [imgLoaded, setImgLoaded] = useState(false);
-  const [imgError, setImgError] = useState(false);
+  const [displayed, setDisplayed] = useState<ComicPage | null>(null);
+  const [pagePending, setPagePending] = useState(false);
+  const [pageError, setPageError] = useState(false);
+  const [retryToken, setRetryToken] = useState(0);
 
   const totalPages = pages.length;
   const page = pages[currentPage - 1];
@@ -132,6 +134,8 @@ export function ComicReader({
       setIsLoading(true);
       setLoadError(null);
       setPages([]);
+      setDisplayed(null);
+      setPageError(false);
       clearObjectUrls();
       clearPreloadedImages();
 
@@ -235,14 +239,63 @@ export function ComicReader({
     } catch {}
   }, [currentPage, posKey]);
 
+  // Double-buffer page turns: keep the current image on screen until the next
+  // one is fully decoded, then swap in a single frame — no blank flash.
   useEffect(() => {
-    if (currentPage < 1) return;
-    setImgLoaded(false);
-    setImgError(false);
-  }, [currentPage]);
+    if (isLoading || !page) return;
+    if (displayed?.href === page.href) return;
+
+    let cancelled = false;
+    setPageError(false);
+
+    // Only surface a spinner if the decode is actually slow (cold cache)
+    const spinnerTimer = setTimeout(() => {
+      if (!cancelled) setPagePending(true);
+    }, 200);
+
+    let image = preloadedImagesRef.current.get(page.href);
+    if (!image) {
+      image = new Image();
+      image.decoding = "async";
+      image.src = page.href;
+      preloadedImagesRef.current.set(page.href, image);
+    }
+
+    const ready: Promise<void> =
+      typeof image.decode === "function"
+        ? image.decode()
+        : image.complete
+          ? Promise.resolve()
+          : new Promise((resolve, reject) => {
+              image.addEventListener("load", () => resolve(), { once: true });
+              image.addEventListener("error", () => reject(new Error("load failed")), {
+                once: true,
+              });
+            });
+
+    ready
+      .then(() => {
+        if (cancelled) return;
+        setDisplayed(page);
+        setPagePending(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        preloadedImagesRef.current.delete(page.href);
+        setPageError(true);
+        setPagePending(false);
+      });
+
+    return () => {
+      cancelled = true;
+      clearTimeout(spinnerTimer);
+    };
+  }, [page, displayed?.href, isLoading, retryToken]);
 
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
       if (e.key === "ArrowLeft" || e.key === "ArrowUp") goPrev();
       else if (e.key === "ArrowRight" || e.key === "ArrowDown" || e.key === " ") goNext();
       else if (e.key === "Escape") onBack();
@@ -401,43 +454,44 @@ export function ComicReader({
 
       <div className="relative min-h-0 flex-1 overflow-auto">
         <div className="flex min-h-full items-start justify-center">
-          {page && (
-            <>
-              {!imgLoaded && !imgError && (
-                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                  <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
-                </div>
-              )}
-              {imgError && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
-                  <p className="text-sm text-white/60">Failed to load page</p>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setImgError(false);
-                      setImgLoaded(false);
-                    }}
-                    className="rounded bg-white/10 px-3 py-1.5 text-sm text-white active:opacity-70"
-                  >
-                    Retry
-                  </button>
-                </div>
-              )}
-              <img
-                key={currentPage}
-                src={imgError ? "" : page.href}
-                alt={page.name}
-                className="block max-w-none"
-                style={{
-                  width: `${Math.round(100 * zoom)}%`,
-                  maxWidth: zoom <= 1 ? "100%" : "none",
-                  display: imgLoaded ? "block" : "none",
+          {displayed && (
+            <img
+              src={displayed.href}
+              alt={displayed.name}
+              className="block max-w-none"
+              style={{
+                width: `${Math.round(100 * zoom)}%`,
+                maxWidth: zoom <= 1 ? "100%" : "none",
+              }}
+              draggable={false}
+            />
+          )}
+          {pagePending && !pageError && (
+            <div
+              className={
+                displayed
+                  ? "absolute bottom-4 right-4 pointer-events-none"
+                  : "absolute inset-0 flex items-center justify-center pointer-events-none"
+              }
+            >
+              <div className="h-7 w-7 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+            </div>
+          )}
+          {pageError && page && (
+            <div className="absolute inset-0 z-[107] flex flex-col items-center justify-center gap-3 bg-neutral-950/70">
+              <p className="text-sm text-white/60">Failed to load page {currentPage}</p>
+              <button
+                type="button"
+                onClick={() => {
+                  preloadedImagesRef.current.delete(page.href);
+                  setPageError(false);
+                  setRetryToken((t) => t + 1);
                 }}
-                draggable={false}
-                onLoad={() => { setImgLoaded(true); setImgError(false); }}
-                onError={() => { setImgError(true); setImgLoaded(false); }}
-              />
-            </>
+                className="rounded bg-white/10 px-3 py-1.5 text-sm text-white active:opacity-70"
+              >
+                Retry
+              </button>
+            </div>
           )}
         </div>
 
