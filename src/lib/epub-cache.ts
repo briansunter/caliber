@@ -1,8 +1,9 @@
 import JSZip from "jszip";
-import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, join, normalize, sep } from "node:path";
 import { CONFIG_DIR_PATH } from "./config";
 import { getBookFormatPath } from "./calibre-optimized";
+import { type SourceSignature, getSourceSignature, isSameSignature } from "./file-signature";
 
 const EPUB_CACHE_DIR = join(CONFIG_DIR_PATH, "epub-cache");
 const CACHE_META_FILE = ".caliber-epub-cache.json";
@@ -19,28 +20,29 @@ export class EpubCacheError extends Error {
   }
 }
 
-interface SourceSignature {
-  size: number;
-  mtimeMs: number;
-}
-
 interface CachedZip {
   signature: SourceSignature;
   zip: JSZip;
 }
 
-const openEpubs = new Map<string, CachedZip>();
-
-function getSourceSignature(path: string): SourceSignature {
-  const stat = statSync(path);
-  return {
-    size: stat.size,
-    mtimeMs: stat.mtimeMs,
-  };
+interface StatCacheEntry {
+  signature: SourceSignature;
+  expiresAt: number;
 }
 
-function isSameSignature(a: SourceSignature | null, b: SourceSignature): boolean {
-  return Boolean(a && a.size === b.size && a.mtimeMs === b.mtimeMs);
+const openEpubs = new Map<string, CachedZip>();
+const statCache = new Map<string, StatCacheEntry>();
+const STAT_TTL_MS = 5_000;
+
+function getCachedSignature(path: string): SourceSignature {
+  const now = Date.now();
+  const entry = statCache.get(path);
+  if (entry && entry.expiresAt > now) {
+    return entry.signature;
+  }
+  const signature = getSourceSignature(path);
+  statCache.set(path, { signature, expiresAt: now + STAT_TTL_MS });
+  return signature;
 }
 
 async function readCacheSignature(cacheDir: string): Promise<SourceSignature | null> {
@@ -106,7 +108,7 @@ async function ensureEpubCache(bookId: number): Promise<{
   const epubPath = getBookFormatPath(bookId, "EPUB");
   if (!epubPath || !existsSync(epubPath)) return null;
 
-  const signature = getSourceSignature(epubPath);
+  const signature = getCachedSignature(epubPath);
   const cacheDir = join(EPUB_CACHE_DIR, String(bookId));
   const cachedSignature = await readCacheSignature(cacheDir);
 

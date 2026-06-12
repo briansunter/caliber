@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import * as pdfjsLib from "pdfjs-dist";
 import {
   ArrowLeft,
@@ -29,6 +30,44 @@ interface PdfReaderProps {
   initialLoadMode?: ReaderLoadMode;
 }
 
+interface PdfLinkService {
+  eventBus?: { dispatch: () => void };
+  addLinkAttributes(link: HTMLAnchorElement, url: string, newWindow?: boolean): void;
+  getDestinationHash(dest: unknown): string;
+  getAnchorUrl(anchor: string): string;
+  goToDestination(dest: unknown): Promise<void>;
+  goToPage(page: number | string): void;
+  executeNamedAction(action: string): void;
+  executeSetOCGState(): Promise<void>;
+}
+
+type ReaderPointerTarget = EventTarget | null;
+
+function closestElement(target: ReaderPointerTarget): Element | null {
+  const node = target as (Node & { closest?: (selector: string) => Element | null }) | null;
+  if (!node) return null;
+  if (typeof node.closest === "function") return node.closest("*");
+  return node.parentElement ?? null;
+}
+
+function isInteractiveTarget(target: ReaderPointerTarget): boolean {
+  const element = closestElement(target);
+  return Boolean(
+    element?.closest(
+      [
+        "a[href]",
+        "button",
+        "input",
+        "textarea",
+        "select",
+        "summary",
+        "[role='button']",
+        "[role='link']",
+      ].join(","),
+    ),
+  );
+}
+
 export function PdfReader({
   url,
   bookId,
@@ -38,12 +77,16 @@ export function PdfReader({
 }: PdfReaderProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const pageLayerRef = useRef<HTMLDivElement>(null);
+  const annotationLayerRef = useRef<HTMLDivElement>(null);
   const pdfRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
   const renderTaskRef = useRef<pdfjsLib.RenderTask | null>(null);
+  const renderTokenRef = useRef(0);
   const prefetchRunRef = useRef(0);
   const touchRef = useRef<{ x: number; y: number; t: number } | null>(null);
 
   const posKey = `caliber-pos-${bookId}-pdf`;
+  const zoomKey = `caliber-zoom-${bookId}-pdf`;
 
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -51,8 +94,41 @@ export function PdfReader({
   const [currentPage, setCurrentPage] = useState(() => stored(posKey, { page: 1 }).page as number);
   const [totalPages, setTotalPages] = useState(0);
   const [showUI, setShowUI] = useState(true);
-  const [zoom, setZoom] = useState(1);
+  const [zoom, setZoom] = useState(() => stored(zoomKey, { zoom: 1 }).zoom as number);
+  const [containerWidth, setContainerWidth] = useState(0);
   const [, setRendering] = useState(false);
+
+  const goToPdfDestination = useCallback(async (dest: unknown) => {
+    const pdf = pdfRef.current;
+    if (!pdf) return;
+
+    const explicitDest =
+      typeof dest === "string" ? await pdf.getDestination(dest) : await Promise.resolve(dest);
+    if (!Array.isArray(explicitDest)) return;
+
+    const destRef = explicitDest[0];
+    let pageNumber: number | null = null;
+
+    if (destRef && typeof destRef === "object") {
+      const pdfWithCache = pdf as pdfjsLib.PDFDocumentProxy & {
+        cachedPageNumber?: (ref: unknown) => number | null;
+      };
+      pageNumber = pdfWithCache.cachedPageNumber?.(destRef) ?? null;
+      if (!pageNumber) {
+        try {
+          pageNumber = (await pdf.getPageIndex(destRef as never)) + 1;
+        } catch {
+          return;
+        }
+      }
+    } else if (Number.isInteger(destRef)) {
+      pageNumber = Number(destRef) + 1;
+    }
+
+    if (pageNumber && pageNumber >= 1 && pageNumber <= pdf.numPages) {
+      setCurrentPage(pageNumber);
+    }
+  }, []);
 
   const goNext = useCallback(() => {
     setCurrentPage((p) => Math.min(p + 1, totalPages || p));
@@ -73,19 +149,113 @@ export function PdfReader({
     setLoadMode(initialLoadMode);
   }, [initialLoadMode]);
 
-  // Touch handling
-  const onTouchStart = useCallback((e: React.TouchEvent) => {
-    const touch = e.touches[0];
-    if (!touch) return;
-    touchRef.current = {
-      x: touch.clientX,
-      y: touch.clientY,
-      t: Date.now(),
+  useEffect(() => {
+    return () => {
+      if (renderTaskRef.current) {
+        try { renderTaskRef.current.cancel(); } catch {}
+        renderTaskRef.current = null;
+      }
+      if (pdfRef.current) {
+        try { pdfRef.current.destroy(); } catch {}
+        pdfRef.current = null;
+      }
     };
   }, []);
 
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    let rafId: number | null = null;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        setContainerWidth(entry.contentRect.width);
+      });
+    });
+    observer.observe(container);
+    setContainerWidth(container.clientWidth);
+    return () => {
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      observer.disconnect();
+    };
+  }, []);
+
+  const pdfLinkService = useMemo<PdfLinkService>(
+    () => ({
+      eventBus: { dispatch: () => {} },
+      addLinkAttributes(link, targetUrl, newWindow = false) {
+        link.href = targetUrl;
+        link.title = targetUrl;
+        link.target = newWindow ? "_blank" : "_blank";
+        link.rel = "noopener noreferrer";
+      },
+      getDestinationHash(dest) {
+        if (typeof dest === "string" && dest) return `#${encodeURIComponent(dest)}`;
+        if (Array.isArray(dest)) return `#${encodeURIComponent(JSON.stringify(dest))}`;
+        return "#";
+      },
+      getAnchorUrl(anchor) {
+        return anchor;
+      },
+      goToDestination: goToPdfDestination,
+      goToPage(page) {
+        const parsed = typeof page === "string" ? Number.parseInt(page, 10) : page;
+        const max = pdfRef.current?.numPages ?? totalPages;
+        if (Number.isInteger(parsed) && parsed >= 1 && parsed <= max) {
+          setCurrentPage(parsed);
+        }
+      },
+      executeNamedAction(action) {
+        switch (action) {
+          case "NextPage":
+            setCurrentPage((page) => Math.min(page + 1, pdfRef.current?.numPages ?? page));
+            break;
+          case "PrevPage":
+            setCurrentPage((page) => Math.max(page - 1, 1));
+            break;
+          case "FirstPage":
+            setCurrentPage(1);
+            break;
+          case "LastPage":
+            setCurrentPage(pdfRef.current?.numPages ?? totalPages);
+            break;
+        }
+      },
+      executeSetOCGState: async () => {},
+    }),
+    [goToPdfDestination, totalPages],
+  );
+
+  // Touch handling
+  const onTouchStart = useCallback(
+    (e: React.TouchEvent) => {
+      if (zoom !== 1 || isInteractiveTarget(e.target)) {
+        touchRef.current = null;
+        return;
+      }
+
+      const touch = e.touches[0];
+      if (!touch) return;
+      touchRef.current = {
+        x: touch.clientX,
+        y: touch.clientY,
+        t: Date.now(),
+      };
+    },
+    [zoom],
+  );
+
   const onTouchEnd = useCallback(
     (e: React.TouchEvent) => {
+      if (zoom !== 1 || isInteractiveTarget(e.target)) {
+        touchRef.current = null;
+        return;
+      }
+
       const start = touchRef.current;
       if (!start) return;
       touchRef.current = null;
@@ -110,18 +280,24 @@ export function PdfReader({
         else toggleUI();
       }
     },
-    [goPrev, goNext, toggleUI],
+    [goPrev, goNext, toggleUI, zoom],
   );
 
   const onClick = useCallback(
     (e: React.MouseEvent) => {
+      if (zoom !== 1 || isInteractiveTarget(e.target)) return;
+
       const w = window.innerWidth;
       if (e.clientX < w * 0.3) goPrev();
       else if (e.clientX > w * 0.7) goNext();
       else toggleUI();
     },
-    [goPrev, goNext, toggleUI],
+    [goPrev, goNext, toggleUI, zoom],
   );
+
+  const onReaderKeyUp = useCallback((e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "Enter") toggleUI();
+  }, [toggleUI]);
 
   // Load PDF document. Stream mode lets PDF.js request byte ranges; full mode fetches once.
   useEffect(() => {
@@ -201,7 +377,12 @@ export function PdfReader({
     const pdf = pdfRef.current;
     const canvas = canvasRef.current;
     const container = containerRef.current;
-    if (!pdf || !canvas || !container || isLoading) return;
+    const pageLayer = pageLayerRef.current;
+    const annotationLayer = annotationLayerRef.current;
+    if (!pdf || !canvas || !container || !pageLayer || !annotationLayer || isLoading) return;
+
+    const token = renderTokenRef.current + 1;
+    renderTokenRef.current = token;
 
     // Cancel previous render
     if (renderTaskRef.current) {
@@ -210,11 +391,15 @@ export function PdfReader({
     }
 
     setRendering(true);
+    annotationLayer.innerHTML = "";
 
-    pdf.getPage(currentPage).then((page) => {
-      const containerWidth = container.clientWidth;
+    const effectiveWidth = containerWidth > 0 ? containerWidth : container.clientWidth;
+
+    pdf.getPage(currentPage).then(async (page) => {
+      if (renderTokenRef.current !== token) return;
+
       const unscaledViewport = page.getViewport({ scale: 1 });
-      const fitScale = containerWidth / unscaledViewport.width;
+      const fitScale = effectiveWidth / unscaledViewport.width;
       const viewport = page.getViewport({ scale: fitScale * zoom });
       const dpr = window.devicePixelRatio || 1;
 
@@ -222,22 +407,58 @@ export function PdfReader({
       canvas.height = viewport.height * dpr;
       canvas.style.width = `${viewport.width}px`;
       canvas.style.height = `${viewport.height}px`;
+      pageLayer.style.width = `${viewport.width}px`;
+      pageLayer.style.height = `${viewport.height}px`;
+      annotationLayer.style.setProperty("--scale-factor", String(viewport.scale));
 
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
-      ctx.scale(dpr, dpr);
 
-      const renderTask = page.render({ canvasContext: ctx, viewport });
+      const renderTask = page.render({
+        canvasContext: ctx,
+        viewport,
+        transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
+      });
       renderTaskRef.current = renderTask;
 
       renderTask.promise.then(() => setRendering(false)).catch(() => {}); // Ignore cancellation
+
+      try {
+        const annotations = await page.getAnnotations({ intent: "display" });
+        if (renderTokenRef.current !== token) return;
+        annotationLayer.innerHTML = "";
+
+        const layer = new pdfjsLib.AnnotationLayer({
+          div: annotationLayer,
+          accessibilityManager: null,
+          annotationCanvasMap: null,
+          annotationEditorUIManager: null,
+          page,
+          viewport,
+          structTreeLayer: null,
+        });
+        await layer.render({
+          viewport,
+          div: annotationLayer,
+          annotations,
+          page,
+          linkService: pdfLinkService as never,
+          renderForms: false,
+        });
+      } catch {
+        annotationLayer.innerHTML = "";
+      }
     });
 
     // Save position
     try {
       localStorage.setItem(posKey, JSON.stringify({ page: currentPage, ts: Date.now() }));
     } catch {}
-  }, [currentPage, isLoading, zoom, posKey]);
+    // Save zoom
+    try {
+      localStorage.setItem(zoomKey, JSON.stringify({ zoom, ts: Date.now() }));
+    } catch {}
+  }, [currentPage, isLoading, zoom, containerWidth, posKey, zoomKey, pdfLinkService]);
 
   useEffect(() => {
     const pdf = pdfRef.current;
@@ -363,21 +584,22 @@ export function PdfReader({
       </div>
 
       {/* Canvas container */}
-      <div ref={containerRef} className="flex-1 relative min-h-0 overflow-auto">
+      <div
+        ref={containerRef}
+        className="flex-1 relative min-h-0 overflow-auto"
+        role="application"
+        tabIndex={-1}
+        onTouchStart={onTouchStart}
+        onTouchEnd={onTouchEnd}
+        onClick={onClick}
+        onKeyUp={onReaderKeyUp}
+      >
         <div className="flex items-start justify-center min-h-full">
-          <canvas ref={canvasRef} className="block" />
+          <div ref={pageLayerRef} className="pdf-page-layer relative">
+            <canvas ref={canvasRef} className="block" />
+            <div ref={annotationLayerRef} className="annotationLayer pdf-annotation-layer" />
+          </div>
         </div>
-
-        {!isLoading && zoom === 1 && (
-          <button
-            type="button"
-            aria-label="Page navigation overlay"
-            className="absolute inset-0 z-[106] cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none block w-full h-full"
-            onTouchStart={onTouchStart}
-            onTouchEnd={onTouchEnd}
-            onClick={onClick}
-          />
-        )}
       </div>
 
       {/* Footer */}
@@ -410,8 +632,27 @@ export function PdfReader({
             >
               <ChevronLeft className="h-5 w-5" />
             </button>
-            <span className="text-sm text-white/60 tabular-nums">
-              {currentPage} / {totalPages}
+            <span className="flex items-center gap-1 text-sm text-white/60 tabular-nums">
+              <input
+                type="number"
+                min={1}
+                max={totalPages || 1}
+                value={currentPage}
+                onChange={(e) => {
+                  const val = parseInt(e.target.value, 10);
+                  if (Number.isInteger(val) && val >= 1 && val <= (totalPages || 1)) {
+                    setCurrentPage(val);
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                  e.stopPropagation();
+                }}
+                onClick={(e) => e.stopPropagation()}
+                className="w-10 bg-transparent text-center text-sm text-white/60 tabular-nums [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none outline-none border-b border-white/20 focus:border-white/50"
+                aria-label="Page number"
+              />
+              <span>/ {totalPages}</span>
             </span>
             <button
               type="button"

@@ -73,7 +73,8 @@ const BookCover = memo(function BookCover({
               "w-full aspect-[2/3] object-cover transition-all duration-500",
               isLoaded ? "opacity-100 scale-100" : "opacity-0 scale-105",
             )}
-            loading="lazy"
+            loading="eager"
+            fetchPriority="high"
             decoding="async"
             onLoad={handleLoad}
             onError={handleError}

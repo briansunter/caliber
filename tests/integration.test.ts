@@ -292,6 +292,7 @@ beforeAll(async () => {
     env: {
       ...process.env,
       HOME: homePath,
+      CALIBER_CONFIG_DIR: join(homePath, ".config", "caliber"),
       CALIBRE_LIBRARY_PATH: libraryPath,
       PORT: String(port),
       NODE_ENV: "test",

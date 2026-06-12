@@ -1,19 +1,15 @@
 import JSZip from "jszip";
 import { createExtractorFromData } from "node-unrar-js/esm";
-import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { basename, extname, join } from "node:path";
 import { CONFIG_DIR_PATH } from "./config";
 import { getBookFormatPath } from "./calibre-optimized";
 import { getPathContentType } from "./book-files";
+import { type SourceSignature, getSourceSignature, isSameSignature } from "./file-signature";
 
 const PAGE_CACHE_DIR = join(CONFIG_DIR_PATH, "page-cache");
 const CACHE_META_FILE = ".caliber-page-cache.json";
 const IMAGE_EXTENSIONS = new Set([".avif", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"]);
-
-interface SourceSignature {
-  size: number;
-  mtimeMs: number;
-}
 
 interface CachedPage {
   index: number;
@@ -57,16 +53,15 @@ export class PageStreamingError extends Error {
   }
 }
 
-function getSourceSignature(path: string): SourceSignature {
-  const stat = statSync(path);
-  return {
-    size: stat.size,
-    mtimeMs: stat.mtimeMs,
-  };
+// In-memory cache for validated PageCacheMeta keyed by "bookId/format"
+interface MetaMemEntry {
+  meta: PageCacheMeta;
+  signature: SourceSignature;
 }
+const metaMemCache = new Map<string, MetaMemEntry>();
 
-function isSameSignature(a: SourceSignature | null, b: SourceSignature): boolean {
-  return Boolean(a && a.size === b.size && a.mtimeMs === b.mtimeMs);
+function metaCacheKey(bookId: number, format: string): string {
+  return `${bookId}/${format.toUpperCase()}`;
 }
 
 async function readJson<T>(path: string): Promise<T | null> {
@@ -110,6 +105,13 @@ async function ensureCbzCache(bookId: number): Promise<{ cacheDir: string; meta:
   const source = getSourceSignature(sourcePath);
   const cacheDir = getCacheDir(bookId, format);
   const metaPath = join(cacheDir, CACHE_META_FILE);
+  const cacheKey = metaCacheKey(bookId, format);
+
+  const memEntry = metaMemCache.get(cacheKey);
+  if (memEntry && isSameSignature(memEntry.signature, source)) {
+    return { cacheDir, meta: memEntry.meta };
+  }
+
   const existingMeta = await readJson<PageCacheMeta>(metaPath);
 
   if (
@@ -117,9 +119,11 @@ async function ensureCbzCache(bookId: number): Promise<{ cacheDir: string; meta:
     isSameSignature(existingMeta.source, source) &&
     existingMeta.pages.every((page) => existsSync(join(cacheDir, page.fileName)))
   ) {
+    metaMemCache.set(cacheKey, { meta: existingMeta, signature: source });
     return { cacheDir, meta: existingMeta };
   }
 
+  metaMemCache.delete(cacheKey);
   rmSync(cacheDir, { recursive: true, force: true });
   mkdirSync(cacheDir, { recursive: true });
 
@@ -153,6 +157,7 @@ async function ensureCbzCache(bookId: number): Promise<{ cacheDir: string; meta:
     pages,
   };
   await Bun.write(metaPath, `${JSON.stringify(meta)}\n`);
+  metaMemCache.set(cacheKey, { meta, signature: source });
 
   return { cacheDir, meta };
 }
@@ -168,6 +173,13 @@ async function ensureCbrCache(bookId: number): Promise<{ cacheDir: string; meta:
   const source = getSourceSignature(sourcePath);
   const cacheDir = getCacheDir(bookId, format);
   const metaPath = join(cacheDir, CACHE_META_FILE);
+  const cacheKey = metaCacheKey(bookId, format);
+
+  const memEntry = metaMemCache.get(cacheKey);
+  if (memEntry && isSameSignature(memEntry.signature, source)) {
+    return { cacheDir, meta: memEntry.meta };
+  }
+
   const existingMeta = await readJson<PageCacheMeta>(metaPath);
 
   if (
@@ -175,9 +187,11 @@ async function ensureCbrCache(bookId: number): Promise<{ cacheDir: string; meta:
     isSameSignature(existingMeta.source, source) &&
     existingMeta.pages.every((page) => existsSync(join(cacheDir, page.fileName)))
   ) {
+    metaMemCache.set(cacheKey, { meta: existingMeta, signature: source });
     return { cacheDir, meta: existingMeta };
   }
 
+  metaMemCache.delete(cacheKey);
   rmSync(cacheDir, { recursive: true, force: true });
   mkdirSync(cacheDir, { recursive: true });
 
@@ -232,6 +246,7 @@ async function ensureCbrCache(bookId: number): Promise<{ cacheDir: string; meta:
     pages,
   };
   await Bun.write(metaPath, `${JSON.stringify(meta)}\n`);
+  metaMemCache.set(cacheKey, { meta, signature: source });
 
   return { cacheDir, meta };
 }
@@ -282,7 +297,9 @@ async function runCommand(command: string, args: string[]): Promise<{ stdout: st
   ]);
 
   if (exitCode !== 0) {
-    throw new PageStreamingError(500, stderr.trim() || `${command} exited with ${exitCode}`);
+    const trimmed = stderr.trim();
+    console.error(`[page-streaming] ${command} error:`, trimmed || `exited with ${exitCode}`);
+    throw new PageStreamingError(500, "Page extraction failed");
   }
 
   return { stdout, stderr };

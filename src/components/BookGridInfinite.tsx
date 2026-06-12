@@ -54,7 +54,7 @@ const GridCard = memo(function GridCard({ book }: { book: BookListItem }) {
   );
 });
 
-export function BookGridInfinite({ searchQuery, sortConfig }: BookGridInfiniteProps) {
+export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, sortConfig }: BookGridInfiniteProps) {
   const { books, hasNextPage, fetchNextPage, isFetchingNextPage, isLoading, isError, error } =
     useFlattenedBooks(searchQuery, sortConfig);
 
@@ -88,6 +88,10 @@ export function BookGridInfinite({ searchQuery, sortConfig }: BookGridInfinitePr
 
   const virtualItems = virtualizer.getVirtualItems();
   const totalSize = virtualizer.getTotalSize();
+
+  useEffect(() => {
+    if (cardHeight > 0) virtualizer.measure();
+  }, [cardHeight, virtualizer]);
 
   // Infinite scroll — just use isFetchingNextPage, no extra state
   const lastVirtualItem = virtualItems[virtualItems.length - 1];
@@ -218,4 +222,4 @@ export function BookGridInfinite({ searchQuery, sortConfig }: BookGridInfinitePr
       </div>
     </div>
   );
-}
+});

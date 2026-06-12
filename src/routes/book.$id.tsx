@@ -1,4 +1,4 @@
-import { createFileRoute, useParams } from "@tanstack/react-router";
+import { createFileRoute, useParams, useNavigate } from "@tanstack/react-router";
 import { BookDetail } from "@/components/BookDetail";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft, BookOpen } from "lucide-react";
@@ -10,6 +10,15 @@ export const Route = createFileRoute("/book/$id")({
 function BookDetailPage() {
   const { id } = useParams({ from: "/book/$id" });
   const bookId = parseInt(id, 10);
+  const navigate = useNavigate();
+
+  function handleBack() {
+    if (window.history.length <= 1) {
+      navigate({ to: "/" });
+    } else {
+      window.history.back();
+    }
+  }
 
   return (
     <div className="min-h-screen bg-parchment paper-texture">
@@ -21,7 +30,7 @@ function BookDetailPage() {
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => window.history.back()}
+              onClick={handleBack}
               className="group gap-2 text-ink-muted hover:text-ink transition-colors bg-transparent hover:bg-parchment-dark cursor-pointer"
             >
               <div className="flex items-center justify-center w-8 h-8 rounded bg-parchment-dark group-hover:bg-parchment-warm transition-colors border border-ink">

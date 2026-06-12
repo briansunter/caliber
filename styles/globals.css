@@ -40,6 +40,9 @@
   --color-input: rgba(0, 0, 0, 0.1);
   --color-ring: var(--color-accent);
 
+  /* Semantic error color — mirrors --error in :root */
+  --color-error: #dc2626;
+
   /* Radius - Subtle rounding */
   --radius-sm: 6px;
   --radius-md: 10px;
@@ -177,6 +180,25 @@
 
   /* Typography */
   .font-sans { font-family: var(--font-sans); }
+
+  /* Subtle paper texture — faint noise via layered gradients, no external images */
+  .paper-texture {
+    background-image:
+      repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 3px,
+        rgba(0, 0, 0, 0.012) 3px,
+        rgba(0, 0, 0, 0.012) 4px
+      ),
+      repeating-linear-gradient(
+        90deg,
+        transparent,
+        transparent 7px,
+        rgba(0, 0, 0, 0.006) 7px,
+        rgba(0, 0, 0, 0.006) 8px
+      );
+  }
 
   /* Clean underline animation */
   .underline-elegant {

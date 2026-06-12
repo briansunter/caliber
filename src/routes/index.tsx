@@ -113,7 +113,7 @@ function IndexComponent() {
       };
       requestAnimationFrame(tryScroll);
     }
-  });
+  }, []);
 
   const { data: stats, isLoading: statsLoading } = useLibraryStats();
 
@@ -160,10 +160,11 @@ function IndexComponent() {
             <div className="flex-1 min-w-0">
               <BookSearch onSearch={setSearchQuery} initialValue={searchQuery} />
             </div>
-            <div className="flex-shrink-0 flex items-center border border-ink rounded-lg overflow-hidden">
+            <fieldset aria-label="View mode" className="m-0 p-0 flex-shrink-0 flex items-center border border-ink rounded-lg overflow-hidden">
               <button
                 type="button"
                 onClick={() => setViewMode("list")}
+                aria-pressed={viewMode === "list"}
                 className={`p-2 transition-colors ${viewMode === "list" ? "bg-ink text-white" : "bg-white text-ink-muted hover:text-ink"}`}
                 title="List view"
               >
@@ -172,12 +173,13 @@ function IndexComponent() {
               <button
                 type="button"
                 onClick={() => setViewMode("grid")}
+                aria-pressed={viewMode === "grid"}
                 className={`p-2 transition-colors ${viewMode === "grid" ? "bg-ink text-white" : "bg-white text-ink-muted hover:text-ink"}`}
                 title="Grid view"
               >
                 <LayoutGrid className="h-4 w-4" strokeWidth={1.5} />
               </button>
-            </div>
+            </fieldset>
           </div>
           {viewMode === "grid" && (
             <GridSortBar sortConfig={sortConfig} onSortChange={setSortConfig} />

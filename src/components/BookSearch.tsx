@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, memo } from "react";
+import { useState, useEffect, useCallback, useRef, memo } from "react";
 import { Search, X } from "lucide-react";
 
 interface BookSearchProps {
@@ -11,8 +11,13 @@ export const BookSearch = memo(function BookSearch({
   initialValue = "",
 }: BookSearchProps) {
   const [inputValue, setInputValue] = useState(initialValue);
+  const isMounted = useRef(false);
 
   useEffect(() => {
+    if (!isMounted.current) {
+      isMounted.current = true;
+      return;
+    }
     const timer = setTimeout(() => {
       onSearch(inputValue);
     }, 300);

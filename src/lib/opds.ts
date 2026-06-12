@@ -5,6 +5,7 @@ import type {
   CursorPaginatedResult,
 } from "./calibre-optimized";
 import { canReadInBrowser, getFormatContentType } from "./book-files";
+import { stripHtmlTags } from "./utils";
 
 export const OPDS_NAVIGATION_TYPE = "application/atom+xml;profile=opds-catalog;kind=navigation";
 export const OPDS_ACQUISITION_TYPE = "application/atom+xml;profile=opds-catalog;kind=acquisition";
@@ -62,20 +63,10 @@ function absoluteUrl(baseUrl: string, path: string): string {
 }
 
 export function toOpdsDate(value: string | null | undefined): string {
-  if (!value) return new Date().toISOString();
+  if (!value) return "1970-01-01T00:00:00.000Z";
 
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
-}
-
-function stripHtml(input: string): string {
-  return input
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<[^>]*>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  return Number.isNaN(date.getTime()) ? "1970-01-01T00:00:00.000Z" : date.toISOString();
 }
 
 function feedPreamble(_kind: "navigation" | "acquisition"): string {
@@ -96,7 +87,7 @@ function navigationEntry(
   href: string,
   summary: string,
   updated: string,
-  type: string = OPDS_ACQUISITION_TYPE,
+  type: string = OPDS_NAVIGATION_TYPE,
 ): string {
   const absHref = absoluteUrl(baseUrl, href);
 
@@ -125,6 +116,7 @@ export function renderNavigationFeed(options: NavigationFeedOptions): string {
     "/opds/books?sortBy=title&sortOrder=asc",
     `${totalBooks.toLocaleString()} books sorted by title.`,
     updated,
+    OPDS_ACQUISITION_TYPE,
   )}
   ${navigationEntry(
     baseUrl,
@@ -132,6 +124,7 @@ export function renderNavigationFeed(options: NavigationFeedOptions): string {
     "/opds/recent",
     "Newest books in this Calibre library.",
     updated,
+    OPDS_ACQUISITION_TYPE,
   )}
   ${navigationEntry(
     baseUrl,
@@ -176,7 +169,7 @@ function bookAuthors(book: OpdsBook): string {
 function bookSummary(book: OpdsBook): string {
   const comments = "comments" in book ? book.comments : null;
   if (comments) {
-    const clean = stripHtml(comments);
+    const clean = stripHtmlTags(comments);
     if (clean.length > 0) return clean;
   }
 

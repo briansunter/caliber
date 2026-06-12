@@ -190,13 +190,13 @@ const FormatsCell = memo(function FormatsCell({
 
 const ActionsCell = memo(function ActionsCell({ id }: { id: number }) {
   return (
-    <Link to="/book/$id" params={{ id: String(id) }}>
-      <button
-        type="button"
-        className="p-2 rounded-md hover:bg-parchment-dark text-ink-muted hover:text-ink transition-colors"
-      >
-        <ChevronRight className="h-4 w-4" strokeWidth={1.5} />
-      </button>
+    <Link
+      to="/book/$id"
+      params={{ id: String(id) }}
+      aria-label="View book details"
+      className="p-2 rounded-md hover:bg-parchment-dark text-ink-muted hover:text-ink transition-colors inline-flex items-center justify-center focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+    >
+      <ChevronRight className="h-4 w-4" strokeWidth={1.5} />
     </Link>
   );
 });
@@ -309,11 +309,15 @@ export const SortHeader = memo(function SortHeader({
   className = "",
 }: SortHeaderProps) {
   const isActive = currentSort.field === field;
+  const ariaLabel = isActive
+    ? `Sort by ${label}, currently ${currentSort.order === "asc" ? "ascending" : "descending"}`
+    : `Sort by ${label}`;
 
   return (
     <button
       type="button"
       onClick={() => onSort(field)}
+      aria-label={ariaLabel}
       className={`flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider hover:text-ink transition-colors ${
         isActive ? "text-accent" : "text-ink-muted"
       } ${className}`}
@@ -390,7 +394,7 @@ export const TableHeader = memo(function TableHeader({
   );
 });
 
-export function BookTableInfinite({ searchQuery, sortConfig }: BookTableInfiniteProps) {
+export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, sortConfig }: BookTableInfiniteProps) {
   const { books, hasNextPage, fetchNextPage, isFetchingNextPage, isLoading, isError, error } =
     useFlattenedBooks(searchQuery, sortConfig);
 
@@ -520,4 +524,4 @@ export function BookTableInfinite({ searchQuery, sortConfig }: BookTableInfinite
       </div>
     </div>
   );
-}
+});

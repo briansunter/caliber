@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 import ePub from "epubjs";
 import type Book from "epubjs/types/book";
 import type Rendition from "epubjs/types/rendition";
@@ -28,6 +28,8 @@ interface SpineItemLike {
   index?: number;
   linear?: boolean | string;
 }
+
+type ReaderPointerTarget = EventTarget | null;
 
 const THEME_STYLES: Record<ReaderTheme, Record<string, Record<string, string>>> = {
   light: {
@@ -202,6 +204,31 @@ function getEpubProgress(location: Location | null | undefined, book: Book | nul
   return 0;
 }
 
+function closestElement(target: ReaderPointerTarget): Element | null {
+  const node = target as (Node & { closest?: (selector: string) => Element | null }) | null;
+  if (!node) return null;
+  if (typeof node.closest === "function") return node.closest("*");
+  return node.parentElement ?? null;
+}
+
+function isInteractiveTarget(target: ReaderPointerTarget): boolean {
+  const element = closestElement(target);
+  return Boolean(
+    element?.closest(
+      [
+        "a[href]",
+        "button",
+        "input",
+        "textarea",
+        "select",
+        "summary",
+        "[role='button']",
+        "[role='link']",
+      ].join(","),
+    ),
+  );
+}
+
 export function EpubReader({
   streamUrl,
   fullUrl,
@@ -229,13 +256,14 @@ export function EpubReader({
   const [theme, setTheme] = useState<ReaderTheme>(() =>
     stored("caliber-reader-theme", "light" as ReaderTheme),
   );
+  const [isTouchDevice] = useState(() => window.matchMedia("(hover: none)").matches);
   const fontSizeRef = useRef(fontSize);
   const themeRef = useRef(theme);
+  const showSettingsRef = useRef(showSettings);
+  const showTocRef = useRef(showToc);
 
   const posKey = `caliber-pos-${bookId}-epub`;
 
-  const goNext = useCallback(() => renditionRef.current?.next(), []);
-  const goPrev = useCallback(() => renditionRef.current?.prev(), []);
   const toggleUI = useCallback(() => {
     setShowUI((p) => !p);
     setShowSettings(false);
@@ -258,64 +286,20 @@ export function EpubReader({
     themeRef.current = theme;
   }, [theme]);
 
-  // Touch handling on the overlay
-  const onTouchStart = useCallback((e: React.TouchEvent) => {
-    const touch = e.touches[0];
-    if (!touch) return;
-    touchRef.current = {
-      x: touch.clientX,
-      y: touch.clientY,
-      t: Date.now(),
-    };
-  }, []);
+  useEffect(() => {
+    showSettingsRef.current = showSettings;
+  }, [showSettings]);
 
-  const onTouchEnd = useCallback(
-    (e: React.TouchEvent) => {
-      const start = touchRef.current;
-      if (!start) return;
-      touchRef.current = null;
-
-      const touch = e.changedTouches[0];
-      if (!touch) return;
-      const dx = touch.clientX - start.x;
-      const dy = touch.clientY - start.y;
-      const dt = Date.now() - start.t;
-
-      // Swipe (horizontal, >50px, <500ms)
-      if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5 && dt < 500) {
-        if (dx > 0) goPrev();
-        else goNext();
-        return;
-      }
-
-      // Tap (minimal movement, <300ms)
-      if (Math.abs(dx) < 15 && Math.abs(dy) < 15 && dt < 300) {
-        const w = window.innerWidth;
-        const x = touch.clientX;
-        if (x < w * 0.3) goPrev();
-        else if (x > w * 0.7) goNext();
-        else toggleUI();
-      }
-    },
-    [goPrev, goNext, toggleUI],
-  );
-
-  // Click handler for desktop
-  const onClick = useCallback(
-    (e: React.MouseEvent) => {
-      const w = window.innerWidth;
-      if (e.clientX < w * 0.3) goPrev();
-      else if (e.clientX > w * 0.7) goNext();
-      else toggleUI();
-    },
-    [goPrev, goNext, toggleUI],
-  );
+  useEffect(() => {
+    showTocRef.current = showToc;
+  }, [showToc]);
 
   // Initialize epub.js. Stream mode reads unpacked entries; full mode loads the archive once.
   useEffect(() => {
     if (!viewerRef.current) return;
     let cancelled = false;
     let keyHandler: ((e: KeyboardEvent) => void) | null = null;
+    let contentHandlers: Array<[string, (e: Event) => void]> = [];
 
     async function openBook() {
       setIsLoading(true);
@@ -431,8 +415,84 @@ export function EpubReader({
           })
           .catch(() => {});
 
+        const navigateFromPointer = (clientX: number, viewportWidth: number) => {
+          if (clientX < viewportWidth * 0.3) rendition.prev();
+          else if (clientX > viewportWidth * 0.7) rendition.next();
+          else toggleUI();
+        };
+
+        const contentTouchStart = (e: Event) => {
+          if (isInteractiveTarget(e.target)) {
+            touchRef.current = null;
+            return;
+          }
+
+          const touch = (e as TouchEvent).touches?.[0];
+          if (!touch) return;
+          touchRef.current = {
+            x: touch.clientX,
+            y: touch.clientY,
+            t: Date.now(),
+          };
+        };
+
+        const contentTouchEnd = (e: Event) => {
+          if (isInteractiveTarget(e.target)) {
+            touchRef.current = null;
+            return;
+          }
+
+          const start = touchRef.current;
+          if (!start) return;
+          touchRef.current = null;
+
+          const event = e as TouchEvent;
+          const touch = event.changedTouches?.[0];
+          if (!touch) return;
+          const dx = touch.clientX - start.x;
+          const dy = touch.clientY - start.y;
+          const dt = Date.now() - start.t;
+
+          if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5 && dt < 500) {
+            if (dx > 0) rendition.prev();
+            else rendition.next();
+            return;
+          }
+
+          if (Math.abs(dx) < 15 && Math.abs(dy) < 15 && dt < 300) {
+            const viewportWidth = event.view?.innerWidth || window.innerWidth;
+            navigateFromPointer(touch.clientX, viewportWidth);
+          }
+        };
+
+        const contentClick = (e: Event) => {
+          if ((e as MouseEvent).defaultPrevented || isInteractiveTarget(e.target)) return;
+          const event = e as MouseEvent;
+          const viewportWidth = event.view?.innerWidth || window.innerWidth;
+          navigateFromPointer(event.clientX, viewportWidth);
+        };
+
+        contentHandlers = [
+          ["touchstart", contentTouchStart],
+          ["touchend", contentTouchEnd],
+          ["click", contentClick],
+        ];
+        for (const [eventName, handler] of contentHandlers) {
+          rendition.on(eventName, handler);
+        }
+
         // Keyboard
         keyHandler = (e: KeyboardEvent) => {
+          const active = document.activeElement;
+          const tag = active?.tagName;
+          if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+          if (showSettingsRef.current || showTocRef.current) {
+            if (e.key === "Escape") {
+              if (showSettingsRef.current) setShowSettings(false);
+              else if (showTocRef.current) setShowToc(false);
+            }
+            return;
+          }
           if (e.key === "ArrowLeft" || e.key === "ArrowUp") rendition.prev();
           else if (e.key === "ArrowRight" || e.key === "ArrowDown" || e.key === " ")
             rendition.next();
@@ -462,6 +522,11 @@ export function EpubReader({
       const b = bookRef.current;
       renditionRef.current = null;
       bookRef.current = null;
+      if (r) {
+        for (const [eventName, handler] of contentHandlers) {
+          r.off(eventName, handler);
+        }
+      }
       if (r)
         try {
           r.destroy();
@@ -471,7 +536,7 @@ export function EpubReader({
           b.destroy();
         } catch {}
     };
-  }, [streamUrl, fullUrl, loadMode, onBack, posKey]);
+  }, [streamUrl, fullUrl, loadMode, onBack, posKey, toggleUI]);
 
   // Theme changes
   useEffect(() => {
@@ -613,7 +678,7 @@ export function EpubReader({
           <iframe
             className="absolute inset-0 h-full w-full border-0"
             title={title}
-            sandbox=""
+            sandbox="allow-popups allow-popups-to-escape-sandbox"
             referrerPolicy="no-referrer"
             srcDoc={htmlDocument}
           />
@@ -622,14 +687,22 @@ export function EpubReader({
         )}
 
         {!isLoading && !htmlDocument && (
-          <button
-            type="button"
-            aria-label="Page navigation overlay"
-            className="absolute inset-0 z-[106] cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none block w-full h-full"
-            onTouchStart={onTouchStart}
-            onTouchEnd={onTouchEnd}
-            onClick={onClick}
-          />
+          <>
+            <button
+              type="button"
+              aria-label="Previous page"
+              title="Previous page"
+              className="absolute left-0 top-0 bottom-0 z-[106] w-10 sm:w-12 cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none"
+              onClick={() => renditionRef.current?.prev()}
+            />
+            <button
+              type="button"
+              aria-label="Next page"
+              title="Next page"
+              className="absolute right-0 top-0 bottom-0 z-[106] w-10 sm:w-12 cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none"
+              onClick={() => renditionRef.current?.next()}
+            />
+          </>
         )}
       </div>
 
@@ -656,7 +729,7 @@ export function EpubReader({
           </div>
           <div className="flex justify-between mt-1.5 text-xs" style={{ color: fg, opacity: 0.45 }}>
             <span>{formatProgress(progress)} read</span>
-            <span>Tap edges to turn pages</span>
+            <span>{isTouchDevice ? "Tap edges to turn pages" : "Click edges or use ← → keys"}</span>
           </div>
         </div>
       </div>
@@ -759,21 +832,34 @@ export function EpubReader({
             </button>
           </div>
           <div className="flex-1 overflow-y-auto overscroll-contain">
-            {toc.map((item) => (
-              <button
-                type="button"
-                key={item.href}
-                onClick={() => handleTocNav(item.href)}
-                className="w-full text-left px-5 py-3.5 text-sm active:opacity-60 transition-opacity"
-                style={{
-                  color: fg,
-                  borderBottom: `1px solid ${subtle}`,
-                }}
-              >
-                {item.label?.trim()}
-              </button>
-            ))}
-            {toc.length === 0 && (
+            {toc.length > 0 ? (
+              (() => {
+                function renderTocItems(items: NavItem[], depth: number): React.ReactNode {
+                  return items.map((item) => (
+                    <React.Fragment key={item.id || item.href}>
+                      <button
+                        type="button"
+                        onClick={() => handleTocNav(item.href)}
+                        className="w-full text-left py-3 text-sm active:opacity-60 transition-opacity"
+                        style={{
+                          color: depth === 0 ? fg : fg,
+                          opacity: depth === 0 ? 1 : 0.75,
+                          borderBottom: `1px solid ${subtle}`,
+                          paddingLeft: `${20 + depth * 16}px`,
+                          paddingRight: "20px",
+                        }}
+                      >
+                        {item.label?.trim()}
+                      </button>
+                      {item.subitems && item.subitems.length > 0
+                        ? renderTocItems(item.subitems, depth + 1)
+                        : null}
+                    </React.Fragment>
+                  ));
+                }
+                return renderTocItems(toc, 0);
+              })()
+            ) : (
               <div className="p-8 text-center text-sm" style={{ color: fg, opacity: 0.4 }}>
                 No table of contents available
               </div>

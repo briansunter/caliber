@@ -86,6 +86,8 @@ export function ComicReader({
   const [currentPage, setCurrentPage] = useState(() => stored(posKey, { page: 1 }).page as number);
   const [showUI, setShowUI] = useState(true);
   const [zoom, setZoom] = useState(1);
+  const [imgLoaded, setImgLoaded] = useState(false);
+  const [imgError, setImgError] = useState(false);
 
   const totalPages = pages.length;
   const page = pages[currentPage - 1];
@@ -232,6 +234,12 @@ export function ComicReader({
       localStorage.setItem(posKey, JSON.stringify({ page: currentPage, ts: Date.now() }));
     } catch {}
   }, [currentPage, posKey]);
+
+  useEffect(() => {
+    if (currentPage < 1) return;
+    setImgLoaded(false);
+    setImgError(false);
+  }, [currentPage]);
 
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
@@ -394,16 +402,42 @@ export function ComicReader({
       <div className="relative min-h-0 flex-1 overflow-auto">
         <div className="flex min-h-full items-start justify-center">
           {page && (
-            <img
-              src={page.href}
-              alt={page.name}
-              className="block max-w-none"
-              style={{
-                width: `${Math.round(100 * zoom)}%`,
-                maxWidth: zoom <= 1 ? "100%" : "none",
-              }}
-              draggable={false}
-            />
+            <>
+              {!imgLoaded && !imgError && (
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                  <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+                </div>
+              )}
+              {imgError && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
+                  <p className="text-sm text-white/60">Failed to load page</p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setImgError(false);
+                      setImgLoaded(false);
+                    }}
+                    className="rounded bg-white/10 px-3 py-1.5 text-sm text-white active:opacity-70"
+                  >
+                    Retry
+                  </button>
+                </div>
+              )}
+              <img
+                key={currentPage}
+                src={imgError ? "" : page.href}
+                alt={page.name}
+                className="block max-w-none"
+                style={{
+                  width: `${Math.round(100 * zoom)}%`,
+                  maxWidth: zoom <= 1 ? "100%" : "none",
+                  display: imgLoaded ? "block" : "none",
+                }}
+                draggable={false}
+                onLoad={() => { setImgLoaded(true); setImgError(false); }}
+                onError={() => { setImgError(true); setImgLoaded(false); }}
+              />
+            </>
           )}
         </div>
 
@@ -445,8 +479,27 @@ export function ComicReader({
             >
               <ChevronLeft className="h-5 w-5" />
             </button>
-            <span className="text-sm tabular-nums text-white/60">
-              {currentPage} / {totalPages || "-"}
+            <span className="flex items-center gap-1 text-sm tabular-nums text-white/60">
+              <input
+                type="number"
+                min={1}
+                max={totalPages || 1}
+                value={currentPage}
+                onChange={(e) => {
+                  const val = parseInt(e.target.value, 10);
+                  if (Number.isInteger(val) && val >= 1 && val <= (totalPages || 1)) {
+                    setCurrentPage(val);
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                  e.stopPropagation();
+                }}
+                onClick={(e) => e.stopPropagation()}
+                className="w-10 bg-transparent text-center text-sm text-white/60 tabular-nums [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none outline-none border-b border-white/20 focus:border-white/50"
+                aria-label="Page number"
+              />
+              <span>/ {totalPages || "-"}</span>
             </span>
             <button
               type="button"

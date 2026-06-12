@@ -1,6 +1,6 @@
 import { useInfiniteQuery, useQuery, keepPreviousData } from "@tanstack/react-query";
 import { useMemo } from "react";
-import type { BookListItem, CursorPaginatedResult } from "@/lib/calibre-optimized";
+import type { BookListItem, BookWithDetails, CursorPaginatedResult } from "@/lib/calibre-optimized";
 import { fetchJson } from "@/lib/http";
 
 const API_BASE = "/api";
@@ -149,7 +149,7 @@ export function useLibraryStats() {
 export function useBook(id: number) {
   return useQuery({
     queryKey: ["book", id],
-    queryFn: ({ signal }) => fetchJson<BookListItem>(`${API_BASE}/books/${id}`, { signal }),
+    queryFn: ({ signal }) => fetchJson<BookWithDetails>(`${API_BASE}/books/${id}`, { signal }),
     enabled: !Number.isNaN(id) && id > 0,
   });
 }

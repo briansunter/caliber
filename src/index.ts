@@ -19,7 +19,10 @@ import {
   getLibraryPath,
   getBookFormatPath,
   getBookCoverPath,
+  getBookTitle,
   initFTS,
+  onDbRefresh,
+  CursorError,
   type BookListItem,
   type CatalogEntry,
   type CursorPaginatedResult,
@@ -39,16 +42,17 @@ import { EpubCacheError, getEpubEntryPath } from "./lib/epub-cache";
 import { getPageFile, getPageManifest, PageStreamingError } from "./lib/page-streaming";
 import { handleMCPRequest } from "./mcp";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { CONFIG_DIR_PATH } from "./lib/config";
 
 const LIBRARY_PATH = getLibraryPath();
-const WORK_DIR = join(homedir(), ".config", "caliber");
+const WORK_DIR = CONFIG_DIR_PATH;
 const DEFAULT_PORT = 3003;
 const MAX_QUERY_LIMIT = 100;
 const MAX_STREAM_BATCH_SIZE = 5000;
 const SORT_FIELDS = ["title", "author", "added", "rating"] as const;
 const SORT_ORDERS = ["asc", "desc"] as const;
 const OPTIONAL_EPUB_DISPLAY_OPTIONS_PATH = "META-INF/com.apple.ibooks.display-options.xml";
+const FORMAT_PATTERN = /^[A-Za-z0-9]{1,10}$/;
 const DEFAULT_EPUB_DISPLAY_OPTIONS = `<?xml version="1.0" encoding="UTF-8"?>
 <display_options/>`;
 
@@ -75,20 +79,24 @@ function parseSortOrder(value: string | null): SortOrder {
 
 // Initialize FTS on startup
 initFTS();
+onDbRefresh(() => apiCache.clear());
 
-// Simple LRU cache for API responses
-class LRUCache<K, V> {
+const MAX_CACHE_BYTES = 50 * 1024 * 1024;
+
+class LRUCache<K extends string, V extends { data: string }> {
   private cache = new Map<K, V>();
   private maxSize: number;
+  private maxBytes: number;
+  private totalBytes = 0;
 
-  constructor(maxSize: number) {
+  constructor(maxSize: number, maxBytes: number = MAX_CACHE_BYTES) {
     this.maxSize = maxSize;
+    this.maxBytes = maxBytes;
   }
 
   get(key: K): V | undefined {
     const value = this.cache.get(key);
     if (value !== undefined) {
-      // Move to end (most recently used)
       this.cache.delete(key);
       this.cache.set(key, value);
     }
@@ -96,20 +104,29 @@ class LRUCache<K, V> {
   }
 
   set(key: K, value: V): void {
-    if (this.cache.has(key)) {
+    const incoming = value.data.length;
+    const existing = this.cache.get(key);
+    if (existing !== undefined) {
+      this.totalBytes -= existing.data.length;
       this.cache.delete(key);
-    } else if (this.cache.size >= this.maxSize) {
-      // Remove least recently used (first item)
+    }
+    while (
+      this.cache.size > 0 &&
+      (this.cache.size >= this.maxSize || this.totalBytes + incoming > this.maxBytes)
+    ) {
       const firstKey = this.cache.keys().next().value;
-      if (firstKey !== undefined) {
-        this.cache.delete(firstKey);
-      }
+      if (firstKey === undefined) break;
+      const evicted = this.cache.get(firstKey);
+      if (evicted !== undefined) this.totalBytes -= evicted.data.length;
+      this.cache.delete(firstKey);
     }
     this.cache.set(key, value);
+    this.totalBytes += incoming;
   }
 
   clear(): void {
     this.cache.clear();
+    this.totalBytes = 0;
   }
 }
 
@@ -465,6 +482,9 @@ async function serveBookFile(
   formatParam: string,
   disposition: "attachment" | "inline",
 ): Promise<Response> {
+  if (!FORMAT_PATTERN.test(formatParam)) {
+    return Response.json({ error: "Invalid format" }, { status: 400 });
+  }
   const format = formatParam.toUpperCase();
   const filePath = getBookFormatPath(id, format);
 
@@ -478,8 +498,8 @@ async function serveBookFile(
     return Response.json({ error: "File not found" }, { status: 404 });
   }
 
-  const book = getBookByIdOptimized(id);
-  const filename = getSafeBookFilename(book?.title, format);
+  const title = getBookTitle(id);
+  const filename = getSafeBookFilename(title, format);
   const contentType = getFormatContentType(format);
 
   return serveLocalFile(req, filePath, {
@@ -521,6 +541,14 @@ async function serveEpubEntry(req: Request, id: number): Promise<Response> {
   });
 }
 
+function routeErrorResponse(error: unknown, logLabel: string, message: string): Response {
+  if (error instanceof CursorError) {
+    return Response.json({ error: "Invalid cursor" }, { status: 400 });
+  }
+  console.error(logLabel, error);
+  return Response.json({ error: message }, { status: 500 });
+}
+
 function pageStreamingErrorResponse(error: unknown): Response {
   if (error instanceof PageStreamingError) {
     return Response.json({ error: error.message }, { status: error.status });
@@ -541,6 +569,8 @@ function epubEntryErrorResponse(error: unknown): Response {
   console.error("Error serving EPUB entry:", error);
   return Response.json({ error: "Failed to serve EPUB entry" }, { status: 500 });
 }
+
+const streamEncoder = new TextEncoder();
 
 // Streaming JSON response for large datasets
 async function* streamBooksJSON(
@@ -637,44 +667,12 @@ const server = serve({
     "/opds/books": {
       GET: (req) => {
         try {
-          const url = new URL(req.url);
-          const baseUrl = getPublicBaseUrl(req);
-          const cursor = url.searchParams.get("cursor") || undefined;
-          const limit = parseBoundedInt(url.searchParams.get("limit"), 50, {
-            min: 1,
-            max: MAX_QUERY_LIMIT,
-          });
-          const sortBy = parseSortField(url.searchParams.get("sortBy"));
-          const sortOrder = parseSortOrder(url.searchParams.get("sortOrder"));
-          const result = listBooksCursor({ cursor, limit, sortBy, sortOrder });
-          const nextPath = result.nextCursor
-            ? buildPath("/opds/books", {
-                cursor: result.nextCursor,
-                limit,
-                sortBy,
-                sortOrder,
-              })
-            : undefined;
-          const selfPath = getRequestPath(req);
-          const feed = renderAcquisitionFeed({
-            baseUrl,
-            selfPath,
-            title: sortBy === "added" ? "Recently added" : "All books",
-            id: new URL(selfPath, baseUrl).toString(),
-            updated: new Date().toISOString(),
-            result,
-            nextPath,
-          });
-
-          return getCachedTextResponse(
-            `opds:books:${baseUrl}:${selfPath}`,
-            feed,
-            req,
-            `${OPDS_ACQUISITION_TYPE}; charset=utf-8`,
-          );
+          const params = parseOpdsPageParams(req);
+          const result = listBooksCursor(params);
+          const title = params.sortBy === "added" ? "Recently added" : "All books";
+          return opdsAcquisitionResponse(req, title, "/opds/books", result);
         } catch (error) {
-          console.error("Error rendering OPDS books:", error);
-          return Response.json({ error: "Failed to render OPDS books" }, { status: 500 });
+          return routeErrorResponse(error, "Error rendering OPDS books:", "Failed to render OPDS books");
         }
       },
     },
@@ -696,8 +694,7 @@ const server = serve({
             sortOrder: "desc",
           });
         } catch (error) {
-          console.error("Error rendering OPDS recent books:", error);
-          return Response.json({ error: "Failed to render OPDS recent books" }, { status: 500 });
+          return routeErrorResponse(error, "Error rendering OPDS recent books:", "Failed to render OPDS recent books");
         }
       },
     },
@@ -712,8 +709,7 @@ const server = serve({
             `/opds/authors/${encodeURIComponent(String(entry.id))}/books`
           );
         } catch (error) {
-          console.error("Error rendering OPDS authors:", error);
-          return Response.json({ error: "Failed to render OPDS authors" }, { status: 500 });
+          return routeErrorResponse(error, "Error rendering OPDS authors:", "Failed to render OPDS authors");
         }
       },
     },
@@ -735,8 +731,7 @@ const server = serve({
           const result = listBooksByAuthorCursor(id, params);
           return opdsAcquisitionResponse(req, `Author: ${entry.title}`, `/opds/authors/${id}/books`, result);
         } catch (error) {
-          console.error("Error rendering OPDS author books:", error);
-          return Response.json({ error: "Failed to render OPDS author books" }, { status: 500 });
+          return routeErrorResponse(error, "Error rendering OPDS author books:", "Failed to render OPDS author books");
         }
       },
     },
@@ -751,8 +746,7 @@ const server = serve({
             `/opds/series/${encodeURIComponent(String(entry.id))}/books`
           );
         } catch (error) {
-          console.error("Error rendering OPDS series:", error);
-          return Response.json({ error: "Failed to render OPDS series" }, { status: 500 });
+          return routeErrorResponse(error, "Error rendering OPDS series:", "Failed to render OPDS series");
         }
       },
     },
@@ -774,8 +768,7 @@ const server = serve({
           const result = listBooksBySeriesCursor(id, params);
           return opdsAcquisitionResponse(req, `Series: ${entry.title}`, `/opds/series/${id}/books`, result);
         } catch (error) {
-          console.error("Error rendering OPDS series books:", error);
-          return Response.json({ error: "Failed to render OPDS series books" }, { status: 500 });
+          return routeErrorResponse(error, "Error rendering OPDS series books:", "Failed to render OPDS series books");
         }
       },
     },
@@ -790,8 +783,7 @@ const server = serve({
             `/opds/tags/${encodeURIComponent(String(entry.id))}/books`
           );
         } catch (error) {
-          console.error("Error rendering OPDS tags:", error);
-          return Response.json({ error: "Failed to render OPDS tags" }, { status: 500 });
+          return routeErrorResponse(error, "Error rendering OPDS tags:", "Failed to render OPDS tags");
         }
       },
     },
@@ -813,8 +805,7 @@ const server = serve({
           const result = listBooksByTagCursor(id, params);
           return opdsAcquisitionResponse(req, `Tag: ${entry.title}`, `/opds/tags/${id}/books`, result);
         } catch (error) {
-          console.error("Error rendering OPDS tag books:", error);
-          return Response.json({ error: "Failed to render OPDS tag books" }, { status: 500 });
+          return routeErrorResponse(error, "Error rendering OPDS tag books:", "Failed to render OPDS tag books");
         }
       },
     },
@@ -829,8 +820,7 @@ const server = serve({
             `/opds/formats/${encodeURIComponent(String(entry.id))}/books`
           );
         } catch (error) {
-          console.error("Error rendering OPDS formats:", error);
-          return Response.json({ error: "Failed to render OPDS formats" }, { status: 500 });
+          return routeErrorResponse(error, "Error rendering OPDS formats:", "Failed to render OPDS formats");
         }
       },
     },
@@ -853,8 +843,7 @@ const server = serve({
             result,
           );
         } catch (error) {
-          console.error("Error rendering OPDS format books:", error);
-          return Response.json({ error: "Failed to render OPDS format books" }, { status: 500 });
+          return routeErrorResponse(error, "Error rendering OPDS format books:", "Failed to render OPDS format books");
         }
       },
     },
@@ -902,8 +891,7 @@ const server = serve({
             },
           });
         } catch (error) {
-          console.error("Error rendering OPDS search:", error);
-          return Response.json({ error: "Failed to render OPDS search" }, { status: 500 });
+          return routeErrorResponse(error, "Error rendering OPDS search:", "Failed to render OPDS search");
         }
       },
     },
@@ -957,7 +945,7 @@ const server = serve({
           async start(controller) {
             try {
               for await (const chunk of streamBooksJSON(streamBooks(batchSize))) {
-                controller.enqueue(new TextEncoder().encode(chunk));
+                controller.enqueue(streamEncoder.encode(chunk));
               }
               controller.close();
             } catch (error) {
@@ -969,7 +957,6 @@ const server = serve({
         return new Response(stream, {
           headers: {
             "Content-Type": "application/json",
-            "Transfer-Encoding": "chunked",
             "Cache-Control": "no-cache",
           },
         });
@@ -994,8 +981,7 @@ const server = serve({
           const cacheKey = `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}`;
           return getCachedResponse(cacheKey, result, req);
         } catch (error) {
-          console.error("Error listing books:", error);
-          return Response.json({ error: "Failed to list books" }, { status: 500 });
+          return routeErrorResponse(error, "Error listing books:", "Failed to list books");
         }
       },
     },
@@ -1032,8 +1018,7 @@ const server = serve({
             },
           });
         } catch (error) {
-          console.error("Error searching books:", error);
-          return Response.json({ error: "Failed to search books" }, { status: 500 });
+          return routeErrorResponse(error, "Error searching books:", "Failed to search books");
         }
       },
     },
@@ -1177,6 +1162,9 @@ const server = serve({
           if (id === null) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
+          if (!FORMAT_PATTERN.test(req.params.format)) {
+            return Response.json({ error: "Invalid format" }, { status: 400 });
+          }
 
           const manifest = await getPageManifest(id, req.params.format);
           return Response.json(manifest, {
@@ -1193,6 +1181,9 @@ const server = serve({
           const id = parseBookId(req.params.id);
           if (id === null) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
+          }
+          if (!FORMAT_PATTERN.test(req.params.format)) {
+            return Response.json({ error: "Invalid format" }, { status: 400 });
           }
 
           await getPageManifest(id, req.params.format);
@@ -1216,6 +1207,9 @@ const server = serve({
           if (id === null || !Number.isFinite(page)) {
             return Response.json({ error: "Invalid page request" }, { status: 400 });
           }
+          if (!FORMAT_PATTERN.test(req.params.format)) {
+            return Response.json({ error: "Invalid format" }, { status: 400 });
+          }
 
           const pageFile = await getPageFile(id, req.params.format, page);
           return serveLocalFile(req, pageFile.path, {
@@ -1232,6 +1226,9 @@ const server = serve({
           const page = Number.parseInt(req.params.page, 10);
           if (id === null || !Number.isFinite(page)) {
             return Response.json({ error: "Invalid page request" }, { status: 400 });
+          }
+          if (!FORMAT_PATTERN.test(req.params.format)) {
+            return Response.json({ error: "Invalid format" }, { status: 400 });
           }
 
           const pageFile = await getPageFile(id, req.params.format, page);
@@ -1269,7 +1266,13 @@ const server = serve({
 
           const ifNoneMatch = req.headers.get("If-None-Match");
           if (ifNoneMatch === etag) {
-            return new Response(null, { status: 304 });
+            return new Response(null, {
+              status: 304,
+              headers: {
+                ETag: etag,
+                "Cache-Control": "public, max-age=604800, immutable",
+              },
+            });
           }
 
           return new Response(file, {
@@ -1305,7 +1308,13 @@ const server = serve({
             const stat = await thumbFile.stat();
             const etag = `"t${stat.size}-${stat.mtime?.getTime() || 0}"`;
             if (ifNoneMatch === etag) {
-              return new Response(null, { status: 304 });
+              return new Response(null, {
+                status: 304,
+                headers: {
+                  ETag: etag,
+                  "Cache-Control": "public, max-age=604800, immutable",
+                },
+              });
             }
             return new Response(thumbFile, {
               headers: {
@@ -1334,7 +1343,13 @@ const server = serve({
 
           const ifNoneMatch = req.headers.get("If-None-Match");
           if (ifNoneMatch === etag) {
-            return new Response(null, { status: 304 });
+            return new Response(null, {
+              status: 304,
+              headers: {
+                ETag: etag,
+                "Cache-Control": "public, max-age=604800, immutable",
+              },
+            });
           }
 
           return new Response(coverFile, {

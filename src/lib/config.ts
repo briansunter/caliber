@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 
-const CONFIG_DIR = join(homedir(), ".config", "caliber");
+const CONFIG_DIR = process.env.CALIBER_CONFIG_DIR || join(homedir(), ".config", "caliber");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 
 interface Config {

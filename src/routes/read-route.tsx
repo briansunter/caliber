@@ -1,10 +1,18 @@
 import { createFileRoute, useParams } from "@tanstack/react-router";
 import { BookOpen } from "lucide-react";
-import { ComicReader } from "@/components/ComicReader";
-import { EpubReader } from "@/components/EpubReader";
-import { PdfReader } from "@/components/PdfReader";
+import { lazy, Suspense } from "react";
 import { normalizeReaderLoadMode } from "@/components/reader-types";
 import { useBook } from "@/hooks/useBooksInfinite";
+
+const EpubReader = lazy(() =>
+  import("@/components/EpubReader").then((m) => ({ default: m.EpubReader })),
+);
+const PdfReader = lazy(() =>
+  import("@/components/PdfReader").then((m) => ({ default: m.PdfReader })),
+);
+const ComicReader = lazy(() =>
+  import("@/components/ComicReader").then((m) => ({ default: m.ComicReader })),
+);
 
 export const Route = createFileRoute("/read/$id/$format")({
   component: ReaderPage,
@@ -49,42 +57,57 @@ function ReaderPage() {
   const bookUrl = `/api/books/${bookId}/file/${fmt}`;
   const bookTitle = book.title;
 
+  const readerFallback = (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-neutral-900">
+      <div className="flex flex-col items-center gap-3">
+        <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+        <p className="text-sm text-white/50">Loading...</p>
+      </div>
+    </div>
+  );
+
   if (fmt === "EPUB") {
     return (
-      <EpubReader
-        streamUrl={`/api/books/${bookId}/epub/`}
-        fullUrl={bookUrl}
-        bookId={bookId}
-        onBack={goBack}
-        title={bookTitle}
-        initialLoadMode={loadMode}
-      />
+      <Suspense fallback={readerFallback}>
+        <EpubReader
+          streamUrl={`/api/books/${bookId}/epub/`}
+          fullUrl={bookUrl}
+          bookId={bookId}
+          onBack={goBack}
+          title={bookTitle}
+          initialLoadMode={loadMode}
+        />
+      </Suspense>
     );
   }
 
   if (fmt === "PDF") {
     return (
-      <PdfReader
-        url={bookUrl}
-        bookId={bookId}
-        onBack={goBack}
-        title={bookTitle}
-        initialLoadMode={loadMode}
-      />
+      <Suspense fallback={readerFallback}>
+        <PdfReader
+          url={bookUrl}
+          bookId={bookId}
+          onBack={goBack}
+          title={bookTitle}
+          initialLoadMode={loadMode}
+        />
+      </Suspense>
     );
   }
 
   if (fmt === "CBZ" || fmt === "CBR") {
     return (
-      <ComicReader
-        bookId={bookId}
-        onBack={goBack}
-        title={bookTitle}
-        streamManifestUrl={`/api/books/${bookId}/pages/${fmt}/manifest`}
-        fullUrl={bookUrl}
-        supportsFullFile={fmt === "CBZ"}
-        initialLoadMode={loadMode}
-      />
+      <Suspense fallback={readerFallback}>
+        <ComicReader
+          bookId={bookId}
+          onBack={goBack}
+          title={bookTitle}
+          streamManifestUrl={`/api/books/${bookId}/pages/${fmt}/manifest`}
+          fullUrl={bookUrl}
+          supportsFullFile={fmt === "CBZ"}
+          initialLoadMode={loadMode}
+        />
+      </Suspense>
     );
   }
 
