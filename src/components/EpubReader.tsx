@@ -748,20 +748,34 @@ export function EpubReader({
           <div ref={viewerRef} className="absolute inset-0" />
         )}
 
-        {!isLoading && !htmlDocument && (
+        {/* Real-DOM tap zones over the book. epub.js renders into an iframe
+            whose in-page click/touch handlers fire unreliably on iOS Safari, so
+            on touch devices navigation and toolbar-toggle live here instead:
+            wide left/right thirds page back/forward, the center third always
+            toggles the bars (so you can never get stuck with the toolbar
+            hidden). Desktop keeps the in-iframe handlers — they work with a
+            mouse and preserve clicking links inside the book. */}
+        {!isLoading && !htmlDocument && isTouchDevice && (
           <>
             <button
               type="button"
               aria-label="Previous page"
               title="Previous page"
-              className="absolute left-0 top-0 bottom-0 z-[106] w-10 sm:w-12 cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none"
+              className="absolute left-0 top-0 bottom-0 z-[106] w-[30%] cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none"
               onClick={() => renditionRef.current?.prev()}
+            />
+            <button
+              type="button"
+              aria-label={showUI ? "Hide toolbars" : "Show toolbars"}
+              title={showUI ? "Hide toolbars" : "Show toolbars"}
+              className="absolute left-[30%] top-0 bottom-0 z-[106] w-[40%] cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none"
+              onClick={toggleUI}
             />
             <button
               type="button"
               aria-label="Next page"
               title="Next page"
-              className="absolute right-0 top-0 bottom-0 z-[106] w-10 sm:w-12 cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none"
+              className="absolute right-0 top-0 bottom-0 z-[106] w-[30%] cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none"
               onClick={() => renditionRef.current?.next()}
             />
           </>
