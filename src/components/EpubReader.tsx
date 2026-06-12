@@ -5,8 +5,20 @@ import type Rendition from "epubjs/types/rendition";
 import type { Location } from "epubjs/types/rendition";
 import type { NavItem } from "epubjs/types/navigation";
 import type Navigation from "epubjs/types/navigation";
-import { ArrowLeft, Settings, List, Minus, Plus, X, Download, Wifi } from "lucide-react";
+import {
+  ArrowLeft,
+  Settings,
+  List,
+  Minus,
+  Plus,
+  X,
+  Download,
+  Wifi,
+  Maximize,
+  Minimize,
+} from "lucide-react";
 import { stored } from "@/lib/utils";
+import { useFullscreen } from "@/lib/use-fullscreen";
 import {
   getNextReaderLoadMode,
   replaceReaderLoadModeInUrl,
@@ -276,6 +288,7 @@ export function EpubReader({
     stored("caliber-reader-theme", "light" as ReaderTheme),
   );
   const [isTouchDevice] = useState(() => window.matchMedia("(hover: none)").matches);
+  const { isFullscreen, supported: fullscreenSupported, toggle: toggleFullscreen } = useFullscreen();
   const fontSizeRef = useRef(fontSize);
   const themeRef = useRef(theme);
   const showSettingsRef = useRef(showSettings);
@@ -520,6 +533,7 @@ export function EpubReader({
           if (e.key === "ArrowLeft" || e.key === "ArrowUp") rendition.prev();
           else if (e.key === "ArrowRight" || e.key === "ArrowDown" || e.key === " ")
             rendition.next();
+          else if (e.key === "f" || e.key === "F") toggleFullscreen();
           else if (e.key === "Escape") onBack();
         };
         rendition.on("keyup", keyHandler);
@@ -560,7 +574,7 @@ export function EpubReader({
           b.destroy();
         } catch {}
     };
-  }, [streamUrl, fullUrl, loadMode, onBack, posKey, toggleUI]);
+  }, [streamUrl, fullUrl, loadMode, onBack, posKey, toggleUI, toggleFullscreen]);
 
   // Theme changes
   useEffect(() => {
@@ -673,6 +687,22 @@ export function EpubReader({
               )}
               <span className="hidden sm:inline">{loadMode === "stream" ? "Stream" : "Full"}</span>
             </button>
+            {fullscreenSupported && (
+              <button
+                type="button"
+                onClick={toggleFullscreen}
+                className="p-2 rounded-lg active:opacity-60"
+                style={{ color: fg }}
+                aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+                title={isFullscreen ? "Exit fullscreen (f)" : "Fullscreen (f)"}
+              >
+                {isFullscreen ? (
+                  <Minimize className="h-5 w-5" />
+                ) : (
+                  <Maximize className="h-5 w-5" />
+                )}
+              </button>
+            )}
             <button
               type="button"
               onClick={() => {

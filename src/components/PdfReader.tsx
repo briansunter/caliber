@@ -9,9 +9,12 @@ import {
   ChevronRight,
   Download,
   Wifi,
+  Maximize,
+  Minimize,
 } from "lucide-react";
 import { stored } from "@/lib/utils";
 import { useReaderSettings } from "@/lib/reader-settings";
+import { useFullscreen } from "@/lib/use-fullscreen";
 import {
   getNextReaderLoadMode,
   prefetchOrder,
@@ -93,6 +96,7 @@ export function PdfReader({
   const visitsRef = useRef(0);
 
   const settings = useReaderSettings();
+  const { isFullscreen, supported: fullscreenSupported, toggle: toggleFullscreen } = useFullscreen();
 
   const posKey = `caliber-pos-${bookId}-pdf`;
   const zoomKey = `caliber-zoom-${bookId}-pdf`;
@@ -547,13 +551,16 @@ export function PdfReader({
   // Keyboard
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
       if (e.key === "ArrowLeft" || e.key === "ArrowUp") goPrev();
       else if (e.key === "ArrowRight" || e.key === "ArrowDown" || e.key === " ") goNext();
+      else if (e.key === "f" || e.key === "F") toggleFullscreen();
       else if (e.key === "Escape") onBack();
     };
     document.addEventListener("keyup", handleKey);
     return () => document.removeEventListener("keyup", handleKey);
-  }, [goPrev, goNext, onBack]);
+  }, [goPrev, goNext, onBack, toggleFullscreen]);
 
   const progress = totalPages > 0 ? Math.round((currentPage / totalPages) * 100) : 0;
 
@@ -623,6 +630,21 @@ export function PdfReader({
               )}
               <span className="hidden sm:inline">{loadMode === "stream" ? "Stream" : "Full"}</span>
             </button>
+            {fullscreenSupported && (
+              <button
+                type="button"
+                onClick={toggleFullscreen}
+                className="p-2 rounded-lg text-white active:opacity-60"
+                aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+                title={isFullscreen ? "Exit fullscreen (f)" : "Fullscreen (f)"}
+              >
+                {isFullscreen ? (
+                  <Minimize className="h-5 w-5" />
+                ) : (
+                  <Maximize className="h-5 w-5" />
+                )}
+              </button>
+            )}
             <button
               type="button"
               onClick={() => setZoom((z) => Math.max(0.5, z - 0.25))}
