@@ -21,18 +21,16 @@ interface BookTableInfiniteProps {
   sortConfig: SortConfig;
 }
 
-const COLUMN_WIDTHS = {
-  title: "minmax(300px, 3fr)",
-  authors: "minmax(160px, 1.5fr)",
-  series: "minmax(140px, 1.2fr)",
-  tags: "minmax(180px, 1.5fr)",
-  rating: "90px",
-  formats: "minmax(100px, 1fr)",
-  actions: "60px",
-};
-
-export const GRID_TEMPLATE = `${COLUMN_WIDTHS.title} ${COLUMN_WIDTHS.authors} ${COLUMN_WIDTHS.series} ${COLUMN_WIDTHS.tags} ${COLUMN_WIDTHS.rating} ${COLUMN_WIDTHS.formats} ${COLUMN_WIDTHS.actions}`;
-const GRID_TEMPLATE_MOBILE = `1fr minmax(80px, auto) 40px`;
+// All flexible tracks use minmax(0, Nfr) so the grid can never exceed the
+// viewport (an fr track's implicit min is auto = content width, which made
+// long titles/authors force horizontal scroll on phones and iPads).
+// Columns appear progressively: sm = title/author/rating, lg adds
+// series/formats, xl adds tags.
+const GRID_COLS_MOBILE = "grid-cols-[minmax(0,1fr)_minmax(0,35%)_40px]";
+const GRID_COLS_DESKTOP =
+  "sm:grid-cols-[minmax(0,3fr)_minmax(0,2fr)_90px_48px] " +
+  "lg:grid-cols-[minmax(0,3fr)_minmax(0,1.5fr)_minmax(0,1.2fr)_90px_minmax(0,1fr)_48px] " +
+  "xl:grid-cols-[minmax(0,3fr)_minmax(0,1.5fr)_minmax(0,1.2fr)_minmax(0,1.5fr)_90px_minmax(0,1fr)_60px]";
 
 const ROW_HEIGHT = 72;
 const SKELETON_ROW_KEYS = [
@@ -213,10 +211,7 @@ const TableRow = memo(function TableRow({ book }: TableRowProps) {
       style={{ height: `${ROW_HEIGHT}px` }}
     >
       {/* Mobile layout */}
-      <div
-        className="w-full h-full items-center grid sm:!hidden"
-        style={{ gridTemplateColumns: GRID_TEMPLATE_MOBILE, gap: "0.5rem" }}
-      >
+      <div className={`w-full h-full items-center gap-2 grid sm:!hidden ${GRID_COLS_MOBILE}`}>
         <div className="flex items-center min-w-0 py-2 overflow-hidden">
           <TitleCell title={book.title} id={book.id} hasCover={book.has_cover} />
         </div>
@@ -229,10 +224,9 @@ const TableRow = memo(function TableRow({ book }: TableRowProps) {
           <ActionsCell id={book.id} />
         </div>
       </div>
-      {/* Desktop layout */}
+      {/* Tablet/desktop layout */}
       <div
-        className="w-full h-full items-center hidden sm:!grid"
-        style={{ gridTemplateColumns: GRID_TEMPLATE, gap: "1rem" }}
+        className={`w-full h-full items-center gap-2 lg:gap-4 hidden sm:!grid ${GRID_COLS_DESKTOP}`}
       >
         <div className="flex items-center min-w-0 py-3 overflow-hidden">
           <TitleCell title={book.title} id={book.id} hasCover={book.has_cover} />
@@ -240,16 +234,16 @@ const TableRow = memo(function TableRow({ book }: TableRowProps) {
         <div className="flex items-center min-w-0 py-3 overflow-hidden">
           <AuthorsCell authors={book.authors} />
         </div>
-        <div className="flex items-center min-w-0 py-3 overflow-hidden">
+        <div className="hidden lg:flex items-center min-w-0 py-3 overflow-hidden">
           <SeriesCell series={book.series} seriesIndex={book.series_index} />
         </div>
-        <div className="flex items-center min-w-0 py-3 overflow-hidden">
+        <div className="hidden xl:flex items-center min-w-0 py-3 overflow-hidden">
           <TagsCell tags={book.tags} />
         </div>
         <div className="flex items-center min-w-0 py-3">
           <StarRating rating={book.rating} />
         </div>
-        <div className="flex items-center min-w-0 py-3 overflow-hidden">
+        <div className="hidden lg:flex items-center min-w-0 py-3 overflow-hidden">
           <FormatsCell formats={book.formats} bookId={book.id} />
         </div>
         <div className="flex items-center justify-end py-3">
@@ -366,26 +360,26 @@ export const TableHeader = memo(function TableHeader({
     <>
       {/* Mobile header */}
       <div
-        className="px-3 h-10 items-center border-b border-ink grid sm:!hidden"
-        style={{ gridTemplateColumns: GRID_TEMPLATE_MOBILE, gap: "0.5rem" }}
+        className={`px-3 h-10 items-center gap-2 border-b border-ink grid sm:!hidden ${GRID_COLS_MOBILE}`}
       >
         <SortHeader label="Title" field="title" currentSort={sortConfig} onSort={handleSort} />
         <SortHeader label="Author" field="author" currentSort={sortConfig} onSort={handleSort} />
         <span></span>
       </div>
-      {/* Desktop header */}
+      {/* Tablet/desktop header */}
       <div
-        className="px-4 h-12 items-center border-b border-ink hidden sm:!grid"
-        style={{ gridTemplateColumns: GRID_TEMPLATE, gap: "1rem" }}
+        className={`px-4 h-12 items-center gap-2 lg:gap-4 border-b border-ink hidden sm:!grid ${GRID_COLS_DESKTOP}`}
       >
         <SortHeader label="Title" field="title" currentSort={sortConfig} onSort={handleSort} />
         <SortHeader label="Author" field="author" currentSort={sortConfig} onSort={handleSort} />
-        <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">
+        <span className="hidden lg:block text-xs font-semibold text-ink-muted uppercase tracking-wider">
           Series
         </span>
-        <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">Tags</span>
+        <span className="hidden xl:block text-xs font-semibold text-ink-muted uppercase tracking-wider">
+          Tags
+        </span>
         <SortHeader label="Rating" field="rating" currentSort={sortConfig} onSort={handleSort} />
-        <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">
+        <span className="hidden lg:block text-xs font-semibold text-ink-muted uppercase tracking-wider">
           Formats
         </span>
         <span></span>

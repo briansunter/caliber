@@ -422,7 +422,7 @@ export function BookDetail({ bookId }: BookDetailProps) {
                 <FileText className="h-4 w-4" strokeWidth={1.5} />
                 About this book
               </h3>
-              <p className="leading-relaxed text-ink-secondary whitespace-pre-wrap">
+              <p className="leading-relaxed text-ink-secondary whitespace-pre-wrap break-words">
                 {descriptionText}
               </p>
             </div>
