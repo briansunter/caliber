@@ -11,12 +11,18 @@ import {
   Wifi,
 } from "lucide-react";
 import { stored } from "@/lib/utils";
+import { useReaderSettings } from "@/lib/reader-settings";
 import {
   getNextReaderLoadMode,
   prefetchOrder,
   replaceReaderLoadModeInUrl,
   type ReaderLoadMode,
 } from "./reader-types";
+
+// Drop PDF.js's cached page operator lists this often (in page turns). Visiting
+// a page caches its parsed content; without periodic cleanup a long read grows
+// unbounded and eventually crashes the tab. Re-warming refills the near window.
+const PDF_CLEANUP_EVERY = 12;
 
 // Worker setup — served from our API (versioned URL to bust cache)
 pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdfjs/pdf.worker.min.mjs?v=4.10.38";
@@ -84,6 +90,9 @@ export function PdfReader({
   const prefetchRunRef = useRef(0);
   const touchRef = useRef<{ x: number; y: number; t: number } | null>(null);
   const lastTouchEndRef = useRef(0);
+  const visitsRef = useRef(0);
+
+  const settings = useReaderSettings();
 
   const posKey = `caliber-pos-${bookId}-pdf`;
   const zoomKey = `caliber-zoom-${bookId}-pdf`;
@@ -406,7 +415,11 @@ export function PdfReader({
       const unscaledViewport = page.getViewport({ scale: 1 });
       const fitScale = effectiveWidth / unscaledViewport.width;
       const viewport = page.getViewport({ scale: fitScale * zoom });
-      const dpr = window.devicePixelRatio || 1;
+      // Cap the pixel ratio so Retina pages don't allocate 2-3x oversized canvas
+      // backing stores — the main driver of Safari's per-tab memory crashes.
+      const deviceDpr = window.devicePixelRatio || 1;
+      const dpr =
+        settings.maxRenderScale > 0 ? Math.min(deviceDpr, settings.maxRenderScale) : deviceDpr;
 
       // Double-buffer: render offscreen, then blit to the visible canvas in one
       // step so the previous page stays on screen until the new one is ready.
@@ -434,6 +447,11 @@ export function PdfReader({
           pageLayer.style.height = `${viewport.height}px`;
           annotationLayer.style.setProperty("--scale-factor", String(viewport.scale));
           canvas.getContext("2d")?.drawImage(offscreen, 0, 0);
+          // Release the offscreen backing store immediately. Safari counts
+          // detached canvases against the tab budget until GC runs, so leaving
+          // them around is what eventually crashes the renderer.
+          offscreen.width = 0;
+          offscreen.height = 0;
           setRendering(false);
         })
         .catch(() => {}); // Ignore cancellation
@@ -476,7 +494,16 @@ export function PdfReader({
     try {
       localStorage.setItem(zoomKey, JSON.stringify({ zoom, ts: Date.now() }));
     } catch {}
-  }, [currentPage, isLoading, zoom, containerWidth, posKey, zoomKey, pdfLinkService]);
+  }, [
+    currentPage,
+    isLoading,
+    zoom,
+    containerWidth,
+    posKey,
+    zoomKey,
+    pdfLinkService,
+    settings.maxRenderScale,
+  ]);
 
   useEffect(() => {
     const pdf = pdfRef.current;
@@ -488,7 +515,25 @@ export function PdfReader({
     // Warm sequentially, closest page first, so the most likely next page
     // never waits behind further-out pages
     void (async () => {
-      for (const pageNumber of prefetchOrder(currentPage, 1, totalPages)) {
+      // Periodically purge PDF.js's accumulated page cache so a long read
+      // session stays bounded. Guarded — cleanup() rejects mid-render, which is
+      // fine: we simply skip and try again next interval. Re-warming below
+      // refills the near window.
+      visitsRef.current += 1;
+      if (visitsRef.current % PDF_CLEANUP_EVERY === 0) {
+        try {
+          await pdf.cleanup();
+        } catch {}
+        if (prefetchRunRef.current !== run) return;
+      }
+
+      for (const pageNumber of prefetchOrder(
+        currentPage,
+        1,
+        totalPages,
+        settings.prefetchAhead,
+        settings.prefetchBehind,
+      )) {
         if (prefetchRunRef.current !== run) return;
         try {
           const page = await pdf.getPage(pageNumber);
@@ -497,7 +542,7 @@ export function PdfReader({
         } catch {}
       }
     })();
-  }, [currentPage, isLoading, totalPages]);
+  }, [currentPage, isLoading, totalPages, settings.prefetchAhead, settings.prefetchBehind]);
 
   // Keyboard
   useEffect(() => {

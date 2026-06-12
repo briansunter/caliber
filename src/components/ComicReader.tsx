@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import JSZip from "jszip";
 import { ArrowLeft, ChevronLeft, ChevronRight, Download, Wifi, ZoomIn, ZoomOut } from "lucide-react";
 import { stored } from "@/lib/utils";
+import { useReaderSettings } from "@/lib/reader-settings";
 import {
   getNextReaderLoadMode,
   prefetchOrder,
@@ -77,6 +78,8 @@ export function ComicReader({
   const preloadedImagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const decodedHrefsRef = useRef<Set<string>>(new Set());
   const posKey = `caliber-pos-${bookId}-comic`;
+
+  const settings = useReaderSettings();
 
   const [loadMode, setLoadMode] = useState<ReaderLoadMode>(
     supportsFullFile ? initialLoadMode : "stream",
@@ -212,7 +215,13 @@ export function ComicReader({
   useEffect(() => {
     if (isLoading || pages.length === 0) return;
 
-    const warmOrder = prefetchOrder(currentPage, 1, pages.length);
+    const warmOrder = prefetchOrder(
+      currentPage,
+      1,
+      pages.length,
+      settings.prefetchAhead,
+      settings.prefetchBehind,
+    );
     const keep = new Set<string>();
     const currentHref = pages[currentPage - 1]?.href;
     if (currentHref) keep.add(currentHref);
@@ -255,7 +264,7 @@ export function ComicReader({
     return () => {
       cancelled = true;
     };
-  }, [currentPage, isLoading, pages]);
+  }, [currentPage, isLoading, pages, settings.prefetchAhead, settings.prefetchBehind]);
 
   useEffect(() => {
     try {

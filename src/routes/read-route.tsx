@@ -2,6 +2,7 @@ import { createFileRoute, useParams } from "@tanstack/react-router";
 import { BookOpen } from "lucide-react";
 import { lazy, Suspense } from "react";
 import { normalizeReaderLoadMode } from "@/components/reader-types";
+import { loadReaderSettings } from "@/lib/reader-settings";
 import { useBook } from "@/hooks/useBooksInfinite";
 
 const EpubReader = lazy(() =>
@@ -23,7 +24,11 @@ function ReaderPage() {
   const bookId = parseInt(id, 10);
   const fmt = format.toUpperCase();
   const { data: book, isLoading, error } = useBook(bookId);
-  const loadMode = normalizeReaderLoadMode(new URLSearchParams(window.location.search).get("mode"));
+  // Explicit ?mode= in the URL wins; otherwise fall back to the user's default.
+  const modeParam = new URLSearchParams(window.location.search).get("mode");
+  const loadMode = modeParam
+    ? normalizeReaderLoadMode(modeParam)
+    : loadReaderSettings().defaultLoadMode;
 
   const goBack = () => window.history.back();
 
