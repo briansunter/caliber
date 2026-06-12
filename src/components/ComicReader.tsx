@@ -72,8 +72,10 @@ export function ComicReader({
   onBack,
 }: ComicReaderProps) {
   const touchRef = useRef<{ x: number; y: number; t: number } | null>(null);
+  const lastTouchEndRef = useRef(0);
   const objectUrlsRef = useRef<string[]>([]);
   const preloadedImagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const decodedHrefsRef = useRef<Set<string>>(new Set());
   const posKey = `caliber-pos-${bookId}-comic`;
 
   const [loadMode, setLoadMode] = useState<ReaderLoadMode>(
@@ -95,6 +97,7 @@ export function ComicReader({
 
   const clearPreloadedImages = useCallback(() => {
     preloadedImagesRef.current.clear();
+    decodedHrefsRef.current.clear();
   }, []);
 
   const clearObjectUrls = useCallback(() => {
@@ -231,14 +234,21 @@ export function ComicReader({
           image.src = candidate.href;
           preloadedImagesRef.current.set(candidate.href, image);
         }
-        await image.decode?.().catch(() => {
-          preloadedImagesRef.current.delete(candidate.href);
-        });
+        await image
+          .decode?.()
+          .then(() => decodedHrefsRef.current.add(candidate.href))
+          .catch(() => {
+            preloadedImagesRef.current.delete(candidate.href);
+            decodedHrefsRef.current.delete(candidate.href);
+          });
       }
 
       if (cancelled) return;
       for (const href of preloadedImagesRef.current.keys()) {
-        if (!keep.has(href)) preloadedImagesRef.current.delete(href);
+        if (!keep.has(href)) {
+          preloadedImagesRef.current.delete(href);
+          decodedHrefsRef.current.delete(href);
+        }
       }
     })();
 
@@ -253,20 +263,31 @@ export function ComicReader({
     } catch {}
   }, [currentPage, posKey]);
 
-  // Double-buffer page turns: keep the current image on screen until the next
-  // one is fully decoded, then swap in a single frame — no blank flash.
+  // Double-buffer page turns: if the target page is already decoded (warm
+  // buffer), swap instantly with no flash. Otherwise hold the old page only
+  // briefly, then advance to a placeholder so fast paging never feels stuck,
+  // and swap the real image in when it finishes decoding.
   // biome-ignore lint/correctness/useExhaustiveDependencies(retryToken): retryToken re-triggers the decode after a failed page load
   useEffect(() => {
     if (isLoading || !page) return;
     if (displayed?.href === page.href) return;
 
-    let cancelled = false;
     setPageError(false);
 
-    // Only surface a spinner if the decode is actually slow (cold cache)
-    const spinnerTimer = setTimeout(() => {
-      if (!cancelled) setPagePending(true);
-    }, 200);
+    if (decodedHrefsRef.current.has(page.href)) {
+      setDisplayed(page);
+      setPagePending(false);
+      return;
+    }
+
+    let cancelled = false;
+
+    // Grace period: imperceptible for fast decodes, then show the placeholder
+    const placeholderTimer = setTimeout(() => {
+      if (cancelled) return;
+      setDisplayed(null);
+      setPagePending(true);
+    }, 120);
 
     let image = preloadedImagesRef.current.get(page.href);
     if (!image) {
@@ -290,20 +311,22 @@ export function ComicReader({
 
     ready
       .then(() => {
+        decodedHrefsRef.current.add(page.href);
         if (cancelled) return;
         setDisplayed(page);
         setPagePending(false);
       })
       .catch(() => {
-        if (cancelled) return;
         preloadedImagesRef.current.delete(page.href);
+        decodedHrefsRef.current.delete(page.href);
+        if (cancelled) return;
         setPageError(true);
         setPagePending(false);
       });
 
     return () => {
       cancelled = true;
-      clearTimeout(spinnerTimer);
+      clearTimeout(placeholderTimer);
     };
   }, [page, displayed?.href, isLoading, retryToken]);
 
@@ -335,6 +358,10 @@ export function ComicReader({
       if (!start) return;
       touchRef.current = null;
 
+      // The browser fires a synthesized click after touchend for the same tap;
+      // mark the touch as handled so onClick ignores it (else one tap = two pages)
+      lastTouchEndRef.current = Date.now();
+
       const touch = e.changedTouches[0];
       if (!touch) return;
       const dx = touch.clientX - start.x;
@@ -360,6 +387,8 @@ export function ComicReader({
 
   const onClick = useCallback(
     (e: React.MouseEvent) => {
+      // Ignore the click synthesized from a touch we already handled
+      if (Date.now() - lastTouchEndRef.current < 700) return;
       const w = window.innerWidth;
       if (e.clientX < w * 0.3) goPrev();
       else if (e.clientX > w * 0.7) goNext();
@@ -486,10 +515,16 @@ export function ComicReader({
               className={
                 displayed
                   ? "absolute bottom-4 right-4 pointer-events-none"
-                  : "absolute inset-0 flex items-center justify-center pointer-events-none"
+                  : "absolute inset-0 flex flex-col items-center justify-center gap-3 pointer-events-none"
               }
             >
               <div className="h-7 w-7 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+              {!displayed && (
+                <p className="text-sm tabular-nums text-white/40">
+                  Page {currentPage}
+                  {totalPages > 0 ? ` / ${totalPages}` : ""}
+                </p>
+              )}
             </div>
           )}
           {pageError && page && (
