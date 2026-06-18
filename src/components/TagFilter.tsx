@@ -96,7 +96,7 @@ export const TagFilter = memo(function TagFilter({
         aria-expanded={open}
         aria-label={triggerLabel}
         className={cn(
-          "inline-flex items-center gap-1.5 rounded-lg border px-2.5 sm:px-3 h-10 sm:h-[46px] text-sm font-medium transition-colors",
+          "inline-flex items-center justify-center gap-1.5 rounded-lg border px-3 sm:px-3.5 h-10 sm:h-[46px] min-w-[44px] text-sm font-medium transition-colors",
           active
             ? "bg-accent text-white border-accent"
             : "bg-white text-ink-secondary border-ink hover:text-ink",
