@@ -14,17 +14,31 @@ export interface SortConfig {
   order: SortOrder;
 }
 
+export interface TagSummary {
+  id: number;
+  name: string;
+  bookCount: number;
+}
+
 interface BooksResponse extends CursorPaginatedResult<BookListItem> {}
+
+function appendTagParams(params: URLSearchParams, tagIds: number[]): void {
+  for (const id of tagIds) {
+    params.append("tag", String(id));
+  }
+}
 
 async function fetchBooks({
   pageParam,
   sortBy,
   sortOrder,
+  tagIds,
   signal,
 }: {
   pageParam?: string;
   sortBy: SortField;
   sortOrder: SortOrder;
+  tagIds: number[];
   signal?: AbortSignal;
 }): Promise<BooksResponse> {
   const params = new URLSearchParams();
@@ -34,6 +48,7 @@ async function fetchBooks({
   if (pageParam) {
     params.set("cursor", pageParam);
   }
+  appendTagParams(params, tagIds);
 
   return fetchJson<BooksResponse>(`${API_BASE}/books?${params}`, { signal });
 }
@@ -43,12 +58,14 @@ async function searchBooks({
   query,
   sortBy,
   sortOrder,
+  tagIds,
   signal,
 }: {
   pageParam?: string;
   query: string;
   sortBy: SortField;
   sortOrder: SortOrder;
+  tagIds: number[];
   signal?: AbortSignal;
 }): Promise<BooksResponse> {
   const params = new URLSearchParams();
@@ -59,19 +76,24 @@ async function searchBooks({
   if (pageParam) {
     params.set("cursor", pageParam);
   }
+  appendTagParams(params, tagIds);
 
   return fetchJson<BooksResponse>(`${API_BASE}/books/search?${params}`, { signal });
 }
 
 // Infinite scroll hook for all books
-export function useBooksInfinite(sortConfig: SortConfig = { field: "title", order: "asc" }) {
+export function useBooksInfinite(
+  sortConfig: SortConfig = { field: "title", order: "asc" },
+  tagIds: number[] = [],
+) {
   return useInfiniteQuery({
-    queryKey: ["books", "infinite", sortConfig.field, sortConfig.order],
+    queryKey: ["books", "infinite", sortConfig.field, sortConfig.order, tagIds],
     queryFn: ({ pageParam, signal }) =>
       fetchBooks({
         pageParam,
         sortBy: sortConfig.field,
         sortOrder: sortConfig.order,
+        tagIds,
         signal,
       }),
     getNextPageParam: (lastPage) => lastPage.nextCursor,
@@ -87,15 +109,17 @@ export function useBooksInfinite(sortConfig: SortConfig = { field: "title", orde
 export function useSearchInfinite(
   query: string,
   sortConfig: SortConfig = { field: "title", order: "asc" },
+  tagIds: number[] = [],
 ) {
   return useInfiniteQuery({
-    queryKey: ["books", "search", "infinite", query, sortConfig.field, sortConfig.order],
+    queryKey: ["books", "search", "infinite", query, sortConfig.field, sortConfig.order, tagIds],
     queryFn: ({ pageParam, signal }) =>
       searchBooks({
         pageParam,
         query,
         sortBy: sortConfig.field,
         sortOrder: sortConfig.order,
+        tagIds,
         signal,
       }),
     getNextPageParam: (lastPage) => lastPage.nextCursor,
@@ -109,10 +133,14 @@ export function useSearchInfinite(
 }
 
 // Shared hook: flattens pages and exposes fetch controls
-export function useFlattenedBooks(searchQuery: string, sortConfig: SortConfig) {
+export function useFlattenedBooks(
+  searchQuery: string,
+  sortConfig: SortConfig,
+  tagIds: number[] = [],
+) {
   const isSearching = searchQuery.trim().length > 0;
-  const booksQuery = useBooksInfinite(sortConfig);
-  const searchQueryHook = useSearchInfinite(searchQuery, sortConfig);
+  const booksQuery = useBooksInfinite(sortConfig, tagIds);
+  const searchQueryHook = useSearchInfinite(searchQuery, sortConfig, tagIds);
   const query = isSearching ? searchQueryHook : booksQuery;
 
   const books = useMemo(() => {
@@ -142,6 +170,15 @@ export function useLibraryStats() {
         totalTags: number;
       }>(`${API_BASE}/stats`, { signal }),
     staleTime: 1000 * 60 * 5,
+  });
+}
+
+// Hook for all tags with counts (tag filter UI)
+export function useTags() {
+  return useQuery({
+    queryKey: ["tags"],
+    queryFn: ({ signal }) => fetchJson<TagSummary[]>(`${API_BASE}/tags`, { signal }),
+    staleTime: 1000 * 60 * 10,
   });
 }
 

@@ -6,6 +6,7 @@ import {
   listAuthorsCursor,
   listSeriesCursor,
   listTagsCursor,
+  listAllTags,
   listFormatsCursor,
   listBooksByAuthorCursor,
   listBooksBySeriesCursor,
@@ -86,6 +87,22 @@ function parseSortField(value: string | null): SortField {
 
 function parseSortOrder(value: string | null): SortOrder {
   return SORT_ORDERS.includes(value as SortOrder) ? (value as SortOrder) : "asc";
+}
+
+// Parse repeated `tag` query params into deduped, valid tag IDs (OR logic).
+const MAX_TAG_FILTERS = 50;
+function parseTagIds(url: URL): number[] {
+  const raw = url.searchParams.getAll("tag");
+  if (raw.length === 0) return [];
+  const ids = new Set<number>();
+  for (const value of raw) {
+    const id = Number.parseInt(value, 10);
+    if (Number.isFinite(id) && id > 0) {
+      ids.add(id);
+      if (ids.size >= MAX_TAG_FILTERS) break;
+    }
+  }
+  return Array.from(ids);
 }
 
 // --- User session cookie (no auth yet: cookie just remembers a username) ---
@@ -655,6 +672,14 @@ const server = serve({
       },
     },
 
+    // All tags with book counts (for the tag filter UI)
+    "/api/tags": {
+      GET: (req) => {
+        const tags = listAllTags();
+        return getCachedResponse("tags", tags, req);
+      },
+    },
+
     // Book count (lightweight)
     "/api/books/count": {
       GET: (req) => {
@@ -1151,10 +1176,11 @@ const server = serve({
           });
           const sortBy = parseSortField(url.searchParams.get("sortBy"));
           const sortOrder = parseSortOrder(url.searchParams.get("sortOrder"));
+          const tagIds = parseTagIds(url);
 
-          const result = listBooksCursor({ cursor, limit, sortBy, sortOrder });
+          const result = listBooksCursor({ cursor, limit, sortBy, sortOrder, tagIds });
 
-          const cacheKey = `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}`;
+          const cacheKey = `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}:tags:${tagIds.join(",")}`;
           return getCachedResponse(cacheKey, result, req);
         } catch (error) {
           return routeErrorResponse(error, "Error listing books:", "Failed to list books");
@@ -1175,17 +1201,18 @@ const server = serve({
           });
           const sortBy = parseSortField(url.searchParams.get("sortBy"));
           const sortOrder = parseSortOrder(url.searchParams.get("sortOrder"));
+          const tagIds = parseTagIds(url);
 
           if (!query.trim()) {
-            const result = listBooksCursor({ cursor, limit, sortBy, sortOrder });
+            const result = listBooksCursor({ cursor, limit, sortBy, sortOrder, tagIds });
             return getCachedResponse(
-              `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}`,
+              `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}:tags:${tagIds.join(",")}`,
               result,
               req,
             );
           }
 
-          const result = searchBooksCursor({ query, cursor, limit, sortBy, sortOrder });
+          const result = searchBooksCursor({ query, cursor, limit, sortBy, sortOrder, tagIds });
 
           // Don't cache search results
           return Response.json(result, {

@@ -4,8 +4,9 @@ import { BookGridInfinite } from "@/components/BookGridInfinite";
 import { BookSearch } from "@/components/BookSearch";
 import { useState, useCallback, useEffect, useRef } from "react";
 import { BookOpen, Users, Layers, Library, LayoutGrid, List, Settings } from "lucide-react";
-import { useLibraryStats, type SortConfig, type SortField } from "@/hooks/useBooksInfinite";
+import { useLibraryStats, useTags, type SortConfig, type SortField } from "@/hooks/useBooksInfinite";
 import { UserMenu } from "@/components/UserMenu";
+import { TagFilter } from "@/components/TagFilter";
 import { RecentlyRead } from "@/components/RecentlyRead";
 
 type ViewMode = "list" | "grid";
@@ -17,15 +18,31 @@ interface UIState {
   view: ViewMode;
   sort: SortConfig;
   search: string;
+  tags: number[];
 }
 
 function loadUIState(): UIState {
+  const defaultView = window.innerWidth < 768 ? "grid" : "list";
+  const defaults: UIState = {
+    view: defaultView,
+    sort: { field: "added", order: "desc" },
+    search: "",
+    tags: [],
+  };
   try {
     const saved = sessionStorage.getItem(STORAGE_KEY);
-    if (saved) return JSON.parse(saved);
-  } catch {}
-  const defaultView = window.innerWidth < 768 ? "grid" : "list";
-  return { view: defaultView, sort: { field: "added", order: "desc" }, search: "" };
+    if (!saved) return defaults;
+    const parsed = JSON.parse(saved) as Partial<UIState>;
+    return {
+      ...defaults,
+      ...parsed,
+      tags: Array.isArray(parsed.tags)
+        ? parsed.tags.filter((id) => typeof id === "number" && id > 0)
+        : [],
+    };
+  } catch {
+    return defaults;
+  }
 }
 
 function saveUIState(state: UIState) {
@@ -84,6 +101,14 @@ function IndexComponent() {
     });
   }, []);
 
+  const setTags = useCallback((tags: number[]) => {
+    setUIState((prev) => {
+      const next = { ...prev, tags };
+      saveUIState(next);
+      return next;
+    });
+  }, []);
+
   // Save scroll position on any click that navigates away
   useEffect(() => {
     const handleClick = (e: MouseEvent) => {
@@ -118,6 +143,7 @@ function IndexComponent() {
   }, []);
 
   const { data: stats, isLoading: statsLoading } = useLibraryStats();
+  const { data: tags, isLoading: tagsLoading } = useTags();
 
   return (
     <div className="min-h-screen bg-parchment paper-texture">
@@ -176,6 +202,12 @@ function IndexComponent() {
             <div className="flex-1 min-w-0">
               <BookSearch onSearch={setSearchQuery} initialValue={searchQuery} />
             </div>
+            <TagFilter
+              tags={tags}
+              selectedIds={uiState.tags}
+              onChange={setTags}
+              isLoading={tagsLoading}
+            />
             <fieldset aria-label="View mode" className="m-0 p-0 flex-shrink-0 flex items-center border border-ink rounded-lg overflow-hidden">
               <button
                 type="button"
@@ -211,14 +243,14 @@ function IndexComponent() {
 
             {/* Table Section */}
             <div className="bg-white border-x border-b border-ink rounded-b-lg shadow-sm">
-              <BookTableInfinite searchQuery={searchQuery} sortConfig={sortConfig} />
+              <BookTableInfinite searchQuery={searchQuery} sortConfig={sortConfig} tagIds={uiState.tags} />
             </div>
           </>
         )}
 
         {viewMode === "grid" && (
           <div className="bg-white border-x border-b border-ink rounded-b-lg shadow-sm pt-4">
-            <BookGridInfinite searchQuery={searchQuery} sortConfig={sortConfig} />
+            <BookGridInfinite searchQuery={searchQuery} sortConfig={sortConfig} tagIds={uiState.tags} />
           </div>
         )}
       </main>

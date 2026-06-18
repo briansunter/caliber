@@ -19,6 +19,7 @@ import { CoverFallback } from "./CoverFallback";
 interface BookTableInfiniteProps {
   searchQuery: string;
   sortConfig: SortConfig;
+  tagIds?: number[];
 }
 
 // All flexible tracks use minmax(0, Nfr) so the grid can never exceed the
@@ -388,9 +389,9 @@ export const TableHeader = memo(function TableHeader({
   );
 });
 
-export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, sortConfig }: BookTableInfiniteProps) {
+export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, sortConfig, tagIds }: BookTableInfiniteProps) {
   const { books, hasNextPage, fetchNextPage, isFetchingNextPage, isLoading, isError, error } =
-    useFlattenedBooks(searchQuery, sortConfig);
+    useFlattenedBooks(searchQuery, sortConfig, tagIds);
 
   // Set up window virtualizer - uses window scroll
   const virtualizer = useWindowVirtualizer({
@@ -422,13 +423,13 @@ export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, 
 
   // Scroll to top when search or sort changes (skip initial mount for scroll restoration)
   const hasMountedTable = useRef(false);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional - scroll to top when search/sort changes
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional - scroll to top when search/sort/tags change
   useEffect(() => {
     if (hasMountedTable.current) {
       window.scrollTo({ top: 0 });
     }
     hasMountedTable.current = true;
-  }, [searchQuery, sortConfig]);
+  }, [searchQuery, sortConfig, tagIds]);
 
   if (isLoading) {
     return (

@@ -89,6 +89,13 @@ function buildFixtureDb(dbPath: string, books: BookSpec[]): void {
     }
   }
 
+  for (const [id, name] of TAG_FIXTURE) {
+    db.run("INSERT INTO tags (id, name) VALUES (?, ?)", [id, name]);
+  }
+  for (const [book, tag] of TAG_BOOKS) {
+    db.run("INSERT INTO books_tags_link (book, tag) VALUES (?, ?)", [book, tag]);
+  }
+
   db.close();
 }
 
@@ -115,6 +122,22 @@ const BOOKS: BookSpec[] = [
   { id: 8, title: "Honey Bee", sort: "Honey Bee", authorSort: "Clark, Hank", timestamp: "2024-01-03 00:00:00+00:00", rating: 4 },
   { id: 9, title: "Igloo Nights", sort: "Igloo Nights", authorSort: "Davis, Iris", timestamp: "2024-01-07 00:00:00+00:00", rating: 2 },
   { id: 10, title: "Jungle Book", sort: "Jungle Book", authorSort: "Evans, Jack", timestamp: "2024-01-05 00:00:00+00:00" },
+];
+
+// Tags for the tag-filter (OR) tests. Membership:
+//   Fiction (1): books 1,2,3,4   -> count 4
+//   History (2): books 3,4,5     -> count 3
+//   Sci-Fi  (3): books 5,6       -> count 2
+// Union Fiction ∪ History = {1,2,3,4,5} (titles Aardvark..Elephant align with id order).
+const TAG_FIXTURE: Array<[number, string]> = [
+  [1, "Fiction"],
+  [2, "History"],
+  [3, "Sci-Fi"],
+];
+const TAG_BOOKS: Array<[number, number]> = [
+  [1, 1], [2, 1], [3, 1], [4, 1], // Fiction
+  [3, 2], [4, 2], [5, 2], // History
+  [5, 3], [6, 3], // Sci-Fi
 ];
 
 beforeAll(async () => {
@@ -562,5 +585,93 @@ describe("FTS search", () => {
     expect(() => {
       lib.searchBooksByTitle("book AND fire OR dragon");
     }).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. Tag filter (OR logic) tests
+// ---------------------------------------------------------------------------
+
+describe("tag filter (OR logic)", () => {
+  // TAG_BOOKS: Fiction(1)={1,2,3,4}, History(2)={3,4,5}, Sci-Fi(3)={5,6}
+
+  test("listAllTags: sorted by book count desc then name, with counts", () => {
+    const tags = lib.listAllTags();
+    expect(tags.map((t) => t.name)).toEqual(["Fiction", "History", "Sci-Fi"]);
+    expect(tags.map((t) => t.bookCount)).toEqual([4, 3, 2]);
+    expect(tags[0]).toMatchObject({ id: 1, name: "Fiction", bookCount: 4 });
+  });
+
+  test("no tagIds returns all books (filter disabled)", () => {
+    const all = lib.listBooksCursor({ sortBy: "title", sortOrder: "asc" }).items.map((b) => b.id);
+    expect(all).toHaveLength(10);
+  });
+
+  test("single tag filters to its books", () => {
+    expect(
+      lib.listBooksCursor({ tagIds: [2], sortBy: "title", sortOrder: "asc" }).items.map((b) => b.id),
+    ).toEqual([3, 4, 5]); // History
+    expect(
+      lib.listBooksCursor({ tagIds: [3], sortBy: "title", sortOrder: "asc" }).items.map((b) => b.id),
+    ).toEqual([5, 6]); // Sci-Fi
+  });
+
+  test("multiple tags union without duplicates", () => {
+    expect(
+      lib.listBooksCursor({ tagIds: [1, 2], sortBy: "title", sortOrder: "asc" }).items.map((b) => b.id),
+    ).toEqual([1, 2, 3, 4, 5]); // Fiction ∪ History
+    expect(
+      lib.listBooksCursor({ tagIds: [1, 3], sortBy: "title", sortOrder: "asc" }).items.map((b) => b.id),
+    ).toEqual([1, 2, 3, 4, 5, 6]); // Fiction ∪ Sci-Fi
+  });
+
+  test("duplicate / non-existent / invalid tag ids are handled", () => {
+    expect(lib.listBooksCursor({ tagIds: [1, 1, 2, 2], sortBy: "title" }).items.map((b) => b.id)).toEqual(
+      [1, 2, 3, 4, 5],
+    );
+    // Non-existent id 9999 contributes nothing; valid ones still OR together
+    expect(lib.listBooksCursor({ tagIds: [1, 9999], sortBy: "title" }).items.map((b) => b.id)).toEqual([
+      1, 2, 3, 4,
+    ]);
+    // Invalid ids (<=0, NaN) are ignored
+    expect(
+      lib.listBooksCursor({ tagIds: [1, 0, -5, Number.NaN], sortBy: "title" }).items.map((b) => b.id),
+    ).toEqual([1, 2, 3, 4]);
+    expect(lib.listBooksCursor({ tagIds: [9999] }).items).toHaveLength(0);
+  });
+
+  test("union paginates with no dups and monotonic title order", () => {
+    const collected: number[] = [];
+    let cursor: string | undefined = undefined;
+    for (;;) {
+      const page = lib.listBooksCursor({
+        tagIds: [1, 2],
+        limit: 2,
+        sortBy: "title",
+        sortOrder: "asc",
+        cursor,
+      });
+      for (const b of page.items) collected.push(b.id);
+      if (!page.nextCursor) break;
+      cursor = page.nextCursor;
+    }
+    // Membership (copy before sorting so the ordering check below isn't corrupted)
+    expect([...collected].sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5]);
+    expect(new Set(collected).size).toBe(collected.length);
+    // Titles Aardvark..Elephant already align with id order
+    expect(collected).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  test("search × tag filter compose (AND across, OR within tags)", () => {
+    expect(lib.searchBooksCursor({ query: "Aardvark", tagIds: [1] }).items.map((b) => b.id)).toEqual([
+      1,
+    ]);
+    // Aardvark (book 1) is not History
+    expect(lib.searchBooksCursor({ query: "Aardvark", tagIds: [2] }).items).toHaveLength(0);
+    // Dragon (book 4) is in Fiction and History, not Sci-Fi
+    expect(lib.searchBooksCursor({ query: "Dragon", tagIds: [1, 3] }).items.map((b) => b.id)).toEqual([
+      4,
+    ]);
+    expect(lib.searchBooksCursor({ query: "Dragon", tagIds: [3] }).items).toHaveLength(0);
   });
 });

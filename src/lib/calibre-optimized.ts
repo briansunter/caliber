@@ -368,6 +368,28 @@ interface ListOptions {
   limit?: number;
   sortBy?: "title" | "author" | "added" | "rating";
   sortOrder?: "asc" | "desc";
+  // Tag IDs to filter by (OR logic: a book matches if it has ANY of these tags).
+  // Combined with any search/FTS clause via AND.
+  tagIds?: number[];
+}
+
+// Build a `b.id IN (...)` clause for OR-logic tag filtering, or "" if none valid.
+// Returns the clause fragment and the deduped, valid IDs to bind.
+function buildTagFilterClause(
+  tagIds: number[] | undefined,
+): { clause: string; ids: number[] } {
+  if (!tagIds || tagIds.length === 0) return { clause: "", ids: [] };
+  const seen = new Set<number>();
+  for (const id of tagIds) {
+    if (Number.isFinite(id) && id > 0) seen.add(id);
+  }
+  const ids = Array.from(seen);
+  if (ids.length === 0) return { clause: "", ids: [] };
+  const placeholders = ids.map(() => "?").join(",");
+  return {
+    clause: `b.id IN (SELECT book FROM books_tags_link WHERE tag IN (${placeholders}))`,
+    ids,
+  };
 }
 
 function buildBookOrderBy(
@@ -442,7 +464,13 @@ function listBooksWithWhere(
   const dir = sortOrder.toUpperCase();
   const params = [...initialParams];
   const needsRatingInCte = sortBy === "rating";
-  const bookWhere = appendBookCursorWhere(initialWhere, params, options);
+  // OR-logic tag filter is part of the base predicate (inside the book_page CTE's
+  // WHERE), so it composes with search/FTS via AND and is covered by idx_books_tags_link_tag.
+  const tagFilter = buildTagFilterClause(options.tagIds);
+  const baseWhere =
+    tagFilter.clause.length > 0 ? `${initialWhere} AND ${tagFilter.clause}` : initialWhere;
+  if (tagFilter.ids.length > 0) params.push(...tagFilter.ids);
+  const bookWhere = appendBookCursorWhere(baseWhere, params, options);
   const bookOrderBy = buildBookOrderBy(sortBy, sortOrder);
 
   let query: string;
@@ -827,6 +855,32 @@ export function listTagsCursor(options: CatalogOptions = {}): CursorPaginatedRes
 
 export function listFormatsCursor(options: CatalogOptions = {}): CursorPaginatedResult<CatalogEntry> {
   return listCatalogEntries("formats", options);
+}
+
+// All tags with book counts, most-popular-first — drives the tag filter UI.
+export interface TagSummary {
+  id: number;
+  name: string;
+  bookCount: number;
+}
+
+export function listAllTags(limit: number = 2000): TagSummary[] {
+  const db = getDb();
+  const capped = Math.min(Math.max(Math.floor(limit) || 1, 1), 5000);
+  const rows = db
+    .query(
+      `SELECT
+        t.id AS id,
+        t.name AS name,
+        COUNT(DISTINCT btl.book) AS bookCount
+      FROM tags t
+      JOIN books_tags_link btl ON t.id = btl.tag
+      GROUP BY t.id
+      ORDER BY bookCount DESC, t.name COLLATE NOCASE ASC
+      LIMIT ?`,
+    )
+    .all(capped) as TagSummary[];
+  return rows;
 }
 
 export function getCatalogEntry(kind: CatalogKind, id: number | string): CatalogEntry | null {

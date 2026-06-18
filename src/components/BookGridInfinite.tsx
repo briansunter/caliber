@@ -11,6 +11,7 @@ import { CoverFallback } from "./CoverFallback";
 interface BookGridInfiniteProps {
   searchQuery: string;
   sortConfig: SortConfig;
+  tagIds?: number[];
 }
 
 const CARD_GAP = 16;
@@ -54,9 +55,9 @@ const GridCard = memo(function GridCard({ book }: { book: BookListItem }) {
   );
 });
 
-export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, sortConfig }: BookGridInfiniteProps) {
+export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, sortConfig, tagIds }: BookGridInfiniteProps) {
   const { books, hasNextPage, fetchNextPage, isFetchingNextPage, isLoading, isError, error } =
-    useFlattenedBooks(searchQuery, sortConfig);
+    useFlattenedBooks(searchQuery, sortConfig, tagIds);
 
   const [columns, setColumns] = useState(() => {
     const available = Math.min(window.innerWidth - 48, 1280 - 48);
@@ -109,13 +110,13 @@ export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, so
 
   // Scroll to top on search/sort change (skip initial mount for scroll restoration)
   const hasMountedGrid = useRef(false);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional - scroll to top when search/sort changes
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional - scroll to top when search/sort/tags change
   useEffect(() => {
     if (hasMountedGrid.current) {
       window.scrollTo({ top: 0 });
     }
     hasMountedGrid.current = true;
-  }, [searchQuery, sortConfig]);
+  }, [searchQuery, sortConfig, tagIds]);
 
   if (isLoading) {
     return (
