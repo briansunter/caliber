@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/briansunter/caliber/compare/v0.1.1...v0.1.2) (2026-07-15)
+
+
+### Bug Fixes
+
+* add bunx browser launcher ([11e60dc](https://github.com/briansunter/caliber/commit/11e60dc0de88bdec9b1fb344ed624721ab032592))
+
 ## [0.1.1](https://github.com/briansunter/caliber/compare/v0.1.0...v0.1.1) (2026-07-15)
 
 
