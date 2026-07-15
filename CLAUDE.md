@@ -12,7 +12,7 @@ Caliber is a personal Calibre library management application built with Bun, Rea
 # Install dependencies
 bun install
 
-# Development server with hot reload (port 3000)
+# Development server with hot reload (port 3003)
 bun dev
 
 # Production server
@@ -37,7 +37,7 @@ This is a full-stack Bun application - both frontend and backend run on Bun:
 
 ### Database Layer (Calibre Integration)
 
-The app connects directly to Calibre's `metadata.db` SQLite database in **read-only mode**:
+The app reads Calibre's `metadata.db` SQLite database without modifying the library. At startup it creates a consistent serialized snapshot in the writable Caliber config/cache directory for FTS indexes and periodically refreshes that snapshot when `metadata.db`, its WAL, or its SHM sidecar changes:
 
 ```typescript
 // Library path is configurable via CALIBRE_LIBRARY_PATH env var
@@ -45,7 +45,9 @@ const LIBRARY_PATH = process.env.CALIBRE_LIBRARY_PATH || join(homedir(), "Calibr
 ```
 
 Key architectural decisions:
-- **Read-only access**: Database opened with `{ readonly: true }` - never modifies Calibre data
+- **Read-only source**: the source database is opened with `{ readonly: true }` and never modified
+- **Writable snapshot**: FTS tables and indexes live in a separate cache copy under the configured Caliber config directory
+- **Periodic refresh**: default interval is 60 seconds; configure with `CALIBER_DB_REFRESH_INTERVAL_MS`
 - **Connection pooling**: 5-connection round-robin pool for concurrent requests
 - **CTE-based queries**: Common Table Expressions for O(1) cursor pagination (avoids OFFSET performance issues)
 - **Cursor pagination**: Keyset pagination using base64url-encoded cursors (not offset-based)
@@ -76,7 +78,7 @@ GET /api/books/:id/cover     # Get cover image
 - **State Management**: TanStack Query for server state, React useState for UI state
 - **Data Fetching**: Infinite scroll via `useInfiniteQuery` with cursor pagination
 - **Virtual Scrolling**: `@tanstack/react-virtual` for rendering massive lists efficiently
-- **Sorting**: Client-side sort configuration passed to API via query params
+- **Sorting**: Sort configuration is passed to the API, where cursor ordering and cursor predicates use the same normalized expressions
 
 Key components:
 - `BookTableInfinite.tsx` - Virtualized table with infinite scroll and sortable headers
@@ -135,7 +137,13 @@ src/
 
 ```bash
 CALIBRE_LIBRARY_PATH=/path/to/calibre/library  # Default: ~/Calibre Library
-NODE_ENV=production                            # Set for production mode
+CALIBRE_DB_NAME=metadata.db                    # Database filename within the library
+CALIBER_HOST=127.0.0.1                         # Keep loopback unless using external auth
+PORT=3003                                      # HTTP port
+CALIBER_CONFIG_DIR=/path/to/config             # Writable snapshot/cache directory
+CALIBER_DB_REFRESH_INTERVAL_MS=60000           # Periodic source refresh
+CALIBER_MCP_ENABLED=false                      # HTTP MCP is opt-in
+NODE_ENV=production                             # Set for production mode
 ```
 
 ## Key Patterns

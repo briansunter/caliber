@@ -1,8 +1,9 @@
 @import "tailwindcss";
 
 /* ============================================================================
-   CALIBER - CLEAN MODERN THEME
-   A refined, readable design with generous whitespace and clear hierarchy
+   CALIBER - PAPER, INK, AND INDIGO
+   A quiet library surface with enough contrast to keep cards, controls, and
+   the reading list legible at a glance.
    ============================================================================ */
 
 @theme inline {
@@ -11,6 +12,8 @@
   --color-bg-elevated: #ffffff;
   --color-bg-muted: #f5f5f5;
   --color-bg-subtle: #f0f0f0;
+  --color-surface: var(--color-bg-elevated);
+  --color-surface-foreground: var(--color-text);
 
   /* Text colors - Strong contrast for readability */
   --color-text: #171717;
@@ -60,6 +63,7 @@
   --bg-elevated: #ffffff;
   --bg-muted: #f5f5f5;
   --bg-subtle: #f0f0f0;
+  --surface: var(--bg-elevated);
 
   --text: #171717;
   --text-secondary: #525252;
@@ -105,6 +109,10 @@
     font-size: 14px;
     overflow-x: clip;
     max-width: 100vw;
+  }
+
+  :root {
+    color-scheme: light;
   }
 
   /* Selection - Subtle accent highlight */
@@ -169,6 +177,7 @@
   .bg-parchment { background-color: var(--bg); }
   .bg-parchment-dark { background-color: var(--bg-muted); }
   .bg-parchment-warm { background-color: var(--bg-subtle); }
+  .bg-surface { background-color: var(--surface); }
   .bg-ink { background-color: var(--text); }
 
   /* Text colors */
@@ -185,6 +194,24 @@
 
   /* Typography */
   .font-sans { font-family: var(--font-sans); }
+
+  .skip-link {
+    position: fixed;
+    left: 1rem;
+    top: 1rem;
+    z-index: 100;
+    transform: translateY(-200%);
+    border-radius: var(--radius-sm);
+    background: var(--text);
+    color: white;
+    padding: 0.625rem 0.875rem;
+    font-weight: 600;
+    transition: transform 0.15s ease;
+  }
+
+  .skip-link:focus {
+    transform: translateY(0);
+  }
 
   /* Subtle paper texture — faint noise via layered gradients, no external images */
   .paper-texture {
@@ -236,7 +263,7 @@
     border: 1px solid var(--border-default);
     border-radius: var(--radius-md);
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
-    transition: all 0.2s ease;
+    transition: box-shadow 0.2s ease, border-color 0.2s ease;
   }
 
   .card:hover {
@@ -257,7 +284,7 @@
     color: white;
     border: none;
     cursor: pointer;
-    transition: all 0.15s ease;
+    transition: background-color 0.15s ease, color 0.15s ease, transform 0.15s ease;
     font-family: var(--font-sans);
   }
 
@@ -279,7 +306,7 @@
     color: var(--text-secondary);
     border: 1px solid var(--border-default);
     cursor: pointer;
-    transition: all 0.15s ease;
+    transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
     font-family: var(--font-sans);
   }
 
@@ -302,7 +329,7 @@
     color: var(--text-tertiary);
     border: none;
     cursor: pointer;
-    transition: all 0.15s ease;
+    transition: background-color 0.15s ease, color 0.15s ease;
   }
 
   .btn-ghost:hover {
@@ -319,7 +346,7 @@
     background: var(--bg-elevated);
     color: var(--text);
     border: 1px solid var(--border-default);
-    transition: all 0.15s ease;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
     font-family: var(--font-sans);
   }
 
@@ -362,7 +389,7 @@
   /* Table row - Subtle hover */
   .table-row {
     border-bottom: 1px solid var(--border-subtle);
-    transition: all 0.1s ease;
+    transition: background-color 0.1s ease, border-color 0.1s ease;
   }
 
   .table-row:hover {
@@ -400,7 +427,7 @@
     border: 1px solid var(--border-default);
     border-radius: var(--radius-md);
     padding: 0.75rem;
-    transition: all 0.15s ease;
+    transition: box-shadow 0.15s ease, border-color 0.15s ease;
   }
 
   @media (min-width: 640px) {
@@ -457,7 +484,7 @@
     color: var(--text-tertiary);
     border: 1px solid var(--border-default);
     cursor: pointer;
-    transition: all 0.1s ease;
+    transition: background-color 0.1s ease, border-color 0.1s ease, color 0.1s ease;
   }
 
   .format-tag:hover {

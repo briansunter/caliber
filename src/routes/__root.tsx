@@ -6,6 +6,9 @@ export const Route = createRootRoute({
   component: () => (
     <QueryClientProvider client={queryClient}>
       <div className="min-h-screen bg-background">
+        <a className="skip-link" href="#main-content">
+          Skip to content
+        </a>
         <Outlet />
       </div>
     </QueryClientProvider>

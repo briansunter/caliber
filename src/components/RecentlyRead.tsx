@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { X, Check, ChevronDown, ChevronUp, Trash2 } from "lucide-react";
-import { CoverFallback } from "./CoverFallback";
+import { BookCoverImage } from "./BookCoverImage";
 import { isUnknownAuthor } from "@/lib/utils";
 import {
   useReadingList,
@@ -49,9 +49,10 @@ export function RecentlyRead() {
           </label>
           <select
             id="reading-sort"
+            name="reading-sort"
             value={sort}
             onChange={(e) => setSort(e.target.value as ReadingSort)}
-            className="rounded-md border border-ink bg-white px-1.5 py-1 text-xs text-ink focus:outline-none focus:ring-2 focus:ring-accent"
+            className="rounded-md border border-ink bg-surface px-1.5 py-1 text-xs text-ink focus:outline-none focus:ring-2 focus:ring-accent"
           >
             {SORT_OPTIONS.map((opt) => (
               <option key={opt.value} value={opt.value}>
@@ -152,20 +153,16 @@ function ReadingCard({ item, onRemove }: { item: ReadingListItem; onRemove: () =
         to="/book/$id"
         params={{ id: String(book.id) }}
         aria-label={book.title}
-        className="flex flex-col overflow-hidden rounded-lg border border-ink bg-white transition-all hover:border-accent/50 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            className="flex flex-col overflow-hidden rounded-lg border border-ink bg-surface transition-[box-shadow,border-color] hover:border-accent/50 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
       >
         <div className="relative aspect-[2/3] w-full overflow-hidden bg-parchment-dark">
-          {book.has_cover ? (
-            <img
-              src={`/api/books/${book.id}/thumb`}
-              alt={book.title}
-              loading="lazy"
-              decoding="async"
-              className="h-full w-full object-cover"
-            />
-          ) : (
-            <CoverFallback title={book.title} size="lg" />
-          )}
+          <BookCoverImage
+            bookId={book.id}
+            title={book.title}
+            hasCover={book.has_cover}
+            width={240}
+            height={360}
+          />
           {progress.finished ? (
             <span className="absolute bottom-1 left-1 flex items-center gap-0.5 rounded bg-emerald-700/90 px-1.5 py-0.5 text-[10px] font-semibold text-white">
               <Check className="h-3 w-3" strokeWidth={2.5} /> Read

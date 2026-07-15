@@ -24,6 +24,7 @@ import {
   initFTS,
   onDbRefresh,
   CursorError,
+  reconfigureLibraryDatabase,
   type BookListItem,
   type CatalogEntry,
   type CursorPaginatedResult,
@@ -38,7 +39,12 @@ import {
   renderOpenSearchDescription,
   renderSingleBookFeed,
 } from "./lib/opds";
-import { getFormatContentType, getPathContentType, getSafeBookFilename } from "./lib/book-files";
+import {
+  canReadInBrowser,
+  getFormatContentType,
+  getPathContentType,
+  getSafeBookFilename,
+} from "./lib/book-files";
 import { EpubCacheError, getEpubEntryPath } from "./lib/epub-cache";
 import { getPageFile, getPageManifest, PageStreamingError } from "./lib/page-streaming";
 import { handleMCPRequest } from "./mcp";
@@ -54,13 +60,25 @@ import {
   type User,
 } from "./lib/user-db";
 import { join } from "node:path";
-import { CONFIG_DIR_PATH } from "./lib/config";
+import {
+  CONFIG_DIR_PATH,
+  COOKIE_SECURE,
+  HOST,
+  getLibraryConfigStatus,
+  LibraryConfigError,
+  MCP_ENABLED,
+  PORT,
+  PUBLIC_BASE_URL,
+  saveLibraryConfig,
+  TRUST_PROXY,
+} from "./lib/config";
 
 const LIBRARY_PATH = getLibraryPath();
 const WORK_DIR = CONFIG_DIR_PATH;
 const DEFAULT_PORT = 3003;
 const MAX_QUERY_LIMIT = 100;
 const MAX_STREAM_BATCH_SIZE = 5000;
+const LOCAL_SETUP_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
 const SORT_FIELDS = ["title", "author", "added", "rating"] as const;
 const SORT_ORDERS = ["asc", "desc"] as const;
 const OPTIONAL_EPUB_DISPLAY_OPTIONS_PATH = "META-INF/com.apple.ibooks.display-options.xml";
@@ -76,8 +94,10 @@ function parseBoundedInt(
   fallback: number,
   bounds: { min: number; max: number },
 ): number {
-  const parsed = Number.parseInt(value ?? "", 10);
-  if (!Number.isFinite(parsed)) return fallback;
+  const raw = value?.trim() ?? "";
+  if (!/^-?\d+$/.test(raw)) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed)) return fallback;
   return Math.min(bounds.max, Math.max(bounds.min, parsed));
 }
 
@@ -96,8 +116,9 @@ function parseTagIds(url: URL): number[] {
   if (raw.length === 0) return [];
   const ids = new Set<number>();
   for (const value of raw) {
-    const id = Number.parseInt(value, 10);
-    if (Number.isFinite(id) && id > 0) {
+    if (!/^\d+$/.test(value)) continue;
+    const id = Number(value);
+    if (Number.isSafeInteger(id) && id > 0) {
       ids.add(id);
       if (ids.size >= MAX_TAG_FILTERS) break;
     }
@@ -118,14 +139,20 @@ function parseCookies(req: Request): Record<string, string> {
     if (eq < 0) continue;
     const name = part.slice(0, eq).trim();
     const value = part.slice(eq + 1).trim();
-    if (name) out[name] = decodeURIComponent(value);
+    if (name) {
+      try {
+        out[name] = decodeURIComponent(value);
+      } catch {
+        // Ignore malformed cookie values instead of failing the whole request.
+      }
+    }
   }
   return out;
 }
 
 function userCookieHeader(username: string | null): string {
   const base = `${USER_COOKIE}=`;
-  const attrs = "Path=/; HttpOnly; SameSite=Lax";
+  const attrs = `Path=/; HttpOnly; SameSite=Lax${COOKIE_SECURE ? "; Secure" : ""}`;
   if (username === null) {
     return `${base}; ${attrs}; Max-Age=0`;
   }
@@ -143,9 +170,13 @@ function publicUser(user: User) {
   return { id: user.id, username: user.username };
 }
 
-// Initialize FTS on startup
-initFTS();
-onDbRefresh(() => apiCache.clear());
+// Initialize FTS on startup. A missing default library should leave the UI
+// reachable so the local operator can select a different database in Settings.
+let libraryReady = initFTS();
+onDbRefresh(() => {
+  libraryReady = true;
+  apiCache.clear();
+});
 
 const MAX_CACHE_BYTES = 50 * 1024 * 1024;
 
@@ -281,9 +312,15 @@ function getCachedTextResponse(
 }
 
 function getPublicBaseUrl(req: Request): string {
+  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
+
   const url = new URL(req.url);
-  const forwardedProto = req.headers.get("X-Forwarded-Proto")?.split(",")[0]?.trim();
-  const forwardedHost = req.headers.get("X-Forwarded-Host")?.split(",")[0]?.trim();
+  const forwardedProto = TRUST_PROXY
+    ? req.headers.get("X-Forwarded-Proto")?.split(",")[0]?.trim()
+    : undefined;
+  const forwardedHost = TRUST_PROXY
+    ? req.headers.get("X-Forwarded-Host")?.split(",")[0]?.trim()
+    : undefined;
   const host = forwardedHost || req.headers.get("Host") || url.host;
   const protocol = forwardedProto || url.protocol.replace(":", "");
 
@@ -332,8 +369,45 @@ function parseOpdsCatalogParams(req: Request) {
 }
 
 function parseBookId(value: string): number | null {
-  const id = parseInt(value, 10);
-  return Number.isNaN(id) ? null : id;
+  if (!/^\d+$/.test(value)) return null;
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+const MAX_JSON_BODY_BYTES = 64 * 1024;
+
+class RequestBodyError extends Error {
+  constructor(readonly status: 400 | 413, message: string) {
+    super(message);
+    this.name = "RequestBodyError";
+  }
+}
+
+async function readJsonBody(req: Request): Promise<unknown> {
+  const contentLength = req.headers.get("Content-Length");
+  if (contentLength && /^\d+$/.test(contentLength)) {
+    if (Number(contentLength) > MAX_JSON_BODY_BYTES) {
+      throw new RequestBodyError(413, "Request body is too large");
+    }
+  }
+
+  const text = await req.text();
+  if (new TextEncoder().encode(text).byteLength > MAX_JSON_BODY_BYTES) {
+    throw new RequestBodyError(413, "Request body is too large");
+  }
+
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw new RequestBodyError(400, "Invalid JSON");
+  }
+}
+
+function requestBodyErrorResponse(error: unknown): Response {
+  if (error instanceof RequestBodyError) {
+    return Response.json({ error: error.message }, { status: error.status });
+  }
+  return Response.json({ error: "Invalid JSON" }, { status: 400 });
 }
 
 function opdsCatalogResponse(
@@ -431,7 +505,8 @@ function parseByteRange(rangeHeader: string, size: number): ByteRange | null {
   if (startPart === undefined || endPart === undefined) return null;
 
   if (startPart === "") {
-    const suffixLength = parseInt(endPart, 10);
+    if (!/^\d+$/.test(endPart)) return null;
+    const suffixLength = Number(endPart);
     if (!Number.isFinite(suffixLength) || suffixLength <= 0) return null;
 
     return {
@@ -440,8 +515,11 @@ function parseByteRange(rangeHeader: string, size: number): ByteRange | null {
     };
   }
 
-  const start = parseInt(startPart, 10);
-  const end = endPart === "" ? size - 1 : parseInt(endPart, 10);
+  if (!/^\d+$/.test(startPart) || (endPart !== "" && !/^\d+$/.test(endPart))) {
+    return null;
+  }
+  const start = Number(startPart);
+  const end = endPart === "" ? size - 1 : Number(endPart);
 
   if (
     !Number.isFinite(start) ||
@@ -478,6 +556,7 @@ async function serveLocalFile(
     contentType: string;
     contentDisposition?: string;
     cacheControl?: string;
+    contentSecurityPolicy?: string;
   },
 ): Promise<Response> {
   const file = Bun.file(filePath);
@@ -500,11 +579,15 @@ async function serveLocalFile(
     "Content-Type": options.contentType,
     "Cache-Control": options.cacheControl ?? "no-cache",
     "Accept-Ranges": "bytes",
+    "X-Content-Type-Options": "nosniff",
     ETag: etag,
   });
   if (lastModified) baseHeaders.set("Last-Modified", lastModified);
   if (options.contentDisposition) {
     baseHeaders.set("Content-Disposition", options.contentDisposition);
+  }
+  if (options.contentSecurityPolicy) {
+    baseHeaders.set("Content-Security-Policy", options.contentSecurityPolicy);
   }
 
   const ifNoneMatch = req.headers.get("If-None-Match");
@@ -567,10 +650,12 @@ async function serveBookFile(
   const title = getBookTitle(id);
   const filename = getSafeBookFilename(title, format);
   const contentType = getFormatContentType(format);
+  const effectiveDisposition =
+    disposition === "inline" && !canReadInBrowser(format) ? "attachment" : disposition;
 
   return serveLocalFile(req, filePath, {
     contentType,
-    contentDisposition: contentDisposition(disposition, filename),
+    contentDisposition: contentDisposition(effectiveDisposition, filename),
     cacheControl: "no-cache",
   });
 }
@@ -604,6 +689,8 @@ async function serveEpubEntry(req: Request, id: number): Promise<Response> {
   return serveLocalFile(req, filePath, {
     contentType: getPathContentType(entryPath),
     cacheControl: "no-cache",
+    contentSecurityPolicy:
+      "default-src 'none'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:;",
   });
 }
 
@@ -657,11 +744,64 @@ async function* streamBooksJSON(
 }
 
 const server = serve({
-  port: parseBoundedInt(process.env.PORT, DEFAULT_PORT, { min: 1, max: 65535 }),
+  hostname: HOST,
+  port: parseBoundedInt(PORT, DEFAULT_PORT, { min: 1, max: 65535 }),
   routes: {
     // Health check
     "/api/health": {
       GET: () => Response.json({ status: "ok", timestamp: Date.now() }),
+    },
+
+    // Local setup/configuration surface. The server binds to loopback by
+    // default; deployments exposing it beyond the host should add auth.
+    "/api/config/library": {
+      GET: () =>
+        Response.json(
+          { ...getLibraryConfigStatus(), ready: libraryReady },
+          { headers: { "Cache-Control": "no-store" } },
+        ),
+      PUT: async (req) => {
+        if (!LOCAL_SETUP_HOSTS.has(HOST.toLowerCase())) {
+          return Response.json(
+            { error: "Library selection is available only when Caliber is bound to loopback; configure CALIBRE_LIBRARY_PATH instead" },
+            { status: 403, headers: { "Cache-Control": "no-store" } },
+          );
+        }
+        let rawBody: unknown;
+        try {
+          rawBody = await readJsonBody(req);
+        } catch (error) {
+          return requestBodyErrorResponse(error);
+        }
+        if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
+          return Response.json({ error: "Request body must be an object" }, { status: 400 });
+        }
+
+        const body = rawBody as {
+          databasePath?: unknown;
+          libraryPath?: unknown;
+          dbName?: unknown;
+        };
+        try {
+          const status = saveLibraryConfig({
+            databasePath: typeof body.databasePath === "string" ? body.databasePath : undefined,
+            libraryPath: typeof body.libraryPath === "string" ? body.libraryPath : undefined,
+            dbName: typeof body.dbName === "string" ? body.dbName : undefined,
+          });
+          reconfigureLibraryDatabase();
+          libraryReady = true;
+          return Response.json(
+            { ...status, ready: libraryReady, applied: true },
+            { headers: { "Cache-Control": "no-store" } },
+          );
+        } catch (error) {
+          if (error instanceof LibraryConfigError) {
+            return Response.json({ error: error.message }, { status: 400 });
+          }
+          console.error("Error changing Calibre library:", error);
+          return Response.json({ error: "Could not change the Calibre library" }, { status: 500 });
+        }
+      },
     },
 
     // Library stats
@@ -688,25 +828,32 @@ const server = serve({
       },
     },
 
-    // --- Users & reading progress (server-side, no auth) ---
+    // --- Users & reading progress (local profile cookie, not authentication) ---
 
     // Who am I? (reads the cookie)
     "/api/user/me": {
       GET: (req) => {
         const user = currentUser(req);
-        return Response.json({ user: user ? publicUser(user) : null });
+        return Response.json(
+          { user: user ? publicUser(user) : null },
+          { headers: { "Cache-Control": "private, no-store" } },
+        );
       },
     },
 
     // "Log in" = remember a username and set the cookie.
     "/api/user/login": {
       POST: async (req) => {
-        let body: { username?: unknown };
+        let rawBody: unknown;
         try {
-          body = await req.json();
-        } catch {
-          return Response.json({ error: "Invalid JSON" }, { status: 400 });
+          rawBody = await readJsonBody(req);
+        } catch (error) {
+          return requestBodyErrorResponse(error);
         }
+        if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
+          return Response.json({ error: "Request body must be an object" }, { status: 400 });
+        }
+        const body = rawBody as { username?: unknown };
         const username = typeof body.username === "string" ? body.username : "";
         if (!isValidUsername(username)) {
           return Response.json({ error: "Invalid username" }, { status: 400 });
@@ -717,7 +864,12 @@ const server = serve({
         }
         return Response.json(
           { user: publicUser(user) },
-          { headers: { "Set-Cookie": userCookieHeader(user.username) } },
+          {
+            headers: {
+              "Set-Cookie": userCookieHeader(user.username),
+              "Cache-Control": "private, no-store",
+            },
+          },
         );
       },
     },
@@ -770,48 +922,77 @@ const server = serve({
     // Per-book progress for the active reader
     "/api/user/progress/:bookId": {
       GET: (req) => {
-        const user = currentUser(req);
-        if (!user) return Response.json({ progress: null });
-        const bookId = Number.parseInt(req.params.bookId, 10);
-        if (!Number.isFinite(bookId)) {
+        const bookId = parseBookId(req.params.bookId);
+        if (bookId === null) {
           return Response.json({ error: "Invalid book id" }, { status: 400 });
         }
-        return Response.json({ progress: getProgress(user.id, bookId) });
+        const user = currentUser(req);
+        if (!user) {
+          return Response.json(
+            { progress: null },
+            { headers: { "Cache-Control": "private, no-store" } },
+          );
+        }
+        return Response.json(
+          { progress: getProgress(user.id, bookId) },
+          { headers: { "Cache-Control": "private, no-store" } },
+        );
       },
       PUT: async (req) => {
-        const user = currentUser(req);
-        if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
-        const bookId = Number.parseInt(req.params.bookId, 10);
-        if (!Number.isFinite(bookId)) {
+        const bookId = parseBookId(req.params.bookId);
+        if (bookId === null) {
           return Response.json({ error: "Invalid book id" }, { status: 400 });
         }
-        let body: {
+        const user = currentUser(req);
+        if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
+
+        const book = getBookByIdOptimized(bookId);
+        if (!book) return Response.json({ error: "Book not found" }, { status: 404 });
+
+        let rawBody: unknown;
+        try {
+          rawBody = await readJsonBody(req);
+        } catch (error) {
+          return requestBodyErrorResponse(error);
+        }
+
+        if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
+          return Response.json({ error: "Request body must be an object" }, { status: 400 });
+        }
+
+        const body = rawBody as {
           format?: unknown;
           location?: unknown;
           percentage?: unknown;
           finished?: unknown;
         };
-        try {
-          body = await req.json();
-        } catch {
-          return Response.json({ error: "Invalid JSON" }, { status: 400 });
+        const format = typeof body.format === "string" ? body.format.trim().toUpperCase() : "";
+        if (!FORMAT_PATTERN.test(format) || !book.formats.includes(format)) {
+          return Response.json({ error: "Invalid book format" }, { status: 400 });
         }
+
         const progress = upsertProgress(user.id, bookId, {
-          format: typeof body.format === "string" ? body.format : "",
+          format,
           location: typeof body.location === "string" ? body.location : null,
           percentage: typeof body.percentage === "number" ? body.percentage : 0,
           finished: body.finished === true,
         });
-        return Response.json({ progress });
+        return Response.json(
+          { progress },
+          { headers: { "Cache-Control": "private, no-store" } },
+        );
       },
       DELETE: (req) => {
-        const user = currentUser(req);
-        if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
-        const bookId = Number.parseInt(req.params.bookId, 10);
-        if (!Number.isFinite(bookId)) {
+        const bookId = parseBookId(req.params.bookId);
+        if (bookId === null) {
           return Response.json({ error: "Invalid book id" }, { status: 400 });
         }
-        return Response.json({ removed: deleteProgress(user.id, bookId) });
+        const user = currentUser(req);
+        if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
+        return Response.json(
+          { removed: deleteProgress(user.id, bookId) },
+          { headers: { "Cache-Control": "private, no-store" } },
+        );
       },
     },
 
@@ -1230,9 +1411,9 @@ const server = serve({
     "/api/books/:id": {
       GET: (req) => {
         try {
-          const id = parseInt(req.params.id, 10);
+          const id = parseBookId(req.params.id);
 
-          if (Number.isNaN(id)) {
+          if (id === null) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
 
@@ -1406,8 +1587,8 @@ const server = serve({
       GET: async (req) => {
         try {
           const id = parseBookId(req.params.id);
-          const page = Number.parseInt(req.params.page, 10);
-          if (id === null || !Number.isFinite(page)) {
+          const page = parseBookId(req.params.page);
+          if (id === null || page === null) {
             return Response.json({ error: "Invalid page request" }, { status: 400 });
           }
           if (!FORMAT_PATTERN.test(req.params.format)) {
@@ -1426,8 +1607,8 @@ const server = serve({
       HEAD: async (req) => {
         try {
           const id = parseBookId(req.params.id);
-          const page = Number.parseInt(req.params.page, 10);
-          if (id === null || !Number.isFinite(page)) {
+          const page = parseBookId(req.params.page);
+          if (id === null || page === null) {
             return Response.json({ error: "Invalid page request" }, { status: 400 });
           }
           if (!FORMAT_PATTERN.test(req.params.format)) {
@@ -1449,8 +1630,8 @@ const server = serve({
     "/api/books/:id/cover": {
       GET: async (req) => {
         try {
-          const id = parseInt(req.params.id, 10);
-          if (Number.isNaN(id)) {
+          const id = parseBookId(req.params.id);
+          if (id === null) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
 
@@ -1473,7 +1654,7 @@ const server = serve({
               status: 304,
               headers: {
                 ETag: etag,
-                "Cache-Control": "public, max-age=604800, immutable",
+                "Cache-Control": "public, max-age=300, must-revalidate",
               },
             });
           }
@@ -1481,7 +1662,7 @@ const server = serve({
           return new Response(file, {
             headers: {
               "Content-Type": "image/jpeg",
-              "Cache-Control": "public, max-age=604800, immutable",
+              "Cache-Control": "public, max-age=300, must-revalidate",
               ETag: etag,
             },
           });
@@ -1496,8 +1677,8 @@ const server = serve({
     "/api/books/:id/thumb": {
       GET: async (req) => {
         try {
-          const id = parseInt(req.params.id, 10);
-          if (Number.isNaN(id)) {
+          const id = parseBookId(req.params.id);
+          if (id === null) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
 
@@ -1515,14 +1696,14 @@ const server = serve({
                 status: 304,
                 headers: {
                   ETag: etag,
-                  "Cache-Control": "public, max-age=604800, immutable",
+                  "Cache-Control": "public, max-age=300, must-revalidate",
                 },
               });
             }
             return new Response(thumbFile, {
               headers: {
                 "Content-Type": "image/jpeg",
-                "Cache-Control": "public, max-age=604800, immutable",
+                "Cache-Control": "public, max-age=300, must-revalidate",
                 ETag: etag,
               },
             });
@@ -1550,7 +1731,7 @@ const server = serve({
               status: 304,
               headers: {
                 ETag: etag,
-                "Cache-Control": "public, max-age=604800, immutable",
+                "Cache-Control": "public, max-age=300, must-revalidate",
               },
             });
           }
@@ -1558,7 +1739,7 @@ const server = serve({
           return new Response(coverFile, {
             headers: {
               "Content-Type": "image/jpeg",
-              "Cache-Control": "public, max-age=604800, immutable",
+              "Cache-Control": "public, max-age=300, must-revalidate",
               ETag: etag,
             },
           });
@@ -1593,6 +1774,9 @@ const server = serve({
     // MCP endpoint for AI tool integration
     "/mcp": {
       POST: async (req) => {
+        if (!MCP_ENABLED) {
+          return Response.json({ error: "MCP is disabled" }, { status: 404 });
+        }
         try {
           const result = await handleMCPRequest(req);
           return result;

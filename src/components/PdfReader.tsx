@@ -19,7 +19,6 @@ import { fetchBookProgress, saveBookProgress } from "@/lib/reading-progress";
 import {
   getNextReaderLoadMode,
   prefetchOrder,
-  replaceReaderLoadModeInUrl,
   type ReaderLoadMode,
 } from "./reader-types";
 
@@ -155,7 +154,6 @@ export function PdfReader({
   const toggleUI = useCallback(() => setShowUI((p) => !p), []);
   const toggleLoadMode = useCallback(() => {
     const nextMode = getNextReaderLoadMode(loadMode);
-    replaceReaderLoadModeInUrl(nextMode);
     setLoadMode(nextMode);
   }, [loadMode]);
 
@@ -616,7 +614,7 @@ export function PdfReader({
           <div className="flex flex-col items-center gap-3">
             <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
             <p className="text-sm text-white/50">
-              {loadMode === "stream" ? "Streaming PDF..." : "Loading PDF..."}
+              {loadMode === "stream" ? "Streaming PDF…" : "Loading PDF…"}
             </p>
           </div>
         </div>
@@ -639,7 +637,7 @@ export function PdfReader({
 
       {/* Header */}
       <div
-        className="shrink-0 z-[108] transition-all duration-200"
+        className="shrink-0 z-[108] transition-transform duration-200"
         style={{
           transform: showUI ? "translateY(0)" : "translateY(-100%)",
           background: "rgba(0,0,0,0.85)",
@@ -652,6 +650,8 @@ export function PdfReader({
           <button
             type="button"
             onClick={onBack}
+            aria-label="Back to book"
+            title="Back to book"
             className="p-2 -ml-1 rounded-lg text-white active:opacity-60"
           >
             <ArrowLeft className="h-5 w-5" />
@@ -686,6 +686,8 @@ export function PdfReader({
             <button
               type="button"
               onClick={() => setZoom((z) => Math.max(0.5, z - 0.25))}
+              aria-label="Zoom out"
+              title="Zoom out"
               className="p-2 rounded-lg text-white active:opacity-60"
             >
               <ZoomOut className="h-5 w-5" />
@@ -696,6 +698,8 @@ export function PdfReader({
             <button
               type="button"
               onClick={() => setZoom((z) => Math.min(3, z + 0.25))}
+              aria-label="Zoom in"
+              title="Zoom in"
               className="p-2 -mr-1 rounded-lg text-white active:opacity-60"
             >
               <ZoomIn className="h-5 w-5" />
@@ -725,7 +729,7 @@ export function PdfReader({
 
       {/* Footer */}
       <div
-        className="shrink-0 z-[108] transition-all duration-200"
+        className="shrink-0 z-[108] transition-transform duration-200"
         style={{
           transform: showUI ? "translateY(0)" : "translateY(100%)",
           background: "rgba(0,0,0,0.85)",
@@ -738,7 +742,7 @@ export function PdfReader({
           {/* Progress bar */}
           <div className="w-full h-1 rounded-full bg-white/10 mb-2">
             <div
-              className="h-full rounded-full bg-white/50 transition-all duration-300"
+              className="h-full rounded-full bg-white/50 transition-[width] duration-300"
               style={{ width: `${progress}%` }}
             />
           </div>
@@ -749,6 +753,8 @@ export function PdfReader({
               type="button"
               onClick={goPrev}
               disabled={currentPage <= 1}
+              aria-label="Previous page"
+              title="Previous page"
               className="p-1.5 rounded-lg text-white disabled:opacity-20 active:opacity-60"
             >
               <ChevronLeft className="h-5 w-5" />
@@ -779,6 +785,8 @@ export function PdfReader({
               type="button"
               onClick={goNext}
               disabled={currentPage >= totalPages}
+              aria-label="Next page"
+              title="Next page"
               className="p-1.5 rounded-lg text-white disabled:opacity-20 active:opacity-60"
             >
               <ChevronRight className="h-5 w-5" />

@@ -111,10 +111,13 @@ export const tools: MCPTool[] = [
 ];
 
 export async function executeTool(name: string, args: Record<string, unknown>): Promise<string> {
+  const countArg = typeof args.count === "number" && Number.isFinite(args.count) ? args.count : 10;
+  const count = Math.min(20, Math.max(1, Math.floor(countArg)));
+
   switch (name) {
     case "search_book_title": {
-      const title = args.title as string;
-      const count = Math.min((args.count as number) || 10, 20);
+      const title = typeof args.title === "string" ? args.title.trim() : "";
+      if (!title) throw new Error("title must be a non-empty string");
 
       const books = searchBooksByTitle(title, count);
 
@@ -134,8 +137,8 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
     }
 
     case "search_author": {
-      const author = args.author as string;
-      const count = Math.min((args.count as number) || 10, 20);
+      const author = typeof args.author === "string" ? args.author.trim() : "";
+      if (!author) throw new Error("author must be a non-empty string");
 
       const authorInfo = getAuthorByName(author);
       const books = searchBooksByAuthor(author, count);
@@ -160,10 +163,10 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
     }
 
     case "search_library": {
-      const query = args.query as string;
-      const limit = Math.min((args.count as number) || 10, 20);
+      const query = typeof args.query === "string" ? args.query.trim() : "";
+      if (!query) throw new Error("query must be a non-empty string");
 
-      const result = searchBooksCursor({ query, limit });
+      const result = searchBooksCursor({ query, limit: count });
 
       let output = `Library search: "${query}"\n`;
       output += `${"=".repeat(60)}\n\n`;
@@ -210,13 +213,28 @@ export async function handleJSONRPC(request: MCPRequest): Promise<MCPResponse | 
     }
 
     case "tools/call": {
-      const params = request.params as {
-        name: string;
-        arguments?: Record<string, unknown>;
-      };
+      if (typeof request.params !== "object" || request.params === null) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32602, message: "Invalid tool call parameters" },
+        };
+      }
+      const params = request.params as { name?: unknown; arguments?: unknown };
+      if (typeof params.name !== "string" || params.name.length === 0) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32602, message: "Tool name is required" },
+        };
+      }
+      const args =
+        typeof params.arguments === "object" && params.arguments !== null && !Array.isArray(params.arguments)
+          ? (params.arguments as Record<string, unknown>)
+          : {};
 
       try {
-        const result = await executeTool(params.name, params.arguments || {});
+        const result = await executeTool(params.name, args);
 
         return {
           jsonrpc: "2.0",

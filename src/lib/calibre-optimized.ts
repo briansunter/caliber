@@ -1,48 +1,114 @@
 import { Database } from "bun:sqlite";
 import { join, resolve, sep } from "node:path";
 import {
-  copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
+  realpathSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { LIBRARY_PATH, DB_NAME, CONFIG_DIR_PATH } from "./config";
-import { type SourceSignature, getSourceSignature, isSameSignature } from "./file-signature";
+import {
+  CONFIG_DIR_PATH,
+  DB_NAME,
+  DB_REFRESH_INTERVAL_MS,
+  LIBRARY_PATH,
+} from "./config";
+import {
+  type SourceSignature,
+  getDatabaseSignature,
+  isSameSignature,
+} from "./file-signature";
 
-const DB_PATH = join(LIBRARY_PATH, DB_NAME);
+let DB_PATH = join(LIBRARY_PATH, DB_NAME);
 
 // Writable copy in ~/.config/caliber for FTS support
 const WORK_DIR = CONFIG_DIR_PATH;
 const WRITABLE_DB_PATH = join(WORK_DIR, "metadata.db");
 const DB_SOURCE_SIGNATURE_PATH = join(WORK_DIR, "metadata.source.json");
 
-function readSourceSignature(): SourceSignature | null {
+interface SnapshotMetadata {
+  sourcePath: string;
+  signature: SourceSignature;
+}
+
+function readSnapshotMetadata(): SnapshotMetadata | null {
   try {
-    return JSON.parse(readFileSync(DB_SOURCE_SIGNATURE_PATH, "utf8")) as SourceSignature;
+    const raw: unknown = JSON.parse(readFileSync(DB_SOURCE_SIGNATURE_PATH, "utf8"));
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+    const record = raw as Record<string, unknown>;
+    if (typeof record.sourcePath !== "string" || typeof record.signature !== "object") {
+      return null;
+    }
+    return {
+      sourcePath: record.sourcePath,
+      signature: record.signature as SourceSignature,
+    };
   } catch {
     return null;
   }
 }
 
 function copyDbToWritable(): void {
+  if (resolve(DB_PATH) === resolve(WRITABLE_DB_PATH)) {
+    throw new Error("Calibre source database must be outside Caliber's cache directory");
+  }
+  if (!existsSync(DB_PATH)) {
+    throw new Error(
+      `Calibre database not found at ${DB_PATH}. Set CALIBRE_LIBRARY_PATH (or CALIBER_LIBRARY_PATH) to a library containing ${DB_NAME}.`,
+    );
+  }
+
   mkdirSync(WORK_DIR, { recursive: true });
   for (const suffix of ["-wal", "-shm"]) {
     const p = WRITABLE_DB_PATH + suffix;
     if (existsSync(p)) unlinkSync(p);
   }
-  copyFileSync(DB_PATH, WRITABLE_DB_PATH);
+
+  // SQLite can have committed changes in the source WAL. serialize() asks
+  // SQLite for a consistent snapshot instead of copying only metadata.db.
+  const sourceDb = new Database(DB_PATH, { readonly: true });
+  const temporaryPath = `${WRITABLE_DB_PATH}.tmp-${process.pid}`;
+  try {
+    const tables = new Set(
+      (sourceDb.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map(
+        (row) => row.name,
+      ),
+    );
+    const missingTables = ["books", "authors", "data", "books_authors_link"].filter(
+      (table) => !tables.has(table),
+    );
+    if (missingTables.length > 0) {
+      throw new Error(`Unsupported Calibre database; missing ${missingTables.join(", ")}`);
+    }
+    writeFileSync(temporaryPath, sourceDb.serialize());
+    try {
+      renameSync(temporaryPath, WRITABLE_DB_PATH);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST" && code !== "EPERM") throw error;
+      unlinkSync(WRITABLE_DB_PATH);
+      renameSync(temporaryPath, WRITABLE_DB_PATH);
+    }
+  } finally {
+    sourceDb.close();
+    if (existsSync(temporaryPath)) unlinkSync(temporaryPath);
+  }
+
+  const signature = getDatabaseSignature(DB_PATH);
   writeFileSync(
     DB_SOURCE_SIGNATURE_PATH,
-    `${JSON.stringify(getSourceSignature(DB_PATH))}\n`,
+    `${JSON.stringify({ sourcePath: resolve(DB_PATH), signature })}\n`,
   );
-  console.log(`📋 Copied database to ${WRITABLE_DB_PATH}`);
+  console.error(`📋 Copied database snapshot to ${WRITABLE_DB_PATH}`);
 }
 
 // Connection pool for concurrent requests
 const dbPool: Database[] = [];
 const MAX_POOL_SIZE = 5;
+let activeStreams = 0;
+let refreshPending = false;
 
 const dbRefreshCallbacks: Array<() => void> = [];
 
@@ -62,7 +128,26 @@ function closePool(): void {
 }
 
 function runRefresh(): void {
+  if (activeStreams > 0) {
+    refreshPending = true;
+    return;
+  }
   closePool();
+  copyDbToWritable();
+  runFtsSetup();
+  for (const cb of dbRefreshCallbacks) {
+    try {
+      cb();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** Switch to a validated library selection without restarting the server. */
+export function reconfigureLibraryDatabase(): void {
+  closePool();
+  DB_PATH = join(LIBRARY_PATH, DB_NAME);
   copyDbToWritable();
   runFtsSetup();
   for (const cb of dbRefreshCallbacks) {
@@ -82,8 +167,13 @@ function ensureWritableDb(): void {
   }
 
   try {
-    const sourceSignature = getSourceSignature(DB_PATH);
-    if (!isSameSignature(readSourceSignature(), sourceSignature)) {
+    const sourceSignature = getDatabaseSignature(DB_PATH);
+    const snapshot = readSnapshotMetadata();
+    if (
+      !snapshot ||
+      snapshot.sourcePath !== resolve(DB_PATH) ||
+      !isSameSignature(snapshot.signature, sourceSignature)
+    ) {
       copyDbToWritable();
     }
   } catch {
@@ -115,7 +205,7 @@ function getDb(): Database {
 
 function runFtsSetup(): void {
   const db = getDb();
-  const sourceSignature = getSourceSignature(DB_PATH);
+  const sourceSignature = getDatabaseSignature(DB_PATH);
   const sourceSignatureValue = JSON.stringify(sourceSignature);
 
   // Expression indexes for keyset pagination (match LOWER() calls in WHERE clauses)
@@ -170,7 +260,7 @@ function runFtsSetup(): void {
     .get() as { value: string } | null;
 
   if (meta?.value !== sourceSignatureValue || ftsCount.count !== bookCount.count) {
-    console.log("🔍 Building FTS index...");
+    console.error("🔍 Building FTS index...");
     db.exec(`INSERT INTO books_fts(books_fts) VALUES('rebuild');`);
     db.query(
       "INSERT OR REPLACE INTO caliber_fts_meta (key, value) VALUES ('source_signature', ?)",
@@ -178,43 +268,58 @@ function runFtsSetup(): void {
   }
 
   const total = db.query("SELECT COUNT(*) as count FROM books_fts").get() as { count: number };
-  console.log(`🔍 FTS index ready (${total.count} books)`);
+  console.error(`🔍 FTS index ready (${total.count} books)`);
 }
 
 // Initialize FTS5 virtual table on writable copy — runs once at startup
-export function initFTS(): void {
-  ensureWritableDb();
+let refreshTimer: ReturnType<typeof setInterval> | null = null;
 
-  runFtsSetup();
+export function initFTS(): boolean {
+  let ready = false;
+  try {
+    ensureWritableDb();
 
-  // Warm up: run initial query to populate mmap/cache
-  console.log("🔥 Warming up database...");
-  const db = getDb();
-  db.query("SELECT COUNT(*) FROM books").get();
-  db.query(`
-    SELECT b.id FROM books b
-    LEFT JOIN books_authors_link bal ON b.id = bal.book
-    LEFT JOIN books_tags_link btl ON b.id = btl.book
-    LEFT JOIN data d ON b.id = d.book
-    ORDER BY b.sort ASC LIMIT 1
-  `).get();
-  console.log("🔥 Database warm");
+    runFtsSetup();
 
-  // Low-frequency freshness check (~60s), unref'd so it doesn't block process exit
-  const timer = setInterval(() => {
+    // Warm up: run initial query to populate mmap/cache
+    console.error("🔥 Warming up database...");
+    const db = getDb();
+    db.query("SELECT COUNT(*) FROM books").get();
+    db.query(`
+      SELECT b.id FROM books b
+      LEFT JOIN books_authors_link bal ON b.id = bal.book
+      LEFT JOIN books_tags_link btl ON b.id = btl.book
+      LEFT JOIN data d ON b.id = d.book
+      ORDER BY b.sort ASC LIMIT 1
+    `).get();
+    console.error("🔥 Database warm");
+    ready = true;
+  } catch (error) {
+    console.error("📚 Library is not ready:", error instanceof Error ? error.message : error);
+  }
+
+  // Low-frequency freshness check, unref'd so it doesn't block process exit.
+  if (refreshTimer) return ready;
+  refreshTimer = setInterval(() => {
     try {
-      const sig = getSourceSignature(DB_PATH);
-      if (!isSameSignature(readSourceSignature(), sig)) {
-        console.log("🔄 Source DB changed — refreshing...");
+      const sig = getDatabaseSignature(DB_PATH);
+      const snapshot = readSnapshotMetadata();
+      if (
+        !snapshot ||
+        snapshot.sourcePath !== resolve(DB_PATH) ||
+        !isSameSignature(snapshot.signature, sig)
+      ) {
+        console.error("🔄 Source DB changed — refreshing...");
         runRefresh();
       }
     } catch {
       // If stat fails just skip this tick
     }
-  }, 60_000);
-  if (typeof timer === "object" && timer !== null && "unref" in timer) {
-    (timer as NodeJS.Timeout).unref();
+  }, DB_REFRESH_INTERVAL_MS);
+  if (typeof refreshTimer === "object" && refreshTimer !== null && "unref" in refreshTimer) {
+    (refreshTimer as NodeJS.Timeout).unref();
   }
+  return ready;
 }
 
 export interface BookListItem {
@@ -291,12 +396,26 @@ interface BookRow {
 }
 
 function splitAggregatedField(value: string | null): string[] {
-  return value
-    ? value
-        .split(",")
+  if (!value) return [];
+
+  // Current queries use JSON aggregates so commas in author/tag names remain
+  // intact. Keep the comma fallback for older writable snapshots.
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (Array.isArray(parsed)) {
+      return parsed
+        .filter((item): item is string => typeof item === "string")
         .map((item) => item.trim())
-        .filter((item) => item.length > 0)
-    : [];
+        .filter((item) => item.length > 0);
+    }
+  } catch {
+    // Legacy GROUP_CONCAT value; fall through to the compatibility parser.
+  }
+
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
 }
 
 // Parse book row with aggregated fields
@@ -357,10 +476,47 @@ function encodeCursor(book: BookListItem, sortField: string): string {
 function decodeCursor(cursor: string): { id: number; sort: string | number } | null {
   try {
     const decoded = Buffer.from(cursor, "base64url").toString();
-    return JSON.parse(decoded);
+    const parsed: unknown = JSON.parse(decoded);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+    const record = parsed as Record<string, unknown>;
+    if (
+      typeof record.id !== "number" ||
+      !Number.isSafeInteger(record.id) ||
+      record.id <= 0 ||
+      (typeof record.sort !== "string" && typeof record.sort !== "number")
+    ) {
+      return null;
+    }
+    if (typeof record.sort === "number" && !Number.isFinite(record.sort)) return null;
+    return { id: record.id, sort: record.sort };
   } catch {
     return null;
   }
+}
+
+function clampLimit(limit: number | undefined, fallback = 100, max = 200): number {
+  const value = Number.isFinite(limit) ? Math.floor(limit as number) : fallback;
+  return Math.min(max, Math.max(1, value));
+}
+
+function isSafeLibraryPath(filePath: string): boolean {
+  const resolvedLibrary = resolve(LIBRARY_PATH);
+  const lexicalPath = resolve(filePath);
+  if (!lexicalPath.startsWith(`${resolvedLibrary}${sep}`)) return false;
+
+  // Resolve symlinks when the target exists so a Calibre row cannot point
+  // outside the configured library through a linked directory.
+  if (existsSync(filePath)) {
+    try {
+      const realLibrary = realpathSync(resolvedLibrary);
+      const realFile = realpathSync(filePath);
+      return realFile.startsWith(`${realLibrary}${sep}`);
+    } catch {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 interface ListOptions {
@@ -399,15 +555,15 @@ function buildBookOrderBy(
   const dir = sortOrder.toUpperCase();
   switch (sortBy) {
     case "title":
-      return `ORDER BY lower(b.sort) ${dir}, b.id ${dir}`;
+      return `ORDER BY COALESCE(NULLIF(lower(b.sort), ''), lower(b.title)) ${dir}, b.id ${dir}`;
     case "author":
-      return `ORDER BY lower(b.author_sort) ${dir}, b.id ${dir}`;
+      return `ORDER BY COALESCE(lower(b.author_sort), '') ${dir}, b.id ${dir}`;
     case "added":
-      return `ORDER BY b.timestamp ${dir}, b.id ${dir}`;
+      return `ORDER BY COALESCE(b.timestamp, '') ${dir}, b.id ${dir}`;
     case "rating":
       return `ORDER BY COALESCE(r.rating, 0) ${dir}, b.id ${dir}`;
     default:
-      return `ORDER BY lower(b.sort) ASC, b.id ASC`;
+      return `ORDER BY COALESCE(NULLIF(lower(b.sort), ''), lower(b.title)) ASC, b.id ASC`;
   }
 }
 
@@ -429,17 +585,17 @@ function appendBookCursorWhere(
 
   if (sortBy === "title") {
     params.push(cursorData.sort as string, cursorData.sort as string, cursorData.id);
-    return `${bookWhere} AND (lower(b.sort) ${sortOp} ? OR (lower(b.sort) = ? AND b.id ${sortOp} ?))`;
+    return `${bookWhere} AND (COALESCE(NULLIF(lower(b.sort), ''), lower(b.title)) ${sortOp} ? OR (COALESCE(NULLIF(lower(b.sort), ''), lower(b.title)) = ? AND b.id ${sortOp} ?))`;
   }
 
   if (sortBy === "author") {
     params.push(cursorData.sort as string, cursorData.sort as string, cursorData.id);
-    return `${bookWhere} AND (lower(b.author_sort) ${sortOp} ? OR (lower(b.author_sort) = ? AND b.id ${sortOp} ?))`;
+    return `${bookWhere} AND (COALESCE(lower(b.author_sort), '') ${sortOp} ? OR (COALESCE(lower(b.author_sort), '') = ? AND b.id ${sortOp} ?))`;
   }
 
   if (sortBy === "added") {
     params.push(cursorData.sort as string, cursorData.sort as string, cursorData.id);
-    return `${bookWhere} AND (b.timestamp ${sortOp} ? OR (b.timestamp = ? AND b.id ${sortOp} ?))`;
+    return `${bookWhere} AND (COALESCE(b.timestamp, '') ${sortOp} ? OR (COALESCE(b.timestamp, '') = ? AND b.id ${sortOp} ?))`;
   }
 
   if (sortBy === "rating") {
@@ -458,7 +614,7 @@ function listBooksWithWhere(
   initialParams: (string | number)[] = [],
 ): CursorPaginatedResult<BookListItem> {
   const db = getDb();
-  const limit = Math.min(options.limit || 100, 200);
+  const limit = clampLimit(options.limit);
   const sortBy = options.sortBy || "title";
   const sortOrder = options.sortOrder || "asc";
   const dir = sortOrder.toUpperCase();
@@ -492,9 +648,9 @@ function listBooksWithWhere(
         b.id, b.title, b.sort, b.author_sort, b.series_index, b.has_cover, b.pubdate, b.timestamp,
         s.name as series,
         b.rating_val as rating,
-        GROUP_CONCAT(DISTINCT a.name) as authors,
-        GROUP_CONCAT(DISTINCT t.name) as tags,
-        GROUP_CONCAT(DISTINCT d.format) as formats
+        json_group_array(DISTINCT a.name) FILTER (WHERE a.name IS NOT NULL) as authors,
+        json_group_array(DISTINCT t.name) FILTER (WHERE t.name IS NOT NULL) as tags,
+        json_group_array(DISTINCT d.format) FILTER (WHERE d.format IS NOT NULL) as formats
       FROM book_page b
       LEFT JOIN books_authors_link bal ON b.id = bal.book
       LEFT JOIN authors a ON bal.author = a.id
@@ -519,9 +675,9 @@ function listBooksWithWhere(
         b.id, b.title, b.sort, b.author_sort, b.series_index, b.has_cover, b.pubdate, b.timestamp,
         s.name as series,
         r.rating,
-        GROUP_CONCAT(DISTINCT a.name) as authors,
-        GROUP_CONCAT(DISTINCT t.name) as tags,
-        GROUP_CONCAT(DISTINCT d.format) as formats
+        json_group_array(DISTINCT a.name) FILTER (WHERE a.name IS NOT NULL) as authors,
+        json_group_array(DISTINCT t.name) FILTER (WHERE t.name IS NOT NULL) as tags,
+        json_group_array(DISTINCT d.format) FILTER (WHERE d.format IS NOT NULL) as formats
       FROM book_page b
       LEFT JOIN books_authors_link bal ON b.id = bal.book
       LEFT JOIN authors a ON bal.author = a.id
@@ -575,7 +731,7 @@ export function searchBooksCursor(options: SearchOptions): CursorPaginatedResult
 
 // FTS5-powered search
 function ftsSearch(options: SearchOptions): CursorPaginatedResult<BookListItem> {
-  const limit = Math.min(options.limit || 100, 200);
+  const limit = clampLimit(options.limit);
 
   // Build FTS query: quote each word and join with AND
   const words = options.query
@@ -679,9 +835,9 @@ export function getBookByIdOptimized(id: number): BookWithDetails | null {
       r.rating,
       p.name as publisher,
       c.text as comments,
-      GROUP_CONCAT(DISTINCT a.name) as authors,
-      GROUP_CONCAT(DISTINCT t.name) as tags,
-      GROUP_CONCAT(DISTINCT d.format) as formats
+      json_group_array(DISTINCT a.name) FILTER (WHERE a.name IS NOT NULL) as authors,
+      json_group_array(DISTINCT t.name) FILTER (WHERE t.name IS NOT NULL) as tags,
+      json_group_array(DISTINCT d.format) FILTER (WHERE d.format IS NOT NULL) as formats
     FROM book_page b
     LEFT JOIN books_authors_link bal ON b.id = bal.book
     LEFT JOIN authors a ON bal.author = a.id
@@ -758,7 +914,7 @@ function listCatalogEntries(
   options: CatalogOptions = {},
 ): CursorPaginatedResult<CatalogEntry> {
   const db = getDb();
-  const limit = Math.min(options.limit || 100, 200);
+  const limit = clampLimit(options.limit);
   const sortOrder = options.sortOrder || "asc";
   const dir = sortOrder.toUpperCase();
   const sortOp = sortOrder === "asc" ? ">" : "<";
@@ -949,6 +1105,7 @@ export function getCatalogEntry(kind: CatalogKind, id: number | string): Catalog
 // Search books by title — uses FTS5 prefix MATCH for O(log n) performance
 export function searchBooksByTitle(title: string, limit: number = 10): BookListItem[] {
   const db = getDb();
+  const cappedLimit = clampLimit(limit, 10, 200);
 
   const words = title
     .trim()
@@ -971,9 +1128,9 @@ export function searchBooksByTitle(title: string, limit: number = 10): BookListI
       b.timestamp,
       s.name as series,
       r.rating,
-      GROUP_CONCAT(DISTINCT a.name) as authors,
-      GROUP_CONCAT(DISTINCT t.name) as tags,
-      GROUP_CONCAT(DISTINCT d.format) as formats
+      json_group_array(DISTINCT a.name) FILTER (WHERE a.name IS NOT NULL) as authors,
+      json_group_array(DISTINCT t.name) FILTER (WHERE t.name IS NOT NULL) as tags,
+      json_group_array(DISTINCT d.format) FILTER (WHERE d.format IS NOT NULL) as formats
     FROM books b
     LEFT JOIN books_authors_link bal ON b.id = bal.book
     LEFT JOIN authors a ON bal.author = a.id
@@ -990,7 +1147,7 @@ export function searchBooksByTitle(title: string, limit: number = 10): BookListI
     LIMIT ?
   `;
 
-  const results = db.query(query).all(ftsQuery, limit) as BookRow[];
+  const results = db.query(query).all(ftsQuery, cappedLimit) as BookRow[];
 
   return results.map(parseBookRow);
 }
@@ -998,6 +1155,7 @@ export function searchBooksByTitle(title: string, limit: number = 10): BookListI
 // Search books by author name
 export function searchBooksByAuthor(authorName: string, limit: number = 10): BookListItem[] {
   const db = getDb();
+  const cappedLimit = clampLimit(limit, 10, 200);
   const searchTerm = `%${authorName.trim()}%`;
 
   const query = `
@@ -1012,9 +1170,9 @@ export function searchBooksByAuthor(authorName: string, limit: number = 10): Boo
       b.timestamp,
       s.name as series,
       r.rating,
-      GROUP_CONCAT(DISTINCT a.name) as authors,
-      GROUP_CONCAT(DISTINCT t.name) as tags,
-      GROUP_CONCAT(DISTINCT d.format) as formats
+      json_group_array(DISTINCT a.name) FILTER (WHERE a.name IS NOT NULL) as authors,
+      json_group_array(DISTINCT t.name) FILTER (WHERE t.name IS NOT NULL) as tags,
+      json_group_array(DISTINCT d.format) FILTER (WHERE d.format IS NOT NULL) as formats
     FROM books b
     LEFT JOIN books_authors_link bal ON b.id = bal.book
     LEFT JOIN authors a ON bal.author = a.id
@@ -1036,7 +1194,7 @@ export function searchBooksByAuthor(authorName: string, limit: number = 10): Boo
     LIMIT ?
   `;
 
-  const results = db.query(query).all(searchTerm, searchTerm, limit) as BookRow[];
+  const results = db.query(query).all(searchTerm, searchTerm, cappedLimit) as BookRow[];
 
   return results.map(parseBookRow);
 }
@@ -1073,11 +1231,14 @@ export function getAuthorByName(authorName: string): { name: string; bookCount: 
 export async function* streamBooks(
   batchSize: number = 1000,
 ): AsyncGenerator<BookListItem[], void, unknown> {
-  const db = getDb();
-  let lastId = 0;
+  activeStreams += 1;
 
-  while (true) {
-    const query = `
+  try {
+    const db = getDb();
+    const effectiveBatchSize = clampLimit(batchSize, 1000, 5000);
+    let lastId = 0;
+    while (true) {
+      const query = `
       WITH book_page AS (
         SELECT
           b.id,
@@ -1104,9 +1265,9 @@ export async function* streamBooks(
         b.timestamp,
         s.name as series,
         r.rating,
-        GROUP_CONCAT(DISTINCT a.name) as authors,
-        GROUP_CONCAT(DISTINCT t.name) as tags,
-        GROUP_CONCAT(DISTINCT d.format) as formats
+        json_group_array(DISTINCT a.name) FILTER (WHERE a.name IS NOT NULL) as authors,
+        json_group_array(DISTINCT t.name) FILTER (WHERE t.name IS NOT NULL) as tags,
+        json_group_array(DISTINCT d.format) FILTER (WHERE d.format IS NOT NULL) as formats
       FROM book_page b
       LEFT JOIN books_authors_link bal ON b.id = bal.book
       LEFT JOIN authors a ON bal.author = a.id
@@ -1121,18 +1282,29 @@ export async function* streamBooks(
       ORDER BY b.id ASC
     `;
 
-    const rows = db.query(query).all(lastId, batchSize) as BookRow[];
+      const rows = db.query(query).all(lastId, effectiveBatchSize) as BookRow[];
 
-    if (rows.length === 0) break;
+      if (rows.length === 0) break;
 
-    const items = rows.map(parseBookRow);
-    const lastItem = items[items.length - 1];
-    if (!lastItem) break;
-    lastId = lastItem.id;
+      const items = rows.map(parseBookRow);
+      const lastItem = items[items.length - 1];
+      if (!lastItem) break;
+      lastId = lastItem.id;
 
-    yield items;
+      yield items;
 
-    if (rows.length < batchSize) break;
+      if (rows.length < effectiveBatchSize) break;
+    }
+  } finally {
+    activeStreams -= 1;
+    if (activeStreams === 0 && refreshPending) {
+      refreshPending = false;
+      try {
+        runRefresh();
+      } catch (error) {
+        console.error("🔄 Deferred database refresh failed:", error instanceof Error ? error.message : error);
+      }
+    }
   }
 }
 
@@ -1165,9 +1337,7 @@ export function getBookFormatPath(bookId: number, format: string): string | null
 
   const ext = format.toLowerCase();
   const filePath = join(LIBRARY_PATH, row.path, `${row.name}.${ext}`);
-  const resolvedLibrary = resolve(LIBRARY_PATH) + sep;
-  const resolvedFile = resolve(filePath);
-  if (!resolvedFile.startsWith(resolvedLibrary)) return null;
+  if (!isSafeLibraryPath(filePath)) return null;
   return filePath;
 }
 
@@ -1181,8 +1351,6 @@ export function getBookCoverPath(bookId: number): string | null {
   if (!row || !row.has_cover) return null;
 
   const filePath = join(LIBRARY_PATH, row.path, "cover.jpg");
-  const resolvedLibrary = resolve(LIBRARY_PATH) + sep;
-  const resolvedFile = resolve(filePath);
-  if (!resolvedFile.startsWith(resolvedLibrary)) return null;
+  if (!isSafeLibraryPath(filePath)) return null;
   return filePath;
 }

@@ -2,9 +2,10 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { BookTableInfinite, TableHeader, SortHeader } from "@/components/BookTableInfinite";
 import { BookGridInfinite } from "@/components/BookGridInfinite";
 import { BookSearch } from "@/components/BookSearch";
+import { LibraryConfigPanel } from "@/components/LibraryConfigPanel";
 import { useState, useCallback, useEffect, useRef } from "react";
 import { BookOpen, Users, Layers, Library, LayoutGrid, List, Settings } from "lucide-react";
-import { useLibraryStats, useTags, type SortConfig, type SortField } from "@/hooks/useBooksInfinite";
+import { useLibraryConfig, useLibraryStats, useTags, type SortConfig, type SortField } from "@/hooks/useBooksInfinite";
 import { UserMenu } from "@/components/UserMenu";
 import { TagFilter } from "@/components/TagFilter";
 import { RecentlyRead } from "@/components/RecentlyRead";
@@ -31,14 +32,47 @@ function loadUIState(): UIState {
   };
   try {
     const saved = sessionStorage.getItem(STORAGE_KEY);
-    if (!saved) return defaults;
-    const parsed = JSON.parse(saved) as Partial<UIState>;
-    return {
-      ...defaults,
-      ...parsed,
+    const parsed = saved ? (JSON.parse(saved) as Partial<UIState>) : {};
+    const savedState: UIState = {
+      view: parsed.view === "list" || parsed.view === "grid" ? parsed.view : defaults.view,
+      sort: {
+        field:
+          parsed.sort?.field === "title" ||
+          parsed.sort?.field === "author" ||
+          parsed.sort?.field === "added" ||
+          parsed.sort?.field === "rating"
+            ? parsed.sort.field
+            : defaults.sort.field,
+        order: parsed.sort?.order === "asc" || parsed.sort?.order === "desc" ? parsed.sort.order : defaults.sort.order,
+      },
+      search: typeof parsed.search === "string" ? parsed.search : defaults.search,
       tags: Array.isArray(parsed.tags)
-        ? parsed.tags.filter((id) => typeof id === "number" && id > 0)
-        : [],
+        ? parsed.tags.filter((id) => typeof id === "number" && Number.isSafeInteger(id) && id > 0)
+        : defaults.tags,
+    };
+
+    const url = new URL(window.location.href);
+    const urlView = url.searchParams.get("view");
+    const urlSortField = url.searchParams.get("sortBy");
+    const urlSortOrder = url.searchParams.get("sortOrder");
+    const urlTags = url.searchParams.getAll("tag");
+    return {
+      ...savedState,
+      view: urlView === "list" || urlView === "grid" ? urlView : savedState.view,
+      search: url.searchParams.has("q") ? url.searchParams.get("q") || "" : savedState.search,
+      sort: {
+        field:
+          urlSortField === "title" ||
+          urlSortField === "author" ||
+          urlSortField === "added" ||
+          urlSortField === "rating"
+            ? urlSortField
+            : savedState.sort.field,
+        order: urlSortOrder === "asc" || urlSortOrder === "desc" ? urlSortOrder : savedState.sort.order,
+      },
+      tags: urlTags.length
+        ? urlTags.filter((id) => /^\d+$/.test(id) && Number(id) > 0).map(Number)
+        : savedState.tags,
     };
   } catch {
     return defaults;
@@ -142,13 +176,23 @@ function IndexComponent() {
     }
   }, []);
 
-  const { data: stats, isLoading: statsLoading } = useLibraryStats();
-  const { data: tags, isLoading: tagsLoading } = useTags();
+  const { data: libraryConfig, error: libraryConfigError, isLoading: libraryConfigLoading, refetch: refetchLibraryConfig } = useLibraryConfig();
+  const libraryReady = libraryConfig?.ready === true;
+  const { data: stats, isLoading: statsLoading } = useLibraryStats(libraryReady);
+  const { data: tags, isLoading: tagsLoading } = useTags(libraryReady);
+
+  if (libraryConfigLoading || !libraryConfig) {
+    return <LibraryOnboarding isLoading error={libraryConfigError instanceof Error ? libraryConfigError.message : null} onRetry={() => refetchLibraryConfig()} />;
+  }
+
+  if (!libraryReady) {
+    return <LibraryOnboarding error={libraryConfigError instanceof Error ? libraryConfigError.message : null} onRetry={() => refetchLibraryConfig()} />;
+  }
 
   return (
     <div className="min-h-screen bg-parchment paper-texture">
       {/* Main Content - Unified Scroll */}
-      <main className="max-w-7xl mx-auto px-3 sm:px-6 pt-4 sm:pt-8 pb-10">
+      <main id="main-content" className="max-w-7xl mx-auto px-3 sm:px-6 pt-4 sm:pt-8 pb-10">
         {/* Welcome Section */}
         <div className="mb-3 sm:mb-6">
           <div className="flex items-center gap-2 sm:gap-3 mb-1 sm:mb-2">
@@ -213,7 +257,8 @@ function IndexComponent() {
                 type="button"
                 onClick={() => setViewMode("list")}
                 aria-pressed={viewMode === "list"}
-                className={`p-2 transition-colors ${viewMode === "list" ? "bg-ink text-white" : "bg-white text-ink-muted hover:text-ink"}`}
+                aria-label="List view"
+                className={`p-2 transition-colors ${viewMode === "list" ? "bg-ink text-white" : "bg-surface text-ink-muted hover:text-ink"}`}
                 title="List view"
               >
                 <List className="h-4 w-4" strokeWidth={1.5} />
@@ -222,7 +267,8 @@ function IndexComponent() {
                 type="button"
                 onClick={() => setViewMode("grid")}
                 aria-pressed={viewMode === "grid"}
-                className={`p-2 transition-colors ${viewMode === "grid" ? "bg-ink text-white" : "bg-white text-ink-muted hover:text-ink"}`}
+                aria-label="Grid view"
+                className={`p-2 transition-colors ${viewMode === "grid" ? "bg-ink text-white" : "bg-surface text-ink-muted hover:text-ink"}`}
                 title="Grid view"
               >
                 <LayoutGrid className="h-4 w-4" strokeWidth={1.5} />
@@ -242,27 +288,74 @@ function IndexComponent() {
             </div>
 
             {/* Table Section */}
-            <div className="bg-white border-x border-b border-ink rounded-b-lg shadow-sm">
+            <div className="bg-surface border-x border-b border-ink rounded-b-lg shadow-sm">
               <BookTableInfinite searchQuery={searchQuery} sortConfig={sortConfig} tagIds={uiState.tags} />
             </div>
           </>
         )}
 
         {viewMode === "grid" && (
-          <div className="bg-white border-x border-b border-ink rounded-b-lg shadow-sm pt-4">
+          <div className="bg-surface border-x border-b border-ink rounded-b-lg shadow-sm pt-4">
             <BookGridInfinite searchQuery={searchQuery} sortConfig={sortConfig} tagIds={uiState.tags} />
           </div>
         )}
       </main>
 
       {/* Footer */}
-      <footer className="border-t border-ink bg-white">
+      <footer className="border-t border-ink bg-surface">
         <div className="max-w-7xl mx-auto px-6 py-8">
           <div className="ornament text-ink-muted">
             <span className="text-sm">Caliber Library Manager</span>
           </div>
         </div>
       </footer>
+    </div>
+  );
+}
+
+function LibraryOnboarding({
+  isLoading = false,
+  error,
+  onRetry,
+}: {
+  isLoading?: boolean;
+  error: string | null;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="min-h-screen bg-parchment paper-texture">
+      <main id="main-content" className="max-w-xl mx-auto px-4 sm:px-6 pt-12 sm:pt-24 pb-16">
+        <div className="flex items-center gap-3 mb-8">
+          <div className="w-10 h-10 bg-ink rounded-xl flex items-center justify-center">
+            <Library className="h-5 w-5 text-white" strokeWidth={1.5} />
+          </div>
+          <div>
+            <p className="text-xs uppercase tracking-[0.18em] text-ink-tertiary">Welcome to</p>
+            <h1 className="text-2xl font-semibold text-ink tracking-tight">Caliber</h1>
+          </div>
+        </div>
+        <div className="mb-5">
+          <h2 className="text-3xl sm:text-4xl font-semibold text-ink tracking-tight">Connect your library</h2>
+          <p className="text-sm text-ink-tertiary mt-2 max-w-lg">
+            Caliber reads your Calibre library without changing it. Choose a database to get started, and Caliber will keep its local copy in sync while it is running.
+          </p>
+        </div>
+        {isLoading && (
+          <output className="block text-sm text-ink-tertiary mb-4" aria-live="polite">
+            Checking the default Calibre location…
+          </output>
+        )}
+        {error && (
+          <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" role="alert">
+            {error}
+            <button type="button" className="ml-2 underline" onClick={onRetry}>Try again</button>
+          </div>
+        )}
+        <LibraryConfigPanel onboarding />
+        <p className="text-xs text-ink-tertiary mt-4">
+          Looking for the default? Calibre usually stores it at <span className="font-mono">~/Calibre Library/metadata.db</span> on macOS and Linux, and in your user Documents folder on Windows.
+        </p>
+      </main>
     </div>
   );
 }

@@ -69,8 +69,10 @@ const BookCover = memo(function BookCover({
           <img
             src={`/api/books/${bookId}/cover`}
             alt={title}
+            width={480}
+            height={720}
             className={cn(
-              "w-full aspect-[2/3] object-cover transition-all duration-500",
+              "w-full aspect-[2/3] object-cover transition-[filter,opacity] duration-500",
               isLoaded ? "opacity-100 scale-100" : "opacity-0 scale-105",
             )}
             loading="eager"
@@ -165,7 +167,7 @@ const FormatButton = memo(function FormatButton({
       variant="outline"
       size="sm"
       onClick={handleDownload}
-      className="group bg-foreground hover:bg-accent text-background hover:text-white border-foreground hover:border-accent transition-all duration-150 rounded text-xs uppercase tracking-wider font-semibold"
+      className="group bg-foreground hover:bg-accent text-background hover:text-white border-foreground hover:border-accent transition-[background-color,border-color,color] duration-150 rounded text-xs uppercase tracking-wider font-semibold"
     >
       <span className="flex items-center gap-2">
         <Download className="h-3.5 w-3.5" strokeWidth={2} />
@@ -244,7 +246,7 @@ export function BookDetail({ bookId }: BookDetailProps) {
       <div className="min-h-[60vh] flex items-center justify-center">
         <div className="flex flex-col items-center gap-3">
           <div className="h-8 w-8 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
-          <p className="text-sm text-ink-muted">Loading...</p>
+          <p className="text-sm text-ink-muted">Loading…</p>
         </div>
       </div>
     );
@@ -310,7 +312,7 @@ export function BookDetail({ bookId }: BookDetailProps) {
                         <Button
                           variant="outline"
                           size="sm"
-                          className="group bg-primary hover:bg-primary/90 border-primary text-primary-foreground transition-all duration-150 rounded text-xs uppercase tracking-wider font-semibold cursor-pointer"
+                          className="group bg-primary hover:bg-primary/90 border-primary text-primary-foreground transition-[background-color,border-color,color] duration-150 rounded text-xs uppercase tracking-wider font-semibold cursor-pointer"
                         >
                           <span className="flex items-center gap-2">
                             <BookOpen className="h-3.5 w-3.5" strokeWidth={2} />

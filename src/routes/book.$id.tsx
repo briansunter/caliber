@@ -23,7 +23,7 @@ function BookDetailPage() {
   return (
     <div className="min-h-screen bg-parchment paper-texture">
       {/* Header */}
-      <header className="border-b border-ink bg-white/90 backdrop-blur-sm sticky top-0 z-50">
+      <header className="border-b border-ink bg-surface/90 backdrop-blur-sm sticky top-0 z-50">
         <div className="max-w-6xl mx-auto px-6">
           <div className="flex items-center justify-between h-16">
             {/* Back navigation */}
@@ -31,6 +31,7 @@ function BookDetailPage() {
               variant="ghost"
               size="sm"
               onClick={handleBack}
+              aria-label="Back to library"
               className="group gap-2 text-ink-muted hover:text-ink transition-colors bg-transparent hover:bg-parchment-dark cursor-pointer"
             >
               <div className="flex items-center justify-center w-8 h-8 rounded bg-parchment-dark group-hover:bg-parchment-warm transition-colors border border-ink">
@@ -54,12 +55,12 @@ function BookDetailPage() {
       </header>
 
       {/* Main content */}
-      <main className="max-w-6xl mx-auto px-6 py-10 lg:py-14">
+      <main id="main-content" className="max-w-6xl mx-auto px-6 py-10 lg:py-14">
         <BookDetail bookId={bookId} />
       </main>
 
       {/* Footer */}
-      <footer className="border-t border-ink mt-auto bg-white">
+      <footer className="border-t border-ink mt-auto bg-surface">
         <div className="max-w-6xl mx-auto px-6 py-8">
           <div className="ornament text-ink-muted">
             <span className="text-sm">Caliber Library Manager</span>

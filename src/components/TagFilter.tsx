@@ -99,7 +99,7 @@ export const TagFilter = memo(function TagFilter({
           "inline-flex items-center justify-center gap-1.5 rounded-lg border px-3 sm:px-3.5 h-10 sm:h-[46px] min-w-[44px] text-sm font-medium transition-colors",
           active
             ? "bg-accent text-white border-accent"
-            : "bg-white text-ink-secondary border-ink hover:text-ink",
+            : "bg-surface text-ink-secondary border-ink hover:text-ink",
         )}
       >
         <Tags className="h-4 w-4" strokeWidth={1.75} />
@@ -128,7 +128,7 @@ export const TagFilter = memo(function TagFilter({
             role="dialog"
             aria-label="Filter by tags"
             className={cn(
-              "fixed inset-x-0 bottom-0 z-50 flex flex-col bg-white border border-ink shadow-xl",
+              "fixed inset-x-0 bottom-0 z-50 flex flex-col bg-surface border border-ink shadow-xl",
               "rounded-t-2xl md:rounded-lg",
               "max-h-[85vh] md:max-h-[30rem] md:w-80",
               "md:absolute md:right-0 md:left-auto md:bottom-auto md:top-full md:mt-2",
@@ -180,6 +180,8 @@ export const TagFilter = memo(function TagFilter({
                 <input
                   ref={inputRef}
                   type="text"
+                  name="tag-filter"
+                  autoComplete="off"
                   value={filter}
                   onChange={(e) => setFilter(e.target.value)}
                   placeholder="Filter tags…"
@@ -227,7 +229,7 @@ export const TagFilter = memo(function TagFilter({
                             "inline-flex items-center gap-1.5 min-h-[36px] px-3 py-1.5 rounded-full text-sm font-medium border transition-colors",
                             selected
                               ? "bg-accent text-white border-accent"
-                              : "bg-white text-ink-secondary border-ink hover:border-accent hover:text-ink",
+                              : "bg-surface text-ink-secondary border-ink hover:border-accent hover:text-ink",
                           )}
                         >
                           {selected ? (

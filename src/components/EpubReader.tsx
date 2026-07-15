@@ -22,7 +22,6 @@ import { useFullscreen } from "@/lib/use-fullscreen";
 import { fetchBookProgress, saveBookProgress } from "@/lib/reading-progress";
 import {
   getNextReaderLoadMode,
-  replaceReaderLoadModeInUrl,
   type ReaderLoadMode,
 } from "./reader-types";
 
@@ -303,7 +302,6 @@ export function EpubReader({
   }, []);
   const toggleLoadMode = useCallback(() => {
     const nextMode = getNextReaderLoadMode(loadMode);
-    replaceReaderLoadModeInUrl(nextMode);
     setLoadMode(nextMode);
   }, [loadMode]);
 
@@ -365,7 +363,6 @@ export function EpubReader({
             if (!html) throw new Error("Invalid EPUB archive");
             if (!cancelled) {
               setLoadMode("full");
-              replaceReaderLoadModeInUrl("full");
               setHtmlDocument(html);
               setIsLoading(false);
             }
@@ -648,7 +645,7 @@ export function EpubReader({
               style={{ color: fg }}
             />
             <p className="text-sm" style={{ color: fg, opacity: 0.6 }}>
-              {loadMode === "stream" ? "Streaming book..." : "Loading book..."}
+              {loadMode === "stream" ? "Streaming book…" : "Loading book…"}
             </p>
           </div>
         </div>
@@ -677,7 +674,7 @@ export function EpubReader({
 
       {/* Header */}
       <div
-        className="shrink-0 z-[108] transition-all duration-200"
+        className="shrink-0 z-[108] transition-transform duration-200"
         style={{
           transform: showUI ? "translateY(0)" : "translateY(-100%)",
           background: barBg,
@@ -690,6 +687,8 @@ export function EpubReader({
           <button
             type="button"
             onClick={onBack}
+            aria-label="Back to book"
+            title="Back to book"
             className="p-2 -ml-1 rounded-lg active:opacity-60"
             style={{ color: fg }}
           >
@@ -733,6 +732,8 @@ export function EpubReader({
                 setShowToc(true);
                 setShowSettings(false);
               }}
+              aria-label="Table of contents"
+              title="Table of contents"
               className="p-2 rounded-lg active:opacity-60"
               style={{ color: fg }}
             >
@@ -741,6 +742,8 @@ export function EpubReader({
             <button
               type="button"
               onClick={() => setShowSettings((s) => !s)}
+              aria-label="Reader settings"
+              title="Reader settings"
               className="p-2 -mr-1 rounded-lg active:opacity-60"
               style={{ color: fg }}
             >
@@ -800,7 +803,7 @@ export function EpubReader({
 
       {/* Footer */}
       <div
-        className="shrink-0 z-[108] transition-all duration-200"
+        className="shrink-0 z-[108] transition-transform duration-200"
         style={{
           transform: showUI ? "translateY(0)" : "translateY(100%)",
           background: barBg,
@@ -812,7 +815,7 @@ export function EpubReader({
         <div className="px-4 py-3">
           <div className="w-full h-1 rounded-full" style={{ background: subtle }}>
             <div
-              className="h-full rounded-full transition-all duration-500"
+              className="h-full rounded-full transition-[width] duration-500"
               style={{
                 width: `${progress}%`,
                 background: isDark ? "rgba(255,255,255,0.5)" : "rgba(0,0,0,0.35)",
@@ -858,6 +861,8 @@ export function EpubReader({
                   <button
                     type="button"
                     onClick={() => setFontSize((s) => Math.max(60, s - 10))}
+                    aria-label="Decrease font size"
+                    title="Decrease font size"
                     className="w-9 h-9 rounded-full flex items-center justify-center border active:opacity-60"
                     style={{ color: fg, borderColor: subtle }}
                   >
@@ -869,6 +874,8 @@ export function EpubReader({
                   <button
                     type="button"
                     onClick={() => setFontSize((s) => Math.min(200, s + 10))}
+                    aria-label="Increase font size"
+                    title="Increase font size"
                     className="w-9 h-9 rounded-full flex items-center justify-center border active:opacity-60"
                     style={{ color: fg, borderColor: subtle }}
                   >
@@ -888,7 +895,8 @@ export function EpubReader({
                       type="button"
                       key={t}
                       onClick={() => setTheme(t)}
-                      className="w-10 h-10 rounded-full border-2 transition-all active:scale-95"
+                      aria-label={`${t.charAt(0).toUpperCase() + t.slice(1)} theme`}
+                      className="w-10 h-10 rounded-full border-2 transition-[box-shadow,border-color,transform] active:scale-95"
                       style={{
                         background: BG[t],
                         borderColor: theme === t ? "#3b82f6" : subtle,

@@ -666,6 +666,9 @@ async function main(): Promise<void> {
   const parsed = parseArgs(Bun.argv.slice(2));
 
   try {
+    // Every command may be the first process touching the library. Ensure the
+    // writable snapshot and FTS table exist before command handlers query it.
+    if (parsed.command && parsed.command !== "init-fts") initFTS();
     await runCommand(parsed);
   } catch (error) {
     if (error instanceof CLIError) {
