@@ -31,6 +31,20 @@ For a scripted or headless setup:
 CALIBRE_LIBRARY_PATH="/path/to/Calibre Library" bun dev
 ```
 
+To run the published app with Bun and open it in your default browser automatically:
+
+```bash
+bunx caliber-app
+```
+
+Set the library path when it is not in the default location:
+
+```bash
+CALIBRE_LIBRARY_PATH="/path/to/Calibre Library" bunx caliber-app
+```
+
+Use `--no-open` or `CALIBER_OPEN_BROWSER=false` for headless environments.
+
 Caliber binds to `127.0.0.1` by default. If you intentionally expose it on another interface, set `CALIBER_HOST` and put it behind authentication and HTTPS; the username prompt is a local reading-progress profile, not authentication.
 
 ## Configuration
