@@ -1,8 +1,10 @@
 {
-  "name": "caliber",
+  "name": "caliber-app",
   "version": "0.1.0",
   "description": "A fast local web interface for browsing, reading, and downloading Calibre libraries.",
-  "private": true,
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "scripts": {
     "dev": "bun --hot src/index.ts",
@@ -10,7 +12,7 @@
     "cli": "bun src/cli.ts",
     "test": "bun test",
     "build": "bun run build.ts",
-    "typecheck": "bun x tsc --noEmit",
+    "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit",
     "lint": "biome lint .",
     "format": "biome format --write .",
     "check": "bun test && bun run typecheck && bun run lint && bun run build"

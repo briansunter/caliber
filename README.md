@@ -107,6 +107,15 @@ bun run build       # production frontend bundle
 
 The production server runs from `src/index.ts` so the Bun runtime can continue to serve the generated HTML entrypoint and reader assets. `dist/` is a frontend build artifact and is intentionally ignored.
 
+## Releases
+
+Release Please runs on pushes to `master`. It opens a release PR from conventional commits; after that PR is merged, the workflow creates the GitHub release and publishes the `caliber-app` package to npm.
+
+Configure these GitHub Actions secrets for npm publishing:
+
+- `BWS_ACCESS_TOKEN` — Bitwarden Secrets Manager access token
+- `BWS_NPM_TOKEN_SECRET_ID` — Bitwarden secret ID containing the npm token
+
 ## License
 
 [MIT](LICENSE)
