@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/briansunter/caliber/compare/v0.1.4...v0.1.5) (2026-07-15)
+
+
+### Bug Fixes
+
+* wait for frontend before opening browser ([eae680e](https://github.com/briansunter/caliber/commit/eae680e61f3b6a06ec9cdbceca97b24b7206941a))
+
 ## [0.1.4](https://github.com/briansunter/caliber/compare/v0.1.3...v0.1.4) (2026-07-15)
 
 
