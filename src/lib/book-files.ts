@@ -52,11 +52,22 @@ export function canReadInBrowser(format: string): boolean {
 }
 
 export function getSafeBookFilename(title: string | null | undefined, format: string): string {
+  const normalizedTitle = title?.normalize("NFKC");
+  const printableTitle = normalizedTitle
+    ? Array.from(normalizedTitle)
+        .filter((character) => {
+          const codePoint = character.codePointAt(0) ?? 0;
+          return character !== "/" && character !== "\\" && codePoint >= 32 && codePoint !== 127;
+        })
+        .join("")
+    : "";
   const safeTitle =
-    title
-      ?.replace(/[^a-zA-Z0-9\s-]/g, "")
+    printableTitle
+      .replace(/[?%*:|"<>]/g, "-")
       .trim()
-      .replace(/\s+/g, "_") || "book";
+      .replace(/\s+/g, "_")
+      .replace(/^\.+$/, "")
+      .slice(0, 160) || "book";
 
   return `${safeTitle}.${format.toLowerCase()}`;
 }

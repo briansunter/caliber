@@ -6,7 +6,7 @@
 // stores the username in a cookie and resolves it to a row here.
 
 import { Database } from "bun:sqlite";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { mkdirSync } from "node:fs";
 import { CONFIG_DIR_PATH } from "./config";
 
@@ -34,6 +34,7 @@ let db: Database | null = null;
 function getDb(): Database {
   if (db) return db;
   mkdirSync(CONFIG_DIR_PATH, { recursive: true });
+  mkdirSync(dirname(USER_DB_PATH), { recursive: true });
   const database = new Database(USER_DB_PATH);
   database.exec("PRAGMA journal_mode = WAL;");
   database.exec("PRAGMA busy_timeout = 5000;");
@@ -168,12 +169,13 @@ export function getProgress(userId: number, bookId: number): ProgressRow | null 
 }
 
 export function listProgress(userId: number, limit = 500): ProgressRow[] {
+  const cappedLimit = Math.min(500, Math.max(1, Math.floor(limit) || 1));
   const rows = getDb()
     .query(
       `SELECT ${PROGRESS_COLUMNS} FROM progress
        WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?`,
     )
-    .all(userId, limit) as Parameters<typeof rowToProgress>[0][];
+    .all(userId, cappedLimit) as Parameters<typeof rowToProgress>[0][];
   return rows.map(rowToProgress);
 }
 

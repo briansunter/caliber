@@ -1,5 +1,6 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { ArrowLeft, RotateCcw, Settings as SettingsIcon } from "lucide-react";
+import { LibraryConfigPanel } from "@/components/LibraryConfigPanel";
 import {
   DEFAULT_READER_SETTINGS,
   READER_SETTINGS_LIMITS,
@@ -33,19 +34,25 @@ function SliderRow({
   format,
   onChange,
 }: SliderRowProps) {
+  const inputId = `set-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+  const descriptionId = `${inputId}-description`;
   return (
     <div className="py-4 border-b border-ink/10 last:border-b-0">
       <div className="flex items-center justify-between gap-4">
-        <label className="text-sm font-medium text-ink" htmlFor={`set-${label}`}>
+        <label className="text-sm font-medium text-ink" htmlFor={inputId}>
           {label}
         </label>
         <span className="text-sm font-semibold text-accent tabular-nums shrink-0">
           {format ? format(value) : value}
         </span>
       </div>
-      <p className="text-xs text-ink-tertiary mt-1 mb-3 max-w-xl">{description}</p>
+      <p id={descriptionId} className="text-xs text-ink-tertiary mt-1 mb-3 max-w-xl">
+        {description}
+      </p>
       <input
-        id={`set-${label}`}
+        id={inputId}
+        name={inputId}
+        aria-describedby={descriptionId}
         type="range"
         min={min}
         max={max}
@@ -67,7 +74,7 @@ function SettingsComponent() {
 
   return (
     <div className="min-h-screen bg-parchment paper-texture">
-      <main className="max-w-2xl mx-auto px-4 sm:px-6 pt-6 sm:pt-10 pb-16">
+      <main id="main-content" className="max-w-2xl mx-auto px-4 sm:px-6 pt-6 sm:pt-10 pb-16">
         {/* Header */}
         <div className="flex items-center gap-3 mb-6">
           <Link
@@ -83,8 +90,10 @@ function SettingsComponent() {
           <h1 className="text-xl sm:text-2xl font-semibold text-ink tracking-tight">Settings</h1>
         </div>
 
+        <LibraryConfigPanel />
+
         {/* Reader memory section */}
-        <section className="bg-white border border-ink rounded-lg shadow-sm p-4 sm:p-6">
+        <section className="bg-surface border border-ink rounded-lg shadow-sm p-4 sm:p-6">
           <div className="mb-2">
             <h2 className="text-base font-semibold text-ink">Reader performance</h2>
             <p className="text-xs text-ink-tertiary mt-1 max-w-xl">
@@ -142,7 +151,7 @@ function SettingsComponent() {
                   className={`px-4 py-1.5 text-sm capitalize transition-colors ${
                     settings.defaultLoadMode === mode
                       ? "bg-ink text-white"
-                      : "bg-white text-ink-muted hover:text-ink"
+                      : "bg-surface text-ink-muted hover:text-ink"
                   }`}
                 >
                   {mode}

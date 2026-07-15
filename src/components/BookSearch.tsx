@@ -39,8 +39,11 @@ export const BookSearch = memo(function BookSearch({
         strokeWidth={1.5}
       />
       <input
-        type="text"
-        placeholder="Search books..."
+        type="search"
+        name="q"
+        autoComplete="off"
+        inputMode="search"
+        placeholder="Search books…"
         value={inputValue}
         onChange={handleChange}
         className="input pl-9 sm:pl-11 pr-9 sm:pr-11 py-2 sm:py-3 text-base"

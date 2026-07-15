@@ -11,6 +11,8 @@ initFTS();
 
 async function main() {
   const decoder = new TextDecoder();
+  const maxFrameBytes = 1024 * 1024;
+  let pending = "";
 
   const stdin = Bun.stdin.stream();
   const reader = stdin.getReader();
@@ -19,10 +21,24 @@ async function main() {
     const { done, value } = await reader.read();
     if (done) break;
 
-    const text = decoder.decode(value);
-    const lines = text.split("\n").filter((line) => line.trim());
+    pending += decoder.decode(value, { stream: true });
+    if (new TextEncoder().encode(pending).byteLength > maxFrameBytes) {
+      process.stdout.write(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32600, message: "Request frame is too large" },
+        })}\n`,
+      );
+      pending = "";
+      continue;
+    }
+
+    const lines = pending.split("\n");
+    pending = lines.pop() ?? "";
 
     for (const line of lines) {
+      if (!line.trim()) continue;
       try {
         const request = JSON.parse(line) as MCPRequest;
         const response = await handleJSONRPC(request);
@@ -41,6 +57,24 @@ async function main() {
         };
         process.stdout.write(`${JSON.stringify(errorResponse)}\n`);
       }
+    }
+  }
+
+  pending += decoder.decode();
+  if (pending.trim()) {
+    try {
+      const request = JSON.parse(pending) as MCPRequest;
+      const response = await handleJSONRPC(request);
+      if (response !== null) process.stdout.write(`${JSON.stringify(response)}\n`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      process.stdout.write(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32700, message: `Parse error: ${message}` },
+        })}\n`,
+      );
     }
   }
 }

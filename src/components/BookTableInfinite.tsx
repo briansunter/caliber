@@ -14,7 +14,7 @@ import {
   ArrowUpDown,
 } from "lucide-react";
 import { isUnknownAuthor } from "@/lib/utils";
-import { CoverFallback } from "./CoverFallback";
+import { BookCoverImage } from "./BookCoverImage";
 
 interface BookTableInfiniteProps {
   searchQuery: string;
@@ -70,7 +70,13 @@ const StarRating = memo(function StarRating({ rating }: { rating?: number | null
     }
   }
 
-  return <div className="flex items-center gap-0.5">{stars}</div>;
+  return (
+    <div className="flex items-center gap-0.5" role="img" aria-label={`${rating} out of 10`}>
+      <span aria-hidden="true" className="flex items-center gap-0.5">
+        {stars}
+      </span>
+    </div>
+  );
 });
 
 // Cell components
@@ -91,18 +97,14 @@ const TitleCell = memo(function TitleCell({
       className="group flex items-center gap-3 min-w-0 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
     >
       <div className="relative flex-shrink-0 w-9 h-12 rounded bg-parchment-dark overflow-hidden flex items-center justify-center border border-ink">
-        {hasCover ? (
-          <img
-            src={`/api/books/${id}/thumb`}
-            alt={title}
-            loading="lazy"
-            decoding="async"
-            fetchPriority="low"
-            className="w-full h-full object-cover"
-          />
-        ) : (
-          <CoverFallback title={title} size="sm" />
-        )}
+        <BookCoverImage
+          bookId={id}
+          title={title}
+          hasCover={Boolean(hasCover)}
+          size="sm"
+          width={36}
+          height={48}
+        />
       </div>
       <span
         title={title}
@@ -390,7 +392,7 @@ export const TableHeader = memo(function TableHeader({
 });
 
 export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, sortConfig, tagIds }: BookTableInfiniteProps) {
-  const { books, hasNextPage, fetchNextPage, isFetchingNextPage, isLoading, isError, error } =
+  const { books, hasNextPage, fetchNextPage, isFetchingNextPage, isLoading, isError, error, refetch } =
     useFlattenedBooks(searchQuery, sortConfig, tagIds);
 
   // Set up window virtualizer - uses window scroll
@@ -399,6 +401,7 @@ export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, 
     estimateSize: useCallback(() => ROW_HEIGHT, []),
     overscan: 20,
     scrollPaddingStart: 200,
+    useFlushSync: false,
   });
 
   const virtualItems = virtualizer.getVirtualItems();
@@ -459,6 +462,13 @@ export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, 
         <p className="text-sm text-ink-tertiary">
           {error instanceof Error ? error.message : "Unknown error"}
         </p>
+        <button
+          type="button"
+          onClick={() => refetch()}
+          className="mt-3 rounded-lg border border-ink px-3 py-1.5 text-sm font-medium text-ink hover:bg-parchment-dark"
+        >
+          Try again
+        </button>
       </div>
     );
   }
@@ -494,10 +504,10 @@ export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, 
 
       {/* Loading indicator at bottom */}
       {isFetchingNextPage && (
-        <div className="flex items-center justify-center py-4 border-t border-parchment">
+        <div className="flex items-center justify-center py-4 border-t border-parchment" aria-live="polite">
           <div className="flex items-center gap-2 text-ink-muted">
             <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
-            <span className="text-sm">Loading more...</span>
+            <span className="text-sm">Loading more…</span>
           </div>
         </div>
       )}

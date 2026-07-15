@@ -1,5 +1,5 @@
 import JSZip from "jszip";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { dirname, join, normalize, sep } from "node:path";
 import { CONFIG_DIR_PATH } from "./config";
 import { getBookFormatPath } from "./calibre-optimized";
@@ -8,6 +8,8 @@ import { type SourceSignature, getSourceSignature, isSameSignature } from "./fil
 const EPUB_CACHE_DIR = join(CONFIG_DIR_PATH, "epub-cache");
 const CACHE_META_FILE = ".caliber-epub-cache.json";
 const MAX_OPEN_EPUBS = 3;
+const MAX_EPUB_BYTES = 256 * 1024 * 1024;
+const MAX_EPUB_ENTRY_BYTES = 32 * 1024 * 1024;
 
 export class EpubCacheError extends Error {
   constructor(
@@ -76,10 +78,14 @@ async function getOpenEpub(epubPath: string, signature: SourceSignature): Promis
   openEpubs.delete(epubPath);
 
   try {
+    if (statSync(epubPath).size > MAX_EPUB_BYTES) {
+      throw new EpubCacheError("EPUB file is too large", 413, "epub_too_large");
+    }
     const zip = await JSZip.loadAsync(await Bun.file(epubPath).arrayBuffer());
     rememberOpenEpub(epubPath, { signature, zip });
     return zip;
-  } catch {
+  } catch (error) {
+    if (error instanceof EpubCacheError) throw error;
     throw new EpubCacheError("Invalid EPUB archive", 422, "invalid_epub");
   }
 }
@@ -135,8 +141,18 @@ async function extractEpubEntry(
   const entry = zip.files[entryPath];
   if (!entry || entry.dir) return null;
 
+  const uncompressedSize = (entry as { _data?: { uncompressedSize?: number } })._data
+    ?.uncompressedSize;
+  if (uncompressedSize && uncompressedSize > MAX_EPUB_ENTRY_BYTES) {
+    throw new EpubCacheError("EPUB resource is too large", 413, "entry_too_large");
+  }
+
   mkdirSync(dirname(target), { recursive: true });
-  await Bun.write(target, await entry.async("uint8array"));
+  const data = await entry.async("uint8array");
+  if (data.byteLength > MAX_EPUB_ENTRY_BYTES) {
+    throw new EpubCacheError("EPUB resource is too large", 413, "entry_too_large");
+  }
+  await Bun.write(target, data);
   await Bun.write(join(cacheDir, CACHE_META_FILE), `${JSON.stringify(signature)}\n`);
 
   return target;
@@ -146,10 +162,17 @@ export async function getEpubEntryPath(bookId: number, entryPath: string): Promi
   const cache = await ensureEpubCache(bookId);
   if (!cache) return null;
 
+  let decodedPath: string;
+  try {
+    decodedPath = decodeURIComponent(entryPath);
+  } catch {
+    throw new EpubCacheError("Invalid EPUB entry path", 400, "invalid_path");
+  }
+
   return extractEpubEntry(
     cache.epubPath,
     cache.cacheDir,
-    decodeURIComponent(entryPath),
+    decodedPath,
     cache.signature,
   );
 }

@@ -1,6 +1,6 @@
 import JSZip from "jszip";
 import { createExtractorFromData } from "node-unrar-js/esm";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { basename, extname, join } from "node:path";
 import { CONFIG_DIR_PATH } from "./config";
 import { getBookFormatPath } from "./calibre-optimized";
@@ -10,6 +10,10 @@ import { type SourceSignature, getSourceSignature, isSameSignature } from "./fil
 const PAGE_CACHE_DIR = join(CONFIG_DIR_PATH, "page-cache");
 const CACHE_META_FILE = ".caliber-page-cache.json";
 const IMAGE_EXTENSIONS = new Set([".avif", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"]);
+const MAX_ARCHIVE_BYTES = 512 * 1024 * 1024;
+const MAX_PAGE_COUNT = 10_000;
+const MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024;
+const COMMAND_TIMEOUT_MS = 30_000;
 
 interface CachedPage {
   index: number;
@@ -87,6 +91,13 @@ function getSourcePath(bookId: number, format: string): string {
   return sourcePath;
 }
 
+function assertArchiveSize(sourcePath: string): void {
+  const size = statSync(sourcePath).size;
+  if (size > MAX_ARCHIVE_BYTES) {
+    throw new PageStreamingError(413, "Reader source file is too large");
+  }
+}
+
 function normalizePageNumber(page: number, pageCount: number): number {
   if (!Number.isInteger(page) || page < 1 || page > pageCount) {
     throw new PageStreamingError(404, "Page not found");
@@ -102,6 +113,7 @@ function sortPageNames(a: string, b: string): number {
 async function ensureCbzCache(bookId: number): Promise<{ cacheDir: string; meta: PageCacheMeta }> {
   const format = "CBZ";
   const sourcePath = getSourcePath(bookId, format);
+  assertArchiveSize(sourcePath);
   const source = getSourceSignature(sourcePath);
   const cacheDir = getCacheDir(bookId, format);
   const metaPath = join(cacheDir, CACHE_META_FILE);
@@ -135,14 +147,23 @@ async function ensureCbzCache(bookId: number): Promise<{ cacheDir: string; meta:
   if (imageEntries.length === 0) {
     throw new PageStreamingError(422, "CBZ contains no image pages");
   }
+  if (imageEntries.length > MAX_PAGE_COUNT) {
+    throw new PageStreamingError(413, "CBZ contains too many pages");
+  }
 
   const pages: CachedPage[] = [];
+  let extractedBytes = 0;
   for (const [offset, entry] of imageEntries.entries()) {
     const index = offset + 1;
     const ext = extname(entry.name).toLowerCase() || ".bin";
     const fileName = `${String(index).padStart(5, "0")}${ext}`;
     const outputPath = join(cacheDir, fileName);
-    await Bun.write(outputPath, await entry.async("uint8array"));
+    const data = await entry.async("uint8array");
+    extractedBytes += data.byteLength;
+    if (extractedBytes > MAX_CACHE_BYTES) {
+      throw new PageStreamingError(413, "CBZ expands beyond the reader cache limit");
+    }
+    await Bun.write(outputPath, data);
     pages.push({
       index,
       name: basename(entry.name),
@@ -170,6 +191,7 @@ async function getUnrarWasmBinary(): Promise<ArrayBuffer> {
 async function ensureCbrCache(bookId: number): Promise<{ cacheDir: string; meta: PageCacheMeta }> {
   const format = "CBR";
   const sourcePath = getSourcePath(bookId, format);
+  assertArchiveSize(sourcePath);
   const source = getSourceSignature(sourcePath);
   const cacheDir = getCacheDir(bookId, format);
   const metaPath = join(cacheDir, CACHE_META_FILE);
@@ -209,6 +231,9 @@ async function ensureCbrCache(bookId: number): Promise<{ cacheDir: string; meta:
   if (imageNames.length === 0) {
     throw new PageStreamingError(422, "CBR contains no image pages");
   }
+  if (imageNames.length > MAX_PAGE_COUNT) {
+    throw new PageStreamingError(413, "CBR contains too many pages");
+  }
 
   const imageNameSet = new Set(imageNames);
   const extracted = extractor.extract({ files: (header) => imageNameSet.has(header.name) });
@@ -220,9 +245,14 @@ async function ensureCbrCache(bookId: number): Promise<{ cacheDir: string; meta:
   }
 
   const pages: CachedPage[] = [];
+  let extractedBytes = 0;
   for (const [offset, name] of imageNames.entries()) {
     const data = extractedPages.get(name);
     if (!data) continue;
+    extractedBytes += data.byteLength;
+    if (extractedBytes > MAX_CACHE_BYTES) {
+      throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
+    }
 
     const index = offset + 1;
     const ext = extname(name).toLowerCase() || ".bin";
@@ -290,11 +320,25 @@ async function runCommand(command: string, args: string[]): Promise<{ stdout: st
 
   const pipeToText = (pipe: unknown) =>
     pipe instanceof ReadableStream ? new Response(pipe).text() : Promise.resolve("");
-  const [stdout, stderr, exitCode] = await Promise.all([
-    pipeToText(proc.stdout),
-    pipeToText(proc.stderr),
-    proc.exited,
-  ]);
+  const timeout = setTimeout(() => {
+    try {
+      proc.kill();
+    } catch {
+      // The process may have exited between the timeout firing and kill().
+    }
+  }, COMMAND_TIMEOUT_MS);
+  let stdout = "";
+  let stderr = "";
+  let exitCode = -1;
+  try {
+    [stdout, stderr, exitCode] = await Promise.all([
+      pipeToText(proc.stdout),
+      pipeToText(proc.stderr),
+      proc.exited,
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (exitCode !== 0) {
     const trimmed = stderr.trim();
@@ -313,7 +357,7 @@ async function getPdfPageCount(sourcePath: string): Promise<number> {
   }
 
   const pageCount = Number.parseInt(match[1], 10);
-  if (!Number.isFinite(pageCount) || pageCount < 1) {
+  if (!Number.isFinite(pageCount) || pageCount < 1 || pageCount > MAX_PAGE_COUNT) {
     throw new PageStreamingError(422, "Unable to read PDF page count");
   }
 
@@ -323,6 +367,7 @@ async function getPdfPageCount(sourcePath: string): Promise<number> {
 async function ensurePdfCache(bookId: number): Promise<{ cacheDir: string; sourcePath: string; source: SourceSignature; pageCount: number }> {
   const format = "PDF";
   const sourcePath = getSourcePath(bookId, format);
+  assertArchiveSize(sourcePath);
   const source = getSourceSignature(sourcePath);
   const cacheDir = getCacheDir(bookId, format);
   const metaPath = join(cacheDir, CACHE_META_FILE);

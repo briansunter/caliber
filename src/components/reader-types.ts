@@ -27,9 +27,3 @@ export function normalizeReaderLoadMode(value: string | null | undefined): Reade
 export function getNextReaderLoadMode(mode: ReaderLoadMode): ReaderLoadMode {
   return mode === "stream" ? "full" : "stream";
 }
-
-export function replaceReaderLoadModeInUrl(mode: ReaderLoadMode): void {
-  const url = new URL(window.location.href);
-  url.searchParams.set("mode", mode);
-  window.history.replaceState(window.history.state, "", url);
-}

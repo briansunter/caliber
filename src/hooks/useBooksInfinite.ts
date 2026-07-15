@@ -20,6 +20,19 @@ export interface TagSummary {
   bookCount: number;
 }
 
+export interface LibraryConfigStatus {
+  libraryPath: string;
+  dbName: string;
+  databasePath: string;
+  configuredDatabasePath: string;
+  defaultDatabasePath: string;
+  databaseExists: boolean;
+  configuredDatabaseExists: boolean;
+  environmentOverride: boolean;
+  configFilePath: string;
+  ready: boolean;
+}
+
 interface BooksResponse extends CursorPaginatedResult<BookListItem> {}
 
 function appendTagParams(params: URLSearchParams, tagIds: number[]): void {
@@ -85,6 +98,7 @@ async function searchBooks({
 export function useBooksInfinite(
   sortConfig: SortConfig = { field: "title", order: "asc" },
   tagIds: number[] = [],
+  enabled = true,
 ) {
   return useInfiniteQuery({
     queryKey: ["books", "infinite", sortConfig.field, sortConfig.order, tagIds],
@@ -98,6 +112,7 @@ export function useBooksInfinite(
       }),
     getNextPageParam: (lastPage) => lastPage.nextCursor,
     initialPageParam: undefined as string | undefined,
+    enabled,
     placeholderData: keepPreviousData,
     staleTime: 1000 * 60 * 5,
     gcTime: 1000 * 60 * 10,
@@ -110,6 +125,7 @@ export function useSearchInfinite(
   query: string,
   sortConfig: SortConfig = { field: "title", order: "asc" },
   tagIds: number[] = [],
+  enabled = query.trim().length > 0,
 ) {
   return useInfiniteQuery({
     queryKey: ["books", "search", "infinite", query, sortConfig.field, sortConfig.order, tagIds],
@@ -124,7 +140,7 @@ export function useSearchInfinite(
       }),
     getNextPageParam: (lastPage) => lastPage.nextCursor,
     initialPageParam: undefined as string | undefined,
-    enabled: query.trim().length > 0,
+    enabled,
     placeholderData: keepPreviousData,
     staleTime: 1000 * 60,
     gcTime: 1000 * 60 * 5,
@@ -139,8 +155,8 @@ export function useFlattenedBooks(
   tagIds: number[] = [],
 ) {
   const isSearching = searchQuery.trim().length > 0;
-  const booksQuery = useBooksInfinite(sortConfig, tagIds);
-  const searchQueryHook = useSearchInfinite(searchQuery, sortConfig, tagIds);
+  const booksQuery = useBooksInfinite(sortConfig, tagIds, !isSearching);
+  const searchQueryHook = useSearchInfinite(searchQuery, sortConfig, tagIds, isSearching);
   const query = isSearching ? searchQueryHook : booksQuery;
 
   const books = useMemo(() => {
@@ -155,11 +171,12 @@ export function useFlattenedBooks(
     isLoading: query.isLoading,
     isError: query.isError,
     error: query.error,
+    refetch: query.refetch,
   };
 }
 
 // Hook for library stats
-export function useLibraryStats() {
+export function useLibraryStats(enabled = true) {
   return useQuery({
     queryKey: ["stats"],
     queryFn: ({ signal }) =>
@@ -168,17 +185,28 @@ export function useLibraryStats() {
         totalAuthors: number;
         totalSeries: number;
         totalTags: number;
-      }>(`${API_BASE}/stats`, { signal }),
+    }>(`${API_BASE}/stats`, { signal }),
+    enabled,
     staleTime: 1000 * 60 * 5,
   });
 }
 
 // Hook for all tags with counts (tag filter UI)
-export function useTags() {
+export function useTags(enabled = true) {
   return useQuery({
     queryKey: ["tags"],
     queryFn: ({ signal }) => fetchJson<TagSummary[]>(`${API_BASE}/tags`, { signal }),
+    enabled,
     staleTime: 1000 * 60 * 10,
+  });
+}
+
+export function useLibraryConfig() {
+  return useQuery({
+    queryKey: ["library-config"],
+    queryFn: ({ signal }) => fetchJson<LibraryConfigStatus>(`${API_BASE}/config/library`, { signal }),
+    retry: false,
+    staleTime: 0,
   });
 }
 

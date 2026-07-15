@@ -1,34 +1,59 @@
 # Caliber
 
-A fast, modern web interface for browsing, reading, and downloading books from your [Calibre](https://calibre-ebook.com/) library. Optimized for large collections with 1M+ books.
+Caliber is a fast, local-first web interface for browsing, searching, reading, and downloading books from any [Calibre](https://calibre-ebook.com/) library. It uses cursor pagination and virtualized lists so large collections remain responsive.
 
-## Highlights
+## Features
 
-- **Fast** — cursor-based pagination instead of OFFSET queries, so browsing stays instant no matter how large your library gets
-- **Read in the browser** — built-in EPUB, PDF, CBZ, and CBR readers
-- **Download books** — access any format stored in your library
-- **OPDS catalog** — browse from OPDS-compatible reader apps with download and inline file links
-- **Modern UI** — infinite scroll, virtual rendering, responsive design
-- **Lightweight** — single process, minimal dependencies
+- EPUB, PDF, CBZ, and CBR browser readers
+- Downloads for every format stored in the library
+- OPDS catalog for compatible reading apps
+- Full-text search, tag filters, infinite scroll, list/grid views, and reading progress
+- Read-only access to Calibre data with a separate writable search/cache snapshot
+- Periodic database refresh while the server is running (including SQLite WAL/SHM changes)
+- Bun CLI and optional MCP integrations
 
-## Quick Start
+## Quick start
 
-Requires [Bun](https://bun.sh) and a [Calibre](https://calibre-ebook.com/) library.
+Requires [Bun](https://bun.sh) and a Calibre library. Caliber looks for `metadata.db` in `~/Calibre Library` by default.
 
 ```bash
 git clone https://github.com/briansunter/caliber.git
 cd caliber
 bun install
-export CALIBRE_LIBRARY_PATH="/path/to/your/Calibre Library"
 bun dev
 ```
 
-Open [http://localhost:3003](http://localhost:3003).
+Open [http://localhost:3003](http://localhost:3003). On first launch, if the default library is not present, Caliber opens a library setup screen where you can enter the path to a Calibre `metadata.db` (or its containing library folder). The selection is validated and applied without a restart; it can be changed later in Settings.
 
-OPDS clients can use [http://localhost:3003/opds](http://localhost:3003/opds). The web reader
-defaults to streaming mode and also supports full-file loading with `?mode=full` where the
-format supports it. EPUB streams unpacked entries, PDF uses HTTP byte ranges, CBZ supports
-streamed pages or full-archive loading, and CBR streams extracted pages.
+For a scripted or headless setup:
+
+```bash
+CALIBRE_LIBRARY_PATH="/path/to/Calibre Library" bun dev
+```
+
+Caliber binds to `127.0.0.1` by default. If you intentionally expose it on another interface, set `CALIBER_HOST` and put it behind authentication and HTTPS; the username prompt is a local reading-progress profile, not authentication.
+
+## Configuration
+
+Configuration can be stored in the platform config directory (`~/.config/caliber/config.json` on macOS/Linux, `%APPDATA%\\caliber\\config.json` on Windows), set with `CALIBER_CONFIG_DIR`, or supplied through environment variables. Environment variables take precedence.
+
+| Variable | Default | Description |
+|---|---|---|
+| `CALIBRE_LIBRARY_PATH` | `~/Calibre Library` | Calibre library directory; `CALIBER_LIBRARY_PATH` is accepted as an alias |
+| `CALIBRE_DB_NAME` | `metadata.db` | Database filename inside the library directory |
+| `PORT` / `CALIBER_PORT` | `3003` | HTTP port |
+| `CALIBER_HOST` | `127.0.0.1` | Bind address; keep loopback for a local library |
+| `CALIBER_CONFIG_DIR` | platform config directory | Caliber cache and config directory |
+| `CALIBER_DB_REFRESH_INTERVAL_MS` | `60000` | Database refresh interval, clamped to 5 seconds–1 hour |
+| `CALIBER_BASE_URL` | request URL | Public URL used in OPDS feeds behind a proxy |
+| `CALIBER_TRUST_PROXY` | `false` | Honor forwarded host/protocol headers only when behind a trusted proxy |
+| `CALIBER_COOKIE_SECURE` | production: `true` | Add the `Secure` attribute to the progress cookie |
+| `CALIBER_MCP_ENABLED` | `false` | Enable the HTTP MCP endpoint; the standalone stdio server is separate |
+| `CALIBER_USER_DB_PATH` | `<config>/users.db` | Location for local profile and reading-progress data |
+| `PDFINFO_PATH` | auto-detected | Optional path to Poppler `pdfinfo` |
+| `PDFTOPPM_PATH` | auto-detected | Optional path to Poppler `pdftoppm` |
+
+Copy `.env.example` as a starting point for a deployment. Caliber copies the source database through SQLite serialization into its cache so live WAL changes are included, then checks the source periodically and rebuilds its FTS snapshot when it changes. It never writes to the Calibre library.
 
 ## CLI
 
@@ -36,60 +61,51 @@ streamed pages or full-archive loading, and CBR streams extracted pages.
 bun run cli -- stats
 bun run cli -- search --query "sanderson" --limit 10 --table
 bun run cli -- download --id 42 --format epub --out book.epub
+bun run cli -- --help
 ```
 
-Run `bun run cli -- --help` for all commands.
+Each command initializes the same writable snapshot used by the server, so first-run CLI commands work on a fresh config directory.
 
-## MCP Server
+## MCP
 
-For AI tool integration via [MCP](https://modelcontextprotocol.io/):
+For local AI tool integration over stdio:
 
 ```bash
 bun src/mcp-server.ts
 ```
 
-## Configuration
-
-| Variable | Default | Description |
-|---|---|---|
-| `CALIBRE_LIBRARY_PATH` | `~/Calibre Library` | Path to your Calibre library |
-| `PORT` | `3003` | Server port |
-| `NODE_ENV` | — | Set to `production` for production mode |
+The HTTP `/mcp` endpoint is disabled by default. Enable it only on a protected local or authenticated network deployment with `CALIBER_MCP_ENABLED=true`.
 
 ## API
 
-```
-GET /api/books?cursor=&limit=&sortBy=  Paginated book list
-GET /api/books/search?q=               Search books
-GET /api/books/:id                     Book details
-GET /api/books/:id/cover               Cover image
-GET /api/books/:id/download/:format    Download book file
-GET /api/books/:id/file/:format        Open/stream book file inline with byte ranges
-GET /api/books/:id/epub/*              Stream unpacked EPUB entries
-GET /api/books/:id/pages/:format/manifest
-GET /api/books/:id/pages/:format/:page Stream CBZ/CBR/PDF page images
-GET /api/stats                         Library statistics
-GET /opds                              OPDS catalog root
-GET /opds/books                        OPDS paged acquisition feed
-GET /opds/authors                      OPDS author navigation feed
-GET /opds/series                       OPDS series navigation feed
-GET /opds/tags                         OPDS tag navigation feed
-GET /opds/formats                      OPDS format navigation feed
-GET /opds/recent                       OPDS recently-added feed
-GET /opds/search?q=                    OPDS search feed
-GET /opds/search.xml                   OPDS OpenSearch descriptor
+```text
+GET  /api/health
+GET  /api/config/library
+PUT  /api/config/library
+GET  /api/books?cursor=&limit=&sortBy=&sortOrder=&tag=
+GET  /api/books/search?q=
+GET  /api/books/:id
+GET  /api/books/:id/cover
+GET  /api/books/:id/thumb
+GET  /api/books/:id/download/:format
+GET  /api/books/:id/file/:format
+GET  /api/books/:id/epub/*
+GET  /api/books/:id/pages/:format/manifest
+GET  /api/books/:id/pages/:format/:page
+GET  /api/stats
+GET  /opds
+GET  /opds/search?q=
 ```
 
-## Tech Stack
-
-[Bun](https://bun.sh) + React 19 + TanStack (Router, Query, Virtual) + Tailwind CSS v4 + SQLite via `bun:sqlite`
-
-## Development
+## Development and release checks
 
 ```bash
-bun run check   # typecheck + lint + build
-bun run build   # build frontend
+bun run check       # tests + typecheck + lint + production frontend build
+bun test            # test suite only
+bun run build       # production frontend bundle
 ```
+
+The production server runs from `src/index.ts` so the Bun runtime can continue to serve the generated HTML entrypoint and reader assets. `dist/` is a frontend build artifact and is intentionally ignored.
 
 ## License
 

@@ -43,7 +43,7 @@ export function UserMenu() {
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-1.5 rounded-lg border border-ink bg-white px-2.5 py-1.5 text-sm font-medium text-ink hover:bg-parchment-dark transition-colors"
+        className="flex items-center gap-1.5 rounded-lg border border-ink bg-surface px-2.5 py-1.5 text-sm font-medium text-ink hover:bg-parchment-dark transition-colors"
         aria-label={user ? `Signed in as ${user.username}` : "Sign in"}
         title={user ? `Signed in as ${user.username}` : "Sign in"}
       >
@@ -54,7 +54,7 @@ export function UserMenu() {
       </button>
 
       {open && (
-        <div className="absolute right-0 z-50 mt-2 w-64 rounded-lg border border-ink bg-white p-3 shadow-lg">
+        <div className="absolute right-0 z-50 mt-2 w-64 rounded-lg border border-ink bg-surface p-3 shadow-lg">
           {user ? (
             <div className="flex flex-col gap-2">
               <div className="px-1 pb-1">
@@ -81,6 +81,7 @@ export function UserMenu() {
               <div className="flex items-center gap-1.5">
                 <input
                   id="username-input"
+                  name="username"
                   ref={inputRef}
                   type="text"
                   value={name}
@@ -89,7 +90,8 @@ export function UserMenu() {
                   maxLength={40}
                   autoCapitalize="off"
                   autoCorrect="off"
-                  className="min-w-0 flex-1 rounded-md border border-ink bg-white px-2 py-1.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-accent"
+                  autoComplete="username"
+                  className="min-w-0 flex-1 rounded-md border border-ink bg-surface px-2 py-1.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-accent"
                 />
                 <button
                   type="submit"
@@ -101,7 +103,9 @@ export function UserMenu() {
                 </button>
               </div>
               {login.isError && (
-                <p className="px-1 text-xs text-red-600">Couldn’t sign in. Try again.</p>
+                <p className="px-1 text-xs text-red-600" role="alert" aria-live="polite">
+                  Couldn’t sign in. Try again.
+                </p>
               )}
             </form>
           )}

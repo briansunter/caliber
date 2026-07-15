@@ -6,7 +6,7 @@ import type { BookListItem } from "@/lib/calibre-optimized";
 import { Link } from "@tanstack/react-router";
 import { BookOpen, Search, Loader2 } from "lucide-react";
 import { isUnknownAuthor } from "@/lib/utils";
-import { CoverFallback } from "./CoverFallback";
+import { BookCoverImage } from "./BookCoverImage";
 
 interface BookGridInfiniteProps {
   searchQuery: string;
@@ -24,21 +24,17 @@ const GridCard = memo(function GridCard({ book }: { book: BookListItem }) {
       to="/book/$id"
       params={{ id: String(book.id) }}
       aria-label={book.title}
-      className="group flex flex-col overflow-hidden rounded-lg border border-ink bg-white hover:shadow-md hover:border-accent/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 transition-all"
+      className="group flex flex-col overflow-hidden rounded-lg border border-ink bg-surface hover:shadow-md hover:border-accent/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 transition-[box-shadow,border-color]"
     >
       <div className="relative w-full aspect-[2/3] bg-parchment-dark flex items-center justify-center overflow-hidden">
-        {book.has_cover ? (
-          <img
-            src={`/api/books/${book.id}/thumb`}
-            alt={book.title}
-            loading="lazy"
-            decoding="async"
-            fetchPriority="low"
-            className="w-full h-full object-cover group-hover:brightness-[1.04] transition-[filter] duration-200"
-          />
-        ) : (
-          <CoverFallback title={book.title} size="lg" />
-        )}
+        <BookCoverImage
+          bookId={book.id}
+          title={book.title}
+          hasCover={book.has_cover}
+          width={240}
+          height={360}
+          className="group-hover:brightness-[1.04] transition-[filter] duration-200"
+        />
       </div>
       <div className="flex flex-col gap-0.5 p-2 min-h-[76px]">
         <span
@@ -56,7 +52,7 @@ const GridCard = memo(function GridCard({ book }: { book: BookListItem }) {
 });
 
 export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, sortConfig, tagIds }: BookGridInfiniteProps) {
-  const { books, hasNextPage, fetchNextPage, isFetchingNextPage, isLoading, isError, error } =
+  const { books, hasNextPage, fetchNextPage, isFetchingNextPage, isLoading, isError, error, refetch } =
     useFlattenedBooks(searchQuery, sortConfig, tagIds);
 
   const [columns, setColumns] = useState(() => {
@@ -85,6 +81,10 @@ export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, so
     estimateSize: useCallback(() => cardHeight, [cardHeight]),
     overscan: 5,
     scrollPaddingStart: 200,
+    // React 19 warns when the adapter flushes a virtualizer rerender while a
+    // route transition is still rendering. Normal scheduling is sufficient
+    // here and keeps grid view free of render-phase updates.
+    useFlushSync: false,
   });
 
   const virtualItems = virtualizer.getVirtualItems();
@@ -142,6 +142,13 @@ export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, so
         <p className="text-sm text-ink-tertiary">
           {error instanceof Error ? error.message : "Unknown error"}
         </p>
+        <button
+          type="button"
+          onClick={() => refetch()}
+          className="mt-3 rounded-lg border border-ink px-3 py-1.5 text-sm font-medium text-ink hover:bg-parchment-dark"
+        >
+          Try again
+        </button>
       </div>
     );
   }
@@ -199,10 +206,10 @@ export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, so
       </div>
 
       {isFetchingNextPage && (
-        <div className="flex items-center justify-center py-4 border-t border-parchment">
+        <div className="flex items-center justify-center py-4 border-t border-parchment" aria-live="polite">
           <div className="flex items-center gap-2 text-ink-muted">
             <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
-            <span className="text-sm">Loading more...</span>
+            <span className="text-sm">Loading more…</span>
           </div>
         </div>
       )}

@@ -1,4 +1,4 @@
-import { createFileRoute, useParams } from "@tanstack/react-router";
+import { createFileRoute, useNavigate, useParams } from "@tanstack/react-router";
 import { BookOpen } from "lucide-react";
 import { lazy, Suspense } from "react";
 import { normalizeReaderLoadMode } from "@/components/reader-types";
@@ -21,7 +21,8 @@ export const Route = createFileRoute("/read/$id/$format")({
 
 function ReaderPage() {
   const { id, format } = useParams({ from: "/read/$id/$format" });
-  const bookId = parseInt(id, 10);
+  const bookId = /^\d+$/.test(id) ? Number(id) : Number.NaN;
+  const navigate = useNavigate();
   const fmt = format.toUpperCase();
   const { data: book, isLoading, error } = useBook(bookId);
   // Explicit ?mode= in the URL wins; otherwise fall back to the user's default.
@@ -30,14 +31,20 @@ function ReaderPage() {
     ? normalizeReaderLoadMode(modeParam)
     : loadReaderSettings().defaultLoadMode;
 
-  const goBack = () => window.history.back();
+  const goBack = () => {
+    if (window.history.length <= 1) {
+      navigate({ to: "/" });
+    } else {
+      window.history.back();
+    }
+  };
 
   if (isLoading) {
     return (
       <div className="fixed inset-0 z-[100] flex items-center justify-center bg-neutral-900">
         <div className="flex flex-col items-center gap-3">
           <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
-          <p className="text-sm text-white/50">Loading...</p>
+          <p className="text-sm text-white/50">Loading…</p>
         </div>
       </div>
     );
@@ -66,7 +73,7 @@ function ReaderPage() {
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-neutral-900">
       <div className="flex flex-col items-center gap-3">
         <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
-        <p className="text-sm text-white/50">Loading...</p>
+        <p className="text-sm text-white/50">Loading…</p>
       </div>
     </div>
   );
