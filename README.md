@@ -37,6 +37,8 @@ To run the published app with Bun and open it in your default browser automatica
 bunx caliber-app
 ```
 
+When the default `~/Calibre Library/metadata.db` exists, the browser opens automatically. If no usable library is found, Caliber stays running and prints the local URL so you can configure one.
+
 Set the library path when it is not in the default location:
 
 ```bash

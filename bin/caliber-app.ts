@@ -34,6 +34,17 @@ async function waitForHealth(url: string): Promise<void> {
   throw new Error(`Caliber did not become ready at ${url}`);
 }
 
+async function hasReadyLibrary(url: string): Promise<boolean> {
+  try {
+    const response = await fetch(new URL("api/config/library", url));
+    if (!response.ok) return false;
+    const status = (await response.json()) as { ready?: boolean };
+    return status.ready === true;
+  } catch {
+    return false;
+  }
+}
+
 function openDefaultBrowser(url: string): void {
   const command = (() => {
     switch (process.platform) {
@@ -63,13 +74,17 @@ function openDefaultBrowser(url: string): void {
 
 const url = getAppUrl();
 await waitForHealth(url);
+const libraryReady = await hasReadyLibrary(url);
 
 const openDisabled =
   process.env.CALIBER_OPEN_BROWSER?.toLowerCase() === "false" ||
   process.argv.slice(2).some((arg) => NO_OPEN_FLAGS.has(arg));
 
-if (openDisabled) {
+if (openDisabled || !libraryReady) {
   console.log(`🌐 Caliber is ready at ${url}`);
+  if (!libraryReady && !openDisabled) {
+    console.log("📚 No usable Calibre library found; configure one in the app or set CALIBRE_LIBRARY_PATH.");
+  }
 } else {
   openDefaultBrowser(url);
 }
