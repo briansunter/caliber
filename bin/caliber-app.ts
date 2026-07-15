@@ -1,6 +1,31 @@
 #!/usr/bin/env bun
 
-import "../src/index.ts";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const PACKAGE_CONFIG = join(PACKAGE_ROOT, "bunfig.toml");
+
+if (process.env.CALIBER_LAUNCHER_REEXEC !== "1") {
+  const child = Bun.spawn(
+    [
+      process.execPath,
+      `--config=${PACKAGE_CONFIG}`,
+      fileURLToPath(import.meta.url),
+      ...process.argv.slice(2),
+    ],
+    {
+      cwd: PACKAGE_ROOT,
+      env: { ...process.env, CALIBER_LAUNCHER_REEXEC: "1" },
+      stdin: "inherit",
+      stdout: "inherit",
+      stderr: "inherit",
+    },
+  );
+  process.exit(await child.exited);
+}
+
+await import("../src/index.ts");
 
 const DEFAULT_PORT = "3003";
 const NO_OPEN_FLAGS = new Set(["--no-open"]);
