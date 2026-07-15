@@ -45,6 +45,36 @@ async function hasReadyLibrary(url: string): Promise<boolean> {
   }
 }
 
+async function waitForFrontend(url: string): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  let lastError = "the frontend bundle has not produced a stylesheet";
+
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(url);
+      if (response.ok) {
+        const html = await response.text();
+        const stylesheetHref = html.match(/<link rel="stylesheet" href="([^"]+)"/)?.[1];
+        if (stylesheetHref) {
+          const stylesheet = await fetch(new URL(stylesheetHref, url));
+          if (stylesheet.ok && stylesheet.headers.get("content-type")?.includes("text/css")) {
+            return;
+          }
+          lastError = `the stylesheet returned HTTP ${stylesheet.status}`;
+        }
+      } else {
+        lastError = `the app returned HTTP ${response.status}`;
+      }
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+
+    await Bun.sleep(100);
+  }
+
+  throw new Error(`Caliber frontend did not become ready at ${url}: ${lastError}`);
+}
+
 function openDefaultBrowser(url: string): void {
   const command = (() => {
     switch (process.platform) {
@@ -86,5 +116,6 @@ if (openDisabled || !libraryReady) {
     console.log("📚 No usable Calibre library found; configure one in the app or set CALIBRE_LIBRARY_PATH.");
   }
 } else {
+  await waitForFrontend(url);
   openDefaultBrowser(url);
 }
