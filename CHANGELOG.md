@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/briansunter/caliber/compare/v0.1.2...v0.1.3) (2026-07-15)
+
+
+### Bug Fixes
+
+* include tailwindcss at runtime ([9372c9e](https://github.com/briansunter/caliber/commit/9372c9e06a54d7bdfa66fa95b80a05fc393e062d))
+
 ## [0.1.2](https://github.com/briansunter/caliber/compare/v0.1.1...v0.1.2) (2026-07-15)
 
 
