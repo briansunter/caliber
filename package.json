@@ -1,6 +1,6 @@
 {
   "name": "caliber-app",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "A fast local web interface for browsing, reading, and downloading Calibre libraries.",
   "publishConfig": {
     "access": "public"
