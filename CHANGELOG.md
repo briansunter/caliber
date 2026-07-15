@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/briansunter/caliber/compare/v0.1.5...v0.1.6) (2026-07-15)
+
+
+### Bug Fixes
+
+* make bunx css independent of caller cwd ([179f270](https://github.com/briansunter/caliber/commit/179f270e4036c465f8be0dc323dd85995cdab835))
+
 ## [0.1.5](https://github.com/briansunter/caliber/compare/v0.1.4...v0.1.5) (2026-07-15)
 
 
