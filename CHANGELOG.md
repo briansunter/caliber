@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/briansunter/caliber/compare/v0.1.3...v0.1.4) (2026-07-15)
+
+
+### Bug Fixes
+
+* open browser only with a ready library ([4bf61e3](https://github.com/briansunter/caliber/commit/4bf61e3e115c6593beb3427795fb003dcc663de7))
+
 ## [0.1.3](https://github.com/briansunter/caliber/compare/v0.1.2...v0.1.3) (2026-07-15)
 
 
