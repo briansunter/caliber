@@ -17,6 +17,12 @@ import {
   streamBooks,
   type BookListItem,
 } from "./lib/calibre-optimized";
+import {
+  deleteUser,
+  getCredentialByUsername,
+  listAuthUsers,
+} from "./lib/user-db";
+import { MIN_PASSWORD_LENGTH, PasswordError, setPasswordForUser } from "./lib/auth";
 import { DB_NAME } from "./lib/config";
 
 type SortField = "title" | "author" | "added" | "rating";
@@ -49,6 +55,7 @@ const COMMAND_FLAGS: Record<string, ReadonlySet<string>> = {
   download: new Set(["id", "format", "out"]),
   cover: new Set(["id", "out"]),
   "init-fts": new Set([]),
+  user: new Set(["password-stdin"]),
 };
 
 class CLIError extends Error {
@@ -85,6 +92,13 @@ Commands:
   download                       Copy a book format file to the current directory
   cover                          Copy a cover image to the current directory
   init-fts                       Run FTS initialization
+
+User management (for use with CALIBER_AUTH_ENABLED=true):
+  user add <username>            Create a user (or set a password on an existing profile)
+  user passwd <username>         Change a user's password
+  user list                      List users
+  user remove <username>         Delete a user, their sessions, and their progress
+  --password-stdin               Read the password from stdin instead of a hidden prompt
 
 Global options:
   --help, -h                     Show this help
@@ -399,6 +413,140 @@ async function handleStream(parsed: ParsedArgs): Promise<void> {
   process.stdout.write("]\n");
 }
 
+// Hidden password prompt using raw mode (no characters echoed).
+function promptHidden(question: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const input = process.stdin as typeof process.stdin & {
+      isTTY?: boolean;
+      setRawMode?: (mode: boolean) => void;
+    };
+    if (!input.isTTY || typeof input.setRawMode !== "function") {
+      reject(new CLIError("Interactive password prompt requires a terminal; use --password-stdin"));
+      return;
+    }
+
+    process.stdout.write(question);
+    let value = "";
+    const finish = (result: string) => {
+      input.setRawMode?.(false);
+      input.pause();
+      input.removeListener("data", onData);
+      process.stdout.write("\n");
+      resolve(result);
+    };
+    const onData = (chunk: string) => {
+      if (chunk === "\r" || chunk === "\n") {
+        finish(value);
+        return;
+      }
+      if (chunk === "\u0003") {
+        input.setRawMode?.(false);
+        input.pause();
+        input.removeListener("data", onData);
+        process.stdout.write("\n");
+        reject(new CLIError("Cancelled", 130));
+        return;
+      }
+      if (chunk === "\u007f" || chunk === "\b") {
+        value = value.slice(0, -1);
+        return;
+      }
+      value += chunk;
+    };
+
+    input.setRawMode(true);
+    input.setEncoding("utf8");
+    input.resume();
+    input.on("data", onData);
+  });
+}
+
+async function readPasswordInput(parsed: ParsedArgs): Promise<string> {
+  if (hasFlag(parsed, "password-stdin")) {
+    const data = await new Response(Bun.stdin.stream()).text();
+    const password = data.replace(/[\r\n]+$/, "");
+    if (password.length === 0) throw new CLIError("Password read from stdin was empty");
+    return password;
+  }
+
+  const first = await promptHidden("Password: ");
+  const second = await promptHidden("Confirm password: ");
+  if (first !== second) throw new CLIError("Passwords do not match");
+  return first;
+}
+
+async function applyPassword(username: string, password: string): Promise<void> {
+  try {
+    const user = await setPasswordForUser(username, password);
+    printJSON({ id: user.id, username: user.username });
+  } catch (error) {
+    if (error instanceof PasswordError) throw new CLIError(error.message);
+    throw error;
+  }
+}
+
+async function handleUserCommand(parsed: ParsedArgs): Promise<void> {
+  const subcommand = parsed.positionals[0];
+  const args = parsed.positionals.slice(1);
+
+  switch (subcommand) {
+    case "add": {
+      if (args.length !== 1) throw new CLIError("Usage: user add <username>", 2);
+      const username = args[0] ?? "";
+      const credential = getCredentialByUsername(username);
+      if (credential?.passwordHash) {
+        throw new CLIError(
+          `User ${credential.username} already has a password; use 'user passwd' instead`,
+        );
+      }
+      const password = await readPasswordInput(parsed);
+      if (password.length < MIN_PASSWORD_LENGTH) {
+        throw new CLIError(`Password must be at least ${MIN_PASSWORD_LENGTH} characters`);
+      }
+      await applyPassword(username, password);
+      return;
+    }
+
+    case "passwd": {
+      if (args.length !== 1) throw new CLIError("Usage: user passwd <username>", 2);
+      const username = args[0] ?? "";
+      const credential = getCredentialByUsername(username);
+      if (!credential) throw new CLIError(`User not found: ${username}`, 2);
+      const password = await readPasswordInput(parsed);
+      if (password.length < MIN_PASSWORD_LENGTH) {
+        throw new CLIError(`Password must be at least ${MIN_PASSWORD_LENGTH} characters`);
+      }
+      await applyPassword(username, password);
+      return;
+    }
+
+    case "list": {
+      if (args.length > 0) throw new CLIError("Usage: user list", 2);
+      printJSON({
+        users: listAuthUsers().map((user) => ({
+          id: user.id,
+          username: user.username,
+          hasPassword: user.hasPassword,
+          lastSeenAt: user.lastSeenAt,
+        })),
+      });
+      return;
+    }
+
+    case "remove": {
+      if (args.length !== 1) throw new CLIError("Usage: user remove <username>", 2);
+      const username = args[0] ?? "";
+      const removed = deleteUser(username);
+      if (!removed) throw new CLIError(`User not found: ${username}`, 2);
+      printJSON({ removed: removed.username });
+      return;
+    }
+
+    default:
+      throw new CLIError("Usage: user <add|passwd|list|remove> ...", 2);
+  }
+}
+
 async function runCommand(parsed: ParsedArgs): Promise<void> {
   const command = normalizeCommand(parsed.command);
 
@@ -657,6 +805,12 @@ async function runCommand(parsed: ParsedArgs): Promise<void> {
       return;
     }
 
+    case "user": {
+      validateFlags(parsed, command);
+      await handleUserCommand(parsed);
+      return;
+    }
+
     default:
       throw new CLIError(`Unknown command: ${command}`, 2);
   }
@@ -668,7 +822,9 @@ async function main(): Promise<void> {
   try {
     // Every command may be the first process touching the library. Ensure the
     // writable snapshot and FTS table exist before command handlers query it.
-    if (parsed.command && parsed.command !== "init-fts") initFTS();
+    // User management only needs the config-dir user database, so it works
+    // even without a usable Calibre library.
+    if (parsed.command && parsed.command !== "init-fts" && parsed.command !== "user") initFTS();
     await runCommand(parsed);
   } catch (error) {
     if (error instanceof CLIError) {

@@ -47,7 +47,7 @@ CALIBRE_LIBRARY_PATH="/path/to/Calibre Library" bunx caliber-app
 
 Use `--no-open` or `CALIBER_OPEN_BROWSER=false` for headless environments.
 
-Caliber binds to `127.0.0.1` by default. If you intentionally expose it on another interface, set `CALIBER_HOST` and put it behind authentication and HTTPS; the username prompt is a local reading-progress profile, not authentication.
+Caliber binds to `127.0.0.1` by default. If you intentionally expose it on another interface, set `CALIBER_HOST` and enable the built-in authentication (see [Authentication](#authentication)) plus HTTPS; without auth enabled, the username prompt is only a local reading-progress profile, not authentication.
 
 ## Configuration
 
@@ -65,11 +65,33 @@ Configuration can be stored in the platform config directory (`~/.config/caliber
 | `CALIBER_TRUST_PROXY` | `false` | Honor forwarded host/protocol headers only when behind a trusted proxy |
 | `CALIBER_COOKIE_SECURE` | production: `true` | Add the `Secure` attribute to the progress cookie |
 | `CALIBER_MCP_ENABLED` | `false` | Enable the HTTP MCP endpoint; the standalone stdio server is separate |
+| `CALIBER_AUTH_ENABLED` | `false` | Require sign-in for the web app, API, and OPDS feeds (see [Authentication](#authentication)) |
 | `CALIBER_USER_DB_PATH` | `<config>/users.db` | Location for local profile and reading-progress data |
 | `PDFINFO_PATH` | auto-detected | Optional path to Poppler `pdfinfo` |
 | `PDFTOPPM_PATH` | auto-detected | Optional path to Poppler `pdftoppm` |
 
 Copy `.env.example` as a starting point for a deployment. Caliber copies the source database through SQLite serialization into its cache so live WAL changes are included, then checks the source periodically and rebuilds its FTS snapshot when it changes. It never writes to the Calibre library.
+
+## Authentication
+
+Authentication is optional and off by default. Enable it with `CALIBER_AUTH_ENABLED=true` (or `"authEnabled": true` in `config.json`) to require a username and password for the web app, the JSON API, the OPDS catalog, and the MCP endpoint. Each signed-in user gets their own reading-progress shelf.
+
+Two standard mechanisms are supported:
+
+- **Web browser** — a login screen starts a server-side session (HttpOnly cookie, 30-day expiry, revocable by signing out).
+- **OPDS readers and API clients** — HTTP Basic Auth with the same credentials, which is what OPDS apps use. Point an OPDS reader at the feed URL (for example `http://localhost:3003/opds`) and enter your Caliber username and password when prompted.
+
+On first start with auth enabled and no accounts yet, the web UI offers to create the first account. That setup screen closes permanently once one user exists. Further accounts are managed from the CLI:
+
+```bash
+bun run cli -- user add alice              # hidden password prompt
+bun run cli -- user passwd alice           # change a password
+bun run cli -- user list
+bun run cli -- user remove alice
+echo "secret-password" | bun run cli -- user add alice --password-stdin   # scripted
+```
+
+Accounts live in `users.db` in the config directory alongside reading progress, never in the Calibre library. Passwords are hashed with argon2id. Failed logins are throttled per username and client. If you expose Caliber beyond localhost, put it behind HTTPS (a reverse proxy with `CALIBER_TRUST_PROXY=true` and `CALIBER_BASE_URL` set) so session cookies and Basic credentials are not sent in cleartext.
 
 ## CLI
 

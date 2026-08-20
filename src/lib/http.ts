@@ -39,6 +39,12 @@ export async function fetchJson<T>(input: string | URL, init?: RequestInit): Pro
   }
 
   if (!response.ok) {
+    // Let the app re-check auth state (and show the login screen) when a
+    // session expires mid-use.
+    if (response.status === 401 && typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("caliber:unauthorized"));
+    }
+
     const message =
       isErrorPayload(payload) && typeof payload.error === "string"
         ? payload.error

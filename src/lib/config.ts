@@ -23,6 +23,7 @@ interface ConfigFile {
   mcpEnabled?: unknown;
   cookieSecure?: unknown;
   dbRefreshIntervalMs?: unknown;
+  authEnabled?: unknown;
 }
 
 interface ResolvedConfig {
@@ -34,6 +35,7 @@ interface ResolvedConfig {
   mcpEnabled: boolean;
   cookieSecure: boolean;
   dbRefreshIntervalMs: number;
+  authEnabled: boolean;
 }
 
 const DEFAULTS: ResolvedConfig = {
@@ -45,6 +47,7 @@ const DEFAULTS: ResolvedConfig = {
   mcpEnabled: false,
   cookieSecure: process.env.NODE_ENV === "production",
   dbRefreshIntervalMs: 60_000,
+  authEnabled: false,
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -157,6 +160,7 @@ function loadConfig(): ConfigFile {
             mcpEnabled: DEFAULTS.mcpEnabled,
             cookieSecure: DEFAULTS.cookieSecure,
             dbRefreshIntervalMs: DEFAULTS.dbRefreshIntervalMs,
+            authEnabled: DEFAULTS.authEnabled,
           },
           null,
           2,
@@ -209,6 +213,10 @@ export const MCP_ENABLED = readEnvBoolean(
 export const COOKIE_SECURE = readEnvBoolean(
   "CALIBER_COOKIE_SECURE",
   readBoolean(config.cookieSecure, DEFAULTS.cookieSecure),
+);
+export const AUTH_ENABLED = readEnvBoolean(
+  "CALIBER_AUTH_ENABLED",
+  readBoolean(config.authEnabled, DEFAULTS.authEnabled),
 );
 const configuredRefreshInterval = Number(
   process.env.CALIBER_DB_REFRESH_INTERVAL_MS ?? config.dbRefreshIntervalMs,

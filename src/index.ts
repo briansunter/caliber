@@ -61,6 +61,7 @@ import {
 } from "./lib/user-db";
 import { join } from "node:path";
 import {
+  AUTH_ENABLED,
   CONFIG_DIR_PATH,
   COOKIE_SECURE,
   HOST,
@@ -72,6 +73,21 @@ import {
   saveLibraryConfig,
   TRUST_PROXY,
 } from "./lib/config";
+import {
+  authenticateRequest,
+  authenticateWithPassword,
+  createSessionToken,
+  loginRateLimited,
+  needsInitialSetup,
+  PasswordError,
+  purgeExpiredSessions,
+  revokeSessionToken,
+  sessionCookieHeader,
+  sessionTokenFromRequest,
+  setRequestUser,
+  setPasswordForUser,
+  MIN_PASSWORD_LENGTH,
+} from "./lib/auth";
 
 const LIBRARY_PATH = getLibraryPath();
 const WORK_DIR = CONFIG_DIR_PATH;
@@ -159,8 +175,14 @@ function userCookieHeader(username: string | null): string {
   return `${base}${encodeURIComponent(username)}; ${attrs}; Max-Age=${USER_COOKIE_MAX_AGE}`;
 }
 
-// Resolve the current user from the cookie. Does NOT create a user — login does.
-function currentUser(req: Request): User | null {
+// Resolve the current user. With auth enabled this is a real
+// authenticated identity (session cookie or Basic credentials). Without
+// auth, the cookie just remembers a username for reading progress.
+async function currentUser(req: Request): Promise<User | null> {
+  if (AUTH_ENABLED) {
+    const authenticated = await authenticateRequest(req);
+    return authenticated?.user ?? null;
+  }
   const username = parseCookies(req)[USER_COOKIE];
   if (!username) return null;
   return getUserByUsername(username);
@@ -743,10 +765,10 @@ async function* streamBooksJSON(
   yield "]";
 }
 
-const server = serve({
-  hostname: HOST,
-  port: parseBoundedInt(PORT, DEFAULT_PORT, { min: 1, max: 65535 }),
-  routes: {
+type RouteHandler = (req: Bun.BunRequest<string>) => Response | Promise<Response>;
+type RouteTable = Record<string, RouteHandler | { [method: string]: RouteHandler } | typeof index>;
+
+const routes: RouteTable = {
     // Health check
     "/api/health": {
       GET: () => Response.json({ status: "ok", timestamp: Date.now() }),
@@ -830,18 +852,25 @@ const server = serve({
 
     // --- Users & reading progress (local profile cookie, not authentication) ---
 
-    // Who am I? (reads the cookie)
+    // Who am I? (reads the cookie or session). Public so the SPA can render
+    // a login screen when auth is enabled.
     "/api/user/me": {
-      GET: (req) => {
-        const user = currentUser(req);
+      GET: async (req) => {
+        const user = await currentUser(req);
         return Response.json(
-          { user: user ? publicUser(user) : null },
+          {
+            user: user ? publicUser(user) : null,
+            authRequired: AUTH_ENABLED,
+            needsSetup: needsInitialSetup(),
+          },
           { headers: { "Cache-Control": "private, no-store" } },
         );
       },
     },
 
-    // "Log in" = remember a username and set the cookie.
+    // Log in. With auth enabled this verifies a password and starts a
+    // server-side session; without auth it just remembers a username for
+    // reading progress.
     "/api/user/login": {
       POST: async (req) => {
         let rawBody: unknown;
@@ -853,11 +882,40 @@ const server = serve({
         if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
           return Response.json({ error: "Request body must be an object" }, { status: 400 });
         }
-        const body = rawBody as { username?: unknown };
+        const body = rawBody as { username?: unknown; password?: unknown };
         const username = typeof body.username === "string" ? body.username : "";
         if (!isValidUsername(username)) {
           return Response.json({ error: "Invalid username" }, { status: 400 });
         }
+
+        if (AUTH_ENABLED) {
+          const password = typeof body.password === "string" ? body.password : "";
+          if (loginRateLimited(req, username)) {
+            return Response.json(
+              { error: "Too many failed attempts; try again later" },
+              { status: 429, headers: { "Cache-Control": "no-store" } },
+            );
+          }
+          const user = await authenticateWithPassword(req, username, password);
+          if (!user) {
+            return Response.json(
+              { error: "Invalid username or password" },
+              { status: 401, headers: { "Cache-Control": "no-store" } },
+            );
+          }
+          purgeExpiredSessions();
+          const session = createSessionToken(user.id);
+          return Response.json(
+            { user: publicUser(user) },
+            {
+              headers: {
+                "Set-Cookie": sessionCookieHeader(session.token),
+                "Cache-Control": "private, no-store",
+              },
+            },
+          );
+        }
+
         const user = getOrCreateUser(username);
         if (!user) {
           return Response.json({ error: "Could not create user" }, { status: 500 });
@@ -874,21 +932,94 @@ const server = serve({
       },
     },
 
-    // Forget the current user (clear cookie)
+    // First-run account creation: allowed only while auth is enabled and no
+    // user can log in yet, so an exposed instance cannot be claimed later.
+    "/api/auth/setup": {
+      POST: async (req) => {
+        if (!AUTH_ENABLED) {
+          return Response.json(
+            { error: "Authentication is disabled" },
+            { status: 403, headers: { "Cache-Control": "no-store" } },
+          );
+        }
+        if (!needsInitialSetup()) {
+          return Response.json(
+            { error: "Setup is already complete; ask an existing user or use the CLI to add accounts" },
+            { status: 403, headers: { "Cache-Control": "no-store" } },
+          );
+        }
+
+        let rawBody: unknown;
+        try {
+          rawBody = await readJsonBody(req);
+        } catch (error) {
+          return requestBodyErrorResponse(error);
+        }
+        if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
+          return Response.json({ error: "Request body must be an object" }, { status: 400 });
+        }
+        const body = rawBody as { username?: unknown; password?: unknown };
+        const username = typeof body.username === "string" ? body.username : "";
+        const password = typeof body.password === "string" ? body.password : "";
+        if (!isValidUsername(username)) {
+          return Response.json({ error: "Invalid username" }, { status: 400 });
+        }
+        if (password.length < MIN_PASSWORD_LENGTH) {
+          return Response.json(
+            { error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` },
+            { status: 400 },
+          );
+        }
+        if (loginRateLimited(req, username)) {
+          return Response.json(
+            { error: "Too many failed attempts; try again later" },
+            { status: 429, headers: { "Cache-Control": "no-store" } },
+          );
+        }
+
+        try {
+          const user = await setPasswordForUser(username, password);
+          const session = createSessionToken(user.id);
+          return Response.json(
+            { user: publicUser(user) },
+            {
+              headers: {
+                "Set-Cookie": sessionCookieHeader(session.token),
+                "Cache-Control": "private, no-store",
+              },
+            },
+          );
+        } catch (error) {
+          if (error instanceof PasswordError) {
+            return Response.json({ error: error.message }, { status: 400 });
+          }
+          throw error;
+        }
+      },
+    },
+
+    // Forget the current user (clear cookie / revoke session)
     "/api/user/logout": {
-      POST: () =>
-        Response.json({ ok: true }, { headers: { "Set-Cookie": userCookieHeader(null) } }),
+      POST: (req) => {
+        const headers = new Headers({ "Cache-Control": "no-store" });
+        if (AUTH_ENABLED) {
+          revokeSessionToken(sessionTokenFromRequest(req));
+          headers.append("Set-Cookie", sessionCookieHeader(null));
+        }
+        headers.append("Set-Cookie", userCookieHeader(null));
+        return Response.json({ ok: true }, { headers });
+      },
     },
 
     // Recently-read shelf: progress rows enriched with book metadata for cards.
     "/api/user/reading": {
-      DELETE: (req) => {
-        const user = currentUser(req);
+      DELETE: async (req) => {
+        const user = await currentUser(req);
         if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
         return Response.json({ removed: clearProgress(user.id) });
       },
-      GET: (req) => {
-        const user = currentUser(req);
+      GET: async (req) => {
+        const user = await currentUser(req);
         if (!user) return Response.json({ items: [] });
         const url = new URL(req.url);
         const limit = parseBoundedInt(url.searchParams.get("limit"), 200, { min: 1, max: 500 });
@@ -921,12 +1052,12 @@ const server = serve({
 
     // Per-book progress for the active reader
     "/api/user/progress/:bookId": {
-      GET: (req) => {
-        const bookId = parseBookId(req.params.bookId);
+      GET: async (req) => {
+        const bookId = parseBookId(req.params.bookId ?? "");
         if (bookId === null) {
           return Response.json({ error: "Invalid book id" }, { status: 400 });
         }
-        const user = currentUser(req);
+        const user = await currentUser(req);
         if (!user) {
           return Response.json(
             { progress: null },
@@ -939,11 +1070,11 @@ const server = serve({
         );
       },
       PUT: async (req) => {
-        const bookId = parseBookId(req.params.bookId);
+        const bookId = parseBookId(req.params.bookId ?? "");
         if (bookId === null) {
           return Response.json({ error: "Invalid book id" }, { status: 400 });
         }
-        const user = currentUser(req);
+        const user = await currentUser(req);
         if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
 
         const book = getBookByIdOptimized(bookId);
@@ -982,12 +1113,12 @@ const server = serve({
           { headers: { "Cache-Control": "private, no-store" } },
         );
       },
-      DELETE: (req) => {
-        const bookId = parseBookId(req.params.bookId);
+      DELETE: async (req) => {
+        const bookId = parseBookId(req.params.bookId ?? "");
         if (bookId === null) {
           return Response.json({ error: "Invalid book id" }, { status: 400 });
         }
-        const user = currentUser(req);
+        const user = await currentUser(req);
         if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
         return Response.json(
           { removed: deleteProgress(user.id, bookId) },
@@ -1099,7 +1230,7 @@ const server = serve({
     "/opds/authors/:id/books": {
       GET: (req) => {
         try {
-          const id = parseBookId(req.params.id);
+          const id = parseBookId(req.params.id ?? "");
           if (id === null) {
             return Response.json({ error: "Invalid author ID" }, { status: 400 });
           }
@@ -1136,7 +1267,7 @@ const server = serve({
     "/opds/series/:id/books": {
       GET: (req) => {
         try {
-          const id = parseBookId(req.params.id);
+          const id = parseBookId(req.params.id ?? "");
           if (id === null) {
             return Response.json({ error: "Invalid series ID" }, { status: 400 });
           }
@@ -1173,7 +1304,7 @@ const server = serve({
     "/opds/tags/:id/books": {
       GET: (req) => {
         try {
-          const id = parseBookId(req.params.id);
+          const id = parseBookId(req.params.id ?? "");
           if (id === null) {
             return Response.json({ error: "Invalid tag ID" }, { status: 400 });
           }
@@ -1210,7 +1341,7 @@ const server = serve({
     "/opds/formats/:format/books": {
       GET: (req) => {
         try {
-          const format = decodeURIComponent(req.params.format).toUpperCase();
+          const format = decodeURIComponent(req.params.format ?? "").toUpperCase();
           const entry = getCatalogEntry("formats", format);
           if (!entry) {
             return Response.json({ error: "Format not found" }, { status: 404 });
@@ -1282,7 +1413,7 @@ const server = serve({
     "/opds/book/:id": {
       GET: (req) => {
         try {
-          const id = parseBookId(req.params.id);
+          const id = parseBookId(req.params.id ?? "");
           if (id === null) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
@@ -1411,7 +1542,7 @@ const server = serve({
     "/api/books/:id": {
       GET: (req) => {
         try {
-          const id = parseBookId(req.params.id);
+          const id = parseBookId(req.params.id ?? "");
 
           if (id === null) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
@@ -1435,13 +1566,13 @@ const server = serve({
     "/api/books/:id/download/:format": {
       GET: async (req) => {
         try {
-          const id = parseBookId(req.params.id);
+          const id = parseBookId(req.params.id ?? "");
 
           if (id === null) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
 
-          return await serveBookFile(req, id, req.params.format, "attachment");
+          return await serveBookFile(req, id, req.params.format ?? "", "attachment");
         } catch (error) {
           console.error("Error downloading book:", error);
           return Response.json({ error: "Failed to download book" }, { status: 500 });
@@ -1449,13 +1580,13 @@ const server = serve({
       },
       HEAD: async (req) => {
         try {
-          const id = parseBookId(req.params.id);
+          const id = parseBookId(req.params.id ?? "");
 
           if (id === null) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
 
-          return await serveBookFile(req, id, req.params.format, "attachment");
+          return await serveBookFile(req, id, req.params.format ?? "", "attachment");
         } catch (error) {
           console.error("Error downloading book:", error);
           return Response.json({ error: "Failed to download book" }, { status: 500 });
@@ -1467,13 +1598,13 @@ const server = serve({
     "/api/books/:id/file/:format": {
       GET: async (req) => {
         try {
-          const id = parseBookId(req.params.id);
+          const id = parseBookId(req.params.id ?? "");
 
           if (id === null) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
 
-          return await serveBookFile(req, id, req.params.format, "inline");
+          return await serveBookFile(req, id, req.params.format ?? "", "inline");
         } catch (error) {
           console.error("Error streaming book:", error);
           return Response.json({ error: "Failed to stream book" }, { status: 500 });
@@ -1481,13 +1612,13 @@ const server = serve({
       },
       HEAD: async (req) => {
         try {
-          const id = parseBookId(req.params.id);
+          const id = parseBookId(req.params.id ?? "");
 
           if (id === null) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
 
-          return await serveBookFile(req, id, req.params.format, "inline");
+          return await serveBookFile(req, id, req.params.format ?? "", "inline");
         } catch (error) {
           console.error("Error streaming book:", error);
           return Response.json({ error: "Failed to stream book" }, { status: 500 });
@@ -1499,12 +1630,12 @@ const server = serve({
     "/api/books/:id/epub": {
       GET: (req) => {
         const url = new URL(req.url);
-        url.pathname = `/api/books/${req.params.id}/epub/`;
+        url.pathname = `/api/books/${req.params.id ?? ""}/epub/`;
         return Response.redirect(url, 308);
       },
       HEAD: (req) => {
         const url = new URL(req.url);
-        url.pathname = `/api/books/${req.params.id}/epub/`;
+        url.pathname = `/api/books/${req.params.id ?? ""}/epub/`;
         return Response.redirect(url, 308);
       },
     },
@@ -1512,7 +1643,7 @@ const server = serve({
     "/api/books/:id/epub/**": {
       GET: async (req) => {
         try {
-          const id = parseBookId(req.params.id);
+          const id = parseBookId(req.params.id ?? "");
 
           if (id === null) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
@@ -1525,7 +1656,7 @@ const server = serve({
       },
       HEAD: async (req) => {
         try {
-          const id = parseBookId(req.params.id);
+          const id = parseBookId(req.params.id ?? "");
 
           if (id === null) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
@@ -1542,15 +1673,15 @@ const server = serve({
     "/api/books/:id/pages/:format/manifest": {
       GET: async (req) => {
         try {
-          const id = parseBookId(req.params.id);
+          const id = parseBookId(req.params.id ?? "");
           if (id === null) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
-          if (!FORMAT_PATTERN.test(req.params.format)) {
+          if (!FORMAT_PATTERN.test(req.params.format ?? "")) {
             return Response.json({ error: "Invalid format" }, { status: 400 });
           }
 
-          const manifest = await getPageManifest(id, req.params.format);
+          const manifest = await getPageManifest(id, req.params.format ?? "");
           return Response.json(manifest, {
             headers: {
               "Cache-Control": "no-cache",
@@ -1562,15 +1693,15 @@ const server = serve({
       },
       HEAD: async (req) => {
         try {
-          const id = parseBookId(req.params.id);
+          const id = parseBookId(req.params.id ?? "");
           if (id === null) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
-          if (!FORMAT_PATTERN.test(req.params.format)) {
+          if (!FORMAT_PATTERN.test(req.params.format ?? "")) {
             return Response.json({ error: "Invalid format" }, { status: 400 });
           }
 
-          await getPageManifest(id, req.params.format);
+          await getPageManifest(id, req.params.format ?? "");
           return new Response(null, {
             headers: {
               "Content-Type": "application/json",
@@ -1586,16 +1717,16 @@ const server = serve({
     "/api/books/:id/pages/:format/:page": {
       GET: async (req) => {
         try {
-          const id = parseBookId(req.params.id);
-          const page = parseBookId(req.params.page);
+          const id = parseBookId(req.params.id ?? "");
+          const page = parseBookId(req.params.page ?? "");
           if (id === null || page === null) {
             return Response.json({ error: "Invalid page request" }, { status: 400 });
           }
-          if (!FORMAT_PATTERN.test(req.params.format)) {
+          if (!FORMAT_PATTERN.test(req.params.format ?? "")) {
             return Response.json({ error: "Invalid format" }, { status: 400 });
           }
 
-          const pageFile = await getPageFile(id, req.params.format, page);
+          const pageFile = await getPageFile(id, req.params.format ?? "", page);
           return serveLocalFile(req, pageFile.path, {
             contentType: pageFile.contentType,
             cacheControl: "no-cache",
@@ -1606,16 +1737,16 @@ const server = serve({
       },
       HEAD: async (req) => {
         try {
-          const id = parseBookId(req.params.id);
-          const page = parseBookId(req.params.page);
+          const id = parseBookId(req.params.id ?? "");
+          const page = parseBookId(req.params.page ?? "");
           if (id === null || page === null) {
             return Response.json({ error: "Invalid page request" }, { status: 400 });
           }
-          if (!FORMAT_PATTERN.test(req.params.format)) {
+          if (!FORMAT_PATTERN.test(req.params.format ?? "")) {
             return Response.json({ error: "Invalid format" }, { status: 400 });
           }
 
-          const pageFile = await getPageFile(id, req.params.format, page);
+          const pageFile = await getPageFile(id, req.params.format ?? "", page);
           return serveLocalFile(req, pageFile.path, {
             contentType: pageFile.contentType,
             cacheControl: "no-cache",
@@ -1630,7 +1761,7 @@ const server = serve({
     "/api/books/:id/cover": {
       GET: async (req) => {
         try {
-          const id = parseBookId(req.params.id);
+          const id = parseBookId(req.params.id ?? "");
           if (id === null) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
@@ -1677,7 +1808,7 @@ const server = serve({
     "/api/books/:id/thumb": {
       GET: async (req) => {
         try {
-          const id = parseBookId(req.params.id);
+          const id = parseBookId(req.params.id ?? "");
           if (id === null) {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
@@ -1789,8 +1920,71 @@ const server = serve({
 
     // Serve index.html for all unmatched routes
     "/*": index,
-  },
+} satisfies RouteTable;
 
+// --- Optional auth guard -----------------------------------------------------
+//
+// When auth is enabled, every /api, /opds, /mcp, and /pdfjs route requires a
+// valid session cookie or HTTP Basic credentials (the mechanism OPDS clients
+// use). The SPA shell and the endpoints above stay public.
+
+const PUBLIC_AUTH_PATHS = new Set([
+  "/api/health",
+  "/api/user/me",
+  "/api/user/login",
+  "/api/user/logout",
+  "/api/auth/setup",
+]);
+
+function isAuthProtectedPattern(pattern: string): boolean {
+  return (
+    pattern === "/api" ||
+    pattern === "/mcp" ||
+    pattern.startsWith("/api/") ||
+    pattern.startsWith("/opds") ||
+    pattern.startsWith("/pdfjs")
+  );
+}
+
+function unauthorizedResponse(pathname: string): Response {
+  const headers: Record<string, string> = { "Cache-Control": "no-store" };
+  // Advertise Basic auth only on OPDS paths: on /api it would pop up the
+  // browser's native login dialog over the SPA's own login screen.
+  if (pathname.startsWith("/opds")) {
+    headers["WWW-Authenticate"] = 'Basic realm="Caliber", charset="UTF-8"';
+  }
+  return Response.json({ error: "Authentication required" }, { status: 401, headers });
+}
+
+function withAuthGuard(routeTable: RouteTable): Record<string, unknown> {
+  const guarded: Record<string, unknown> = {};
+  for (const [pattern, route] of Object.entries(routeTable)) {
+    if (typeof route !== "object" || route === null || !isAuthProtectedPattern(pattern)) {
+      guarded[pattern] = route;
+      continue;
+    }
+    const wrapped: { [method: string]: RouteHandler } = {};
+    for (const [method, handler] of Object.entries(
+      route as { [method: string]: RouteHandler },
+    )) {
+      wrapped[method] = async (req) => {
+        const pathname = new URL(req.url).pathname;
+        if (PUBLIC_AUTH_PATHS.has(pathname)) return handler(req);
+        const authenticated = await authenticateRequest(req);
+        if (!authenticated) return unauthorizedResponse(pathname);
+        setRequestUser(req, authenticated);
+        return handler(req);
+      };
+    }
+    guarded[pattern] = wrapped;
+  }
+  return guarded;
+}
+
+const server = serve({
+  hostname: HOST,
+  port: parseBoundedInt(PORT, DEFAULT_PORT, { min: 1, max: 65535 }),
+  routes: (AUTH_ENABLED ? withAuthGuard(routes) : routes) as typeof routes,
   development: process.env.NODE_ENV !== "production" && {
     hmr: true,
     console: true,
@@ -1799,3 +1993,10 @@ const server = serve({
 
 console.log(`🚀 Server running at ${server.url}`);
 console.log(`📚 Library: ${LIBRARY_PATH}`);
+if (AUTH_ENABLED) {
+  console.log(
+    needsInitialSetup()
+      ? "🔒 Auth enabled: no accounts yet — create one in the browser or with `bun src/cli.ts user add <name>`"
+      : "🔒 Auth enabled",
+  );
+}
