@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.9](https://github.com/briansunter/caliber/compare/v0.1.8...v0.1.9) (2026-08-20)
+
+
+### Features
+
+* add optional multi-user authentication for web, API, and OPDS ([88887b6](https://github.com/briansunter/caliber/commit/88887b6a320653042f70634b8d9d1675ac97b0d8))
+
 ## [0.1.8](https://github.com/briansunter/caliber/compare/v0.1.7...v0.1.8) (2026-08-20)
 
 
