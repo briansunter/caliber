@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/briansunter/caliber/compare/v0.1.6...v0.1.7) (2026-08-20)
+
+
+### Bug Fixes
+
+* keep reader back inside app and fix detail button contrast ([2e1b706](https://github.com/briansunter/caliber/commit/2e1b7062bcee931df29b2c72242ab5587846ffc9))
+
 ## [0.1.6](https://github.com/briansunter/caliber/compare/v0.1.5...v0.1.6) (2026-07-15)
 
 
