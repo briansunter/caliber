@@ -2,6 +2,7 @@ import { createFileRoute, useParams, useNavigate } from "@tanstack/react-router"
 import { BookDetail } from "@/components/BookDetail";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft, BookOpen } from "lucide-react";
+import { useEffect } from "react";
 
 export const Route = createFileRoute("/book/$id")({
   component: BookDetailPage,
@@ -13,12 +14,32 @@ function BookDetailPage() {
   const navigate = useNavigate();
 
   function handleBack() {
-    if (window.history.length <= 1) {
-      navigate({ to: "/" });
-    } else {
-      window.history.back();
-    }
+    navigate({ to: "/" });
   }
+
+  // Ensure the browser's back button goes to the library instead of leaving
+  // the app when the detail page was opened as a direct link (e.g. from an
+  // external referrer or a bookmark). In that case history has no in-app
+  // entry to go back to, so we insert the library behind the detail page.
+  // Normal in-app navigation (library -> detail) already has the library
+  // behind us, so we leave history alone.
+  useEffect(() => {
+    let sameOriginReferrer = false;
+    try {
+      if (document.referrer) {
+        sameOriginReferrer = new URL(document.referrer).origin === window.location.origin;
+      }
+    } catch {
+      sameOriginReferrer = false;
+    }
+
+    if (sameOriginReferrer) return;
+
+    const detailHref = window.location.href;
+    // Insert the library entry behind the detail page so Back lands on it.
+    window.history.replaceState(null, "", "/");
+    window.history.pushState(null, "", detailHref);
+  }, []);
 
   return (
     <div className="min-h-screen bg-parchment paper-texture">
