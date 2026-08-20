@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8](https://github.com/briansunter/caliber/compare/v0.1.7...v0.1.8) (2026-08-20)
+
+
+### Bug Fixes
+
+* keep detail page back inside app ([67d5352](https://github.com/briansunter/caliber/commit/67d53523d668d994c788c6ec315b0ff33464153e))
+
 ## [0.1.7](https://github.com/briansunter/caliber/compare/v0.1.6...v0.1.7) (2026-08-20)
 
 
