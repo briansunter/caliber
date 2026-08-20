@@ -1,23 +1,23 @@
-import { useBook } from "@/hooks/useBooksInfinite";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
+import { Link } from "@tanstack/react-router";
 import {
-  Download,
-  Calendar,
-  User,
+  Bookmark,
+  BookOpen,
   BookText,
+  Building2,
+  Calendar,
+  ChevronRight,
+  Clock,
+  Download,
+  FileText,
   Hash,
   Star,
-  FileText,
-  Building2,
-  Bookmark,
-  Clock,
-  ChevronRight,
-  BookOpen,
+  User,
 } from "lucide-react";
-import { useState, useCallback, memo, useMemo, useEffect } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { useBook } from "@/hooks/useBooksInfinite";
 import { cn, stripHtmlTags } from "@/lib/utils";
-import { Link } from "@tanstack/react-router";
 
 interface BookDetailProps {
   bookId: number;
@@ -164,10 +164,9 @@ const FormatButton = memo(function FormatButton({
 
   return (
     <Button
-      variant="outline"
       size="sm"
       onClick={handleDownload}
-      className="group bg-foreground hover:bg-accent text-background hover:text-white border-foreground hover:border-accent transition-[background-color,border-color,color] duration-150 rounded text-xs uppercase tracking-wider font-semibold"
+      className="bg-neutral-900 hover:bg-neutral-800 text-white border-neutral-900 hover:border-neutral-800 shadow-sm transition-colors duration-150 rounded text-xs uppercase tracking-wider font-semibold"
     >
       <span className="flex items-center gap-2">
         <Download className="h-3.5 w-3.5" strokeWidth={2} />
@@ -295,7 +294,9 @@ export function BookDetail({ bookId }: BookDetailProps) {
             </div>
 
             {/* Read button */}
-            {book.formats.some((f) => f === "EPUB" || f === "PDF" || f === "CBZ" || f === "CBR") && (
+            {book.formats.some(
+              (f) => f === "EPUB" || f === "PDF" || f === "CBZ" || f === "CBR",
+            ) && (
               <div className="space-y-3">
                 <h3 className="text-xs font-semibold text-ink-muted uppercase tracking-widest">
                   Read
@@ -310,9 +311,8 @@ export function BookDetail({ bookId }: BookDetailProps) {
                         params={{ id: String(bookId), format: format.toLowerCase() }}
                       >
                         <Button
-                          variant="outline"
                           size="sm"
-                          className="group bg-primary hover:bg-primary/90 border-primary text-primary-foreground transition-[background-color,border-color,color] duration-150 rounded text-xs uppercase tracking-wider font-semibold cursor-pointer"
+                          className="bg-[#4f46e5] hover:bg-[#4338ca] text-white border-[#4f46e5] hover:border-[#4338ca] shadow-sm transition-colors duration-150 rounded text-xs uppercase tracking-wider font-semibold cursor-pointer"
                         >
                           <span className="flex items-center gap-2">
                             <BookOpen className="h-3.5 w-3.5" strokeWidth={2} />

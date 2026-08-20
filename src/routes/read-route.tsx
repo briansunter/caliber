@@ -1,9 +1,9 @@
 import { createFileRoute, useNavigate, useParams } from "@tanstack/react-router";
 import { BookOpen } from "lucide-react";
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useEffect } from "react";
 import { normalizeReaderLoadMode } from "@/components/reader-types";
-import { loadReaderSettings } from "@/lib/reader-settings";
 import { useBook } from "@/hooks/useBooksInfinite";
+import { loadReaderSettings } from "@/lib/reader-settings";
 
 const EpubReader = lazy(() =>
   import("@/components/EpubReader").then((m) => ({ default: m.EpubReader })),
@@ -32,12 +32,43 @@ function ReaderPage() {
     : loadReaderSettings().defaultLoadMode;
 
   const goBack = () => {
-    if (window.history.length <= 1) {
-      navigate({ to: "/" });
+    if (!Number.isNaN(bookId)) {
+      navigate({ to: "/book/$id", params: { id: String(bookId) } });
     } else {
-      window.history.back();
+      navigate({ to: "/" });
     }
   };
+
+  // Ensure the browser's back button goes to the book detail instead of
+  // leaving the app when the reader was opened as a direct link (e.g.
+  // from an external referrer or a bookmark). In that case history has no
+  // in-app entry to go back to, so we insert the detail page behind the
+  // reader. Normal in-app navigation (library -> detail -> reader) already
+  // has the detail behind us, so we leave history alone.
+  useEffect(() => {
+    if (Number.isNaN(bookId)) return;
+
+    let sameOriginReferrer = false;
+    try {
+      if (document.referrer) {
+        sameOriginReferrer = new URL(document.referrer).origin === window.location.origin;
+      }
+    } catch {
+      sameOriginReferrer = false;
+    }
+
+    // If the reader was reached via in-app navigation the referrer is same-origin
+    // (e.g. the book detail page) and there is already a useful entry behind us.
+    // Otherwise this is a direct open / external link and a single Back would
+    // leave Caliber, so insert the detail page behind the reader.
+    if (sameOriginReferrer) return;
+
+    const detailHref = `/book/${bookId}`;
+    const readerHref = window.location.href;
+    // Insert the detail entry behind the reader so Back lands on it.
+    window.history.replaceState(null, "", detailHref);
+    window.history.pushState(null, "", readerHref);
+  }, [bookId]);
 
   if (isLoading) {
     return (
