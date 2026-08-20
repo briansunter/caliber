@@ -74,14 +74,9 @@ Copy `.env.example` as a starting point for a deployment. Caliber copies the sou
 
 ## Authentication
 
-Authentication is optional and off by default. Enable it with `CALIBER_AUTH_ENABLED=true` (or `"authEnabled": true` in `config.json`) to require a username and password for the web app, the JSON API, the OPDS catalog, and the MCP endpoint. Each signed-in user gets their own reading-progress shelf.
+Authentication is optional and off by default. The simplest path is the Settings page: under **Authentication**, turn it on and — if no accounts exist yet — create the first account in the same step; you are signed in immediately. The change takes effect without a restart and persists to `config.json`, and the same panel adds, removes, and re-passwords accounts. Auth settings in the UI are available whenever Caliber runs on localhost, or to signed-in users once auth is on.
 
-Two standard mechanisms are supported:
-
-- **Web browser** — a login screen starts a server-side session (HttpOnly cookie, 30-day expiry, revocable by signing out).
-- **OPDS readers and API clients** — HTTP Basic Auth with the same credentials, which is what OPDS apps use. Point an OPDS reader at the feed URL (for example `http://localhost:3003/opds`) and enter your Caliber username and password when prompted.
-
-On first start with auth enabled and no accounts yet, the web UI offers to create the first account. That setup screen closes permanently once one user exists. Further accounts are managed from the CLI:
+For configuration-as-code, set `CALIBER_AUTH_ENABLED=true` (or `"authEnabled": true` in `config.json`) to require a username and password for the web app, the JSON API, the OPDS catalog, and the MCP endpoint. The environment variable takes precedence over `config.json` and disables runtime toggling. When auth is enabled with no accounts yet, the web UI offers to create the first account; that setup screen closes permanently once one user exists. Accounts can also be managed from the CLI:
 
 ```bash
 bun run cli -- user add alice              # hidden password prompt
@@ -90,6 +85,11 @@ bun run cli -- user list
 bun run cli -- user remove alice
 echo "secret-password" | bun run cli -- user add alice --password-stdin   # scripted
 ```
+
+Each signed-in user gets their own reading-progress shelf, and two standard mechanisms are supported:
+
+- **Web browser** — a login screen starts a server-side session (HttpOnly cookie, 30-day expiry, revocable by signing out).
+- **OPDS readers and API clients** — HTTP Basic Auth with the same credentials, which is what OPDS apps use. Point an OPDS reader at the feed URL (for example `http://localhost:3003/opds`) and enter your Caliber username and password when prompted.
 
 Accounts live in `users.db` in the config directory alongside reading progress, never in the Calibre library. Passwords are hashed with argon2id. Failed logins are throttled per username and client. If you expose Caliber beyond localhost, put it behind HTTPS (a reverse proxy with `CALIBER_TRUST_PROXY=true` and `CALIBER_BASE_URL` set) so session cookies and Basic credentials are not sent in cleartext.
 

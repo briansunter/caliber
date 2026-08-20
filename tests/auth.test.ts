@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
@@ -13,6 +13,12 @@ let configDir = "";
 let userDbPath = "";
 let baseUrl = "";
 let serverProcess: ReturnType<typeof Bun.spawn> | null = null;
+
+// A second instance with auth off and no env override, for testing the
+// Settings-driven enable/disable and account management flows.
+let configDir2 = "";
+let baseUrl2 = "";
+let serverProcess2: ReturnType<typeof Bun.spawn> | null = null;
 
 function drainPipe(pipe: unknown) {
   if (pipe instanceof ReadableStream) {
@@ -141,6 +147,14 @@ function serverEnv(port: number) {
   };
 }
 
+function server2Env(port: number) {
+  const env: Record<string, string | undefined> = { ...serverEnv(port) };
+  delete env.CALIBER_AUTH_ENABLED;
+  env.CALIBER_CONFIG_DIR = configDir2;
+  env.CALIBER_USER_DB_PATH = join(configDir2, "users.db");
+  return env;
+}
+
 async function runCli(args: string[], stdinData?: string) {
   const proc = Bun.spawn(["bun", "src/cli.ts", ...args], {
     cwd: process.cwd(),
@@ -171,17 +185,23 @@ function sessionCookie(response: Response): string {
   return match?.[1] ? `caliber-session=${match[1]}` : "";
 }
 
-async function json(path: string, init?: RequestInit) {
-  const response = await fetch(`${baseUrl}${path}`, init);
+async function jsonAt(base: string, path: string, init?: RequestInit) {
+  const response = await fetch(`${base}${path}`, init);
   const body = (await response.json().catch(() => null)) as unknown;
   return { response, body };
+}
+
+async function json(path: string, init?: RequestInit) {
+  return jsonAt(baseUrl, path, init);
 }
 
 beforeAll(async () => {
   tempDir = mkdtempSync(join(tmpdir(), "caliber-auth-"));
   libraryPath = join(tempDir, "library");
   configDir = join(tempDir, "config");
+  configDir2 = join(tempDir, "config2");
   mkdirSync(configDir, { recursive: true });
+  mkdirSync(configDir2, { recursive: true });
   userDbPath = join(configDir, "users.db");
   createFixtureLibrary();
   createLegacyUserDb();
@@ -198,12 +218,27 @@ beforeAll(async () => {
   drainPipe(serverProcess.stdout);
   drainPipe(serverProcess.stderr);
   await waitForServer(baseUrl);
+
+  const port2 = await freePort();
+  baseUrl2 = `http://localhost:${port2}`;
+  serverProcess2 = Bun.spawn(["bun", "src/index.ts"], {
+    cwd: process.cwd(),
+    env: server2Env(port2),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  drainPipe(serverProcess2.stdout);
+  drainPipe(serverProcess2.stderr);
+  await waitForServer(baseUrl2);
 }, TEST_TIMEOUT);
 
 afterAll(async () => {
-  if (serverProcess) {
-    serverProcess.kill();
-    await serverProcess.exited.catch(() => {});
+  for (const process_ of [serverProcess, serverProcess2]) {
+    if (process_) {
+      process_.kill();
+      await process_.exited.catch(() => {});
+    }
   }
   if (tempDir) rmSync(tempDir, { recursive: true, force: true });
 });
@@ -464,4 +499,187 @@ describe("login throttling", () => {
     }
     expect(sawTooMany).toBe(true);
   }, 30_000);
+});
+
+describe("auth configuration via the UI (loopback, no env override)", () => {
+  test("status reports auth off with no accounts and management allowed", async () => {
+    const { response, body } = await jsonAt(baseUrl2, "/api/config/auth");
+    expect(response.status).toBe(200);
+    expect(body).toEqual({
+      authEnabled: false,
+      hasAccounts: false,
+      canManage: true,
+      envControlled: false,
+      users: [],
+    });
+  });
+
+  test("enabling without credentials for the first account is rejected", async () => {
+    const { response } = await jsonAt(baseUrl2, "/api/config/auth", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: true }),
+    });
+    expect(response.status).toBe(400);
+    // Nothing changed.
+    const status = await jsonAt(baseUrl2, "/api/config/auth");
+    expect((status.body as { authEnabled: boolean }).authEnabled).toBe(false);
+  });
+
+  test("enabling creates the first account, signs in, and guards routes", async () => {
+    const { response, body } = await jsonAt(baseUrl2, "/api/config/auth", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: true, username: "ui-admin", password: "ui-password-1" }),
+    });
+    expect(response.status).toBe(200);
+    expect(body).toEqual({
+      authEnabled: true,
+      changed: true,
+      user: { id: expect.any(Number), username: "ui-admin" },
+    });
+    const cookie = sessionCookie(response);
+    expect(cookie).not.toBe("");
+
+    const anon = await fetch(`${baseUrl2}/api/books`);
+    expect(anon.status).toBe(401);
+
+    const authed = await fetch(`${baseUrl2}/api/books`, { headers: { Cookie: cookie } });
+    expect(authed.status).toBe(200);
+
+    const opds = await fetch(`${baseUrl2}/opds`, {
+      headers: { Authorization: basicAuth("ui-admin", "ui-password-1") },
+    });
+    expect(opds.status).toBe(200);
+
+    const persisted = readFileSync(join(configDir2, "config.json"), "utf-8");
+    expect(persisted).toContain('"authEnabled": true');
+  });
+
+  test("accounts can be added, re-passworded, and removed", async () => {
+    const login = await fetch(`${baseUrl2}/api/user/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "ui-admin", password: "ui-password-1" }),
+    });
+    const cookie = sessionCookie(login);
+    expect(cookie).not.toBe("");
+
+    const add = await jsonAt(baseUrl2, "/api/auth/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ username: "ui-second", password: "second-pass-1" }),
+    });
+    expect(add.response.status).toBe(200);
+    expect(add.body).toEqual({ user: { id: expect.any(Number), username: "ui-second" } });
+
+    const duplicate = await jsonAt(baseUrl2, "/api/auth/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ username: "ui-second", password: "second-pass-1" }),
+    });
+    expect(duplicate.response.status).toBe(409);
+
+    const secondLogin = await fetch(`${baseUrl2}/api/user/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "ui-second", password: "second-pass-1" }),
+    });
+    expect(secondLogin.status).toBe(200);
+
+    const changed = await jsonAt(baseUrl2, "/api/auth/users/ui-second/password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ password: "changed-pass-1" }),
+    });
+    expect(changed.response.status).toBe(200);
+
+    const oldLogin = await fetch(`${baseUrl2}/api/user/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "ui-second", password: "second-pass-1" }),
+    });
+    expect(oldLogin.status).toBe(401);
+    const newLogin = await fetch(`${baseUrl2}/api/user/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "ui-second", password: "changed-pass-1" }),
+    });
+    expect(newLogin.status).toBe(200);
+
+    const removed = await fetch(`${baseUrl2}/api/auth/users/ui-second`, {
+      method: "DELETE",
+      headers: { Cookie: cookie },
+    });
+    expect(removed.status).toBe(200);
+
+    const removedLogin = await fetch(`${baseUrl2}/api/user/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "ui-second", password: "changed-pass-1" }),
+    });
+    expect(removedLogin.status).toBe(401);
+
+    const status = await jsonAt(baseUrl2, "/api/config/auth", { headers: { Cookie: cookie } });
+    const users = (status.body as { users: Array<{ username: string }> }).users;
+    expect(users.map((user) => user.username)).toEqual(["ui-admin"]);
+  });
+
+  test("disabling over the API opens the server without a restart", async () => {
+    const login = await fetch(`${baseUrl2}/api/user/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "ui-admin", password: "ui-password-1" }),
+    });
+    const cookie = sessionCookie(login);
+
+    const disable = await jsonAt(baseUrl2, "/api/config/auth", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ enabled: false }),
+    });
+    expect(disable.response.status).toBe(200);
+    expect((disable.body as { authEnabled: boolean }).authEnabled).toBe(false);
+
+    const anon = await fetch(`${baseUrl2}/api/books`);
+    expect(anon.status).toBe(200);
+
+    const anonOpds = await fetch(`${baseUrl2}/opds`);
+    expect(anonOpds.status).toBe(200);
+
+    // The username-only profile flow works again.
+    const profileLogin = await fetch(`${baseUrl2}/api/user/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "casual-reader" }),
+    });
+    expect(profileLogin.status).toBe(200);
+  });
+});
+
+describe("auth configuration guards", () => {
+  test("environment override rejects runtime changes", async () => {
+    const { response, body } = await json("/api/config/auth", {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: basicAuth("alice", "alice-password-9"),
+      },
+      body: JSON.stringify({ enabled: false }),
+    });
+    expect(response.status).toBe(400);
+    expect((body as { error: string }).error).toContain("CALIBER_AUTH_ENABLED");
+
+    const status = await json("/api/config/auth", {
+      headers: { Authorization: basicAuth("alice", "alice-password-9") },
+    });
+    const parsed = status.body as {
+      authEnabled: boolean;
+      envControlled: boolean;
+      users?: Array<{ username: string }>;
+    };
+    expect(parsed.authEnabled).toBe(true);
+    expect(parsed.envControlled).toBe(true);
+    expect(parsed.users?.length).toBeGreaterThanOrEqual(2);
+  });
 });

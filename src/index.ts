@@ -57,11 +57,17 @@ import {
   upsertProgress,
   deleteProgress,
   clearProgress,
+  countUsersWithPassword,
+  deleteUser,
+  getCredentialByUsername,
+  listAuthUsers,
   type User,
 } from "./lib/user-db";
 import { join } from "node:path";
 import {
   AUTH_ENABLED,
+  AUTH_ENV_CONTROLLED,
+  AuthConfigError,
   CONFIG_DIR_PATH,
   COOKIE_SECURE,
   HOST,
@@ -71,6 +77,7 @@ import {
   PORT,
   PUBLIC_BASE_URL,
   saveLibraryConfig,
+  setAuthEnabled,
   TRUST_PROXY,
 } from "./lib/config";
 import {
@@ -190,6 +197,14 @@ async function currentUser(req: Request): Promise<User | null> {
 
 function publicUser(user: User) {
   return { id: user.id, username: user.username };
+}
+
+// Auth administration (toggle, accounts) is a local-operator action: allowed
+// when Caliber is bound to loopback, or — once auth is on — for a signed-in
+// user. On a network-exposed instance without auth it stays env/CLI-only.
+async function canManageAuth(req: Request): Promise<boolean> {
+  if (LOCAL_SETUP_HOSTS.has(HOST.toLowerCase())) return true;
+  return (await currentUser(req)) !== null;
 }
 
 // Initialize FTS on startup. A missing default library should leave the UI
@@ -831,6 +846,242 @@ const routes: RouteTable = {
       GET: (req) => {
         const stats = getLibraryStats();
         return getCachedResponse("stats", stats, req);
+      },
+    },
+
+    // --- Auth configuration & account management (Settings UI) ---
+
+    // Auth status for the Settings panel. The account list is only included
+    // for operators allowed to manage auth.
+    "/api/config/auth": {
+      GET: async (req) => {
+        const canManage = await canManageAuth(req);
+        return Response.json(
+          {
+            authEnabled: AUTH_ENABLED,
+            hasAccounts: countUsersWithPassword() > 0,
+            canManage,
+            envControlled: AUTH_ENV_CONTROLLED,
+            users: canManage
+              ? listAuthUsers().map((user) => ({
+                  id: user.id,
+                  username: user.username,
+                  hasPassword: user.hasPassword,
+                }))
+              : undefined,
+          },
+          { headers: { "Cache-Control": "no-store" } },
+        );
+      },
+      PUT: async (req) => {
+        if (!(await canManageAuth(req))) {
+          return Response.json(
+            {
+              error:
+                "Authentication settings are available only when Caliber runs on loopback or while signed in",
+            },
+            { status: 403, headers: { "Cache-Control": "no-store" } },
+          );
+        }
+
+        let rawBody: unknown;
+        try {
+          rawBody = await readJsonBody(req);
+        } catch (error) {
+          return requestBodyErrorResponse(error);
+        }
+        if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
+          return Response.json({ error: "Request body must be an object" }, { status: 400 });
+        }
+        const body = rawBody as { enabled?: unknown; username?: unknown; password?: unknown };
+        if (typeof body.enabled !== "boolean") {
+          return Response.json({ error: "enabled must be a boolean" }, { status: 400 });
+        }
+
+        if (body.enabled === AUTH_ENABLED) {
+          return Response.json(
+            { authEnabled: AUTH_ENABLED, changed: false },
+            { headers: { "Cache-Control": "no-store" } },
+          );
+        }
+
+        // When turning auth on with no accounts yet, the operator creates the
+        // first account in the same request and is signed in immediately.
+        const needsAccount = body.enabled && countUsersWithPassword() === 0;
+        const username = typeof body.username === "string" ? body.username : "";
+        const password = typeof body.password === "string" ? body.password : "";
+        if (needsAccount && !isValidUsername(username)) {
+          return Response.json({ error: "Invalid username" }, { status: 400 });
+        }
+        if (needsAccount && password.length < MIN_PASSWORD_LENGTH) {
+          return Response.json(
+            { error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` },
+            { status: 400 },
+          );
+        }
+
+        try {
+          setAuthEnabled(body.enabled);
+        } catch (error) {
+          if (error instanceof AuthConfigError) {
+            return Response.json(
+              { error: error.message },
+              { status: 400, headers: { "Cache-Control": "no-store" } },
+            );
+          }
+          throw error;
+        }
+
+        if (needsAccount) {
+          try {
+            const user = await setPasswordForUser(username, password);
+            purgeExpiredSessions();
+            const session = createSessionToken(user.id);
+            return Response.json(
+              { authEnabled: true, changed: true, user: publicUser(user) },
+              {
+                headers: {
+                  "Set-Cookie": sessionCookieHeader(session.token),
+                  "Cache-Control": "no-store",
+                },
+              },
+            );
+          } catch (error) {
+            if (error instanceof PasswordError) {
+              return Response.json({ error: error.message }, { status: 400 });
+            }
+            throw error;
+          }
+        }
+
+        return Response.json(
+          { authEnabled: AUTH_ENABLED, changed: true },
+          { headers: { "Cache-Control": "no-store" } },
+        );
+      },
+    },
+
+    // Account administration for the Settings panel. Same operator rules as
+    // the auth toggle above; the guard additionally requires a session
+    // whenever auth is enabled.
+    "/api/auth/users": {
+      POST: async (req) => {
+        if (!(await canManageAuth(req))) {
+          return Response.json(
+            { error: "Account management is available only on loopback or while signed in" },
+            { status: 403, headers: { "Cache-Control": "no-store" } },
+          );
+        }
+
+        let rawBody: unknown;
+        try {
+          rawBody = await readJsonBody(req);
+        } catch (error) {
+          return requestBodyErrorResponse(error);
+        }
+        if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
+          return Response.json({ error: "Request body must be an object" }, { status: 400 });
+        }
+        const body = rawBody as { username?: unknown; password?: unknown };
+        const username = typeof body.username === "string" ? body.username : "";
+        const password = typeof body.password === "string" ? body.password : "";
+        if (!isValidUsername(username)) {
+          return Response.json({ error: "Invalid username" }, { status: 400 });
+        }
+        if (password.length < MIN_PASSWORD_LENGTH) {
+          return Response.json(
+            { error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` },
+            { status: 400 },
+          );
+        }
+
+        const existing = getCredentialByUsername(username);
+        if (existing?.passwordHash) {
+          return Response.json(
+            { error: `${existing.username} already has a password` },
+            { status: 409 },
+          );
+        }
+
+        try {
+          const user = await setPasswordForUser(username, password);
+          return Response.json(
+            { user: publicUser(user) },
+            { headers: { "Cache-Control": "no-store" } },
+          );
+        } catch (error) {
+          if (error instanceof PasswordError) {
+            return Response.json({ error: error.message }, { status: 400 });
+          }
+          throw error;
+        }
+      },
+    },
+
+    "/api/auth/users/:username": {
+      DELETE: async (req) => {
+        if (!(await canManageAuth(req))) {
+          return Response.json(
+            { error: "Account management is available only on loopback or while signed in" },
+            { status: 403, headers: { "Cache-Control": "no-store" } },
+          );
+        }
+        const username = decodeURIComponent(req.params.username ?? "");
+        const removed = deleteUser(username);
+        if (!removed) {
+          return Response.json({ error: "User not found" }, { status: 404 });
+        }
+        return Response.json(
+          { removed: removed.username },
+          { headers: { "Cache-Control": "no-store" } },
+        );
+      },
+    },
+
+    "/api/auth/users/:username/password": {
+      POST: async (req) => {
+        if (!(await canManageAuth(req))) {
+          return Response.json(
+            { error: "Account management is available only on loopback or while signed in" },
+            { status: 403, headers: { "Cache-Control": "no-store" } },
+          );
+        }
+        const username = decodeURIComponent(req.params.username ?? "");
+        const target = getUserByUsername(username);
+        if (!target) {
+          return Response.json({ error: "User not found" }, { status: 404 });
+        }
+
+        let rawBody: unknown;
+        try {
+          rawBody = await readJsonBody(req);
+        } catch (error) {
+          return requestBodyErrorResponse(error);
+        }
+        if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
+          return Response.json({ error: "Request body must be an object" }, { status: 400 });
+        }
+        const body = rawBody as { password?: unknown };
+        const password = typeof body.password === "string" ? body.password : "";
+        if (password.length < MIN_PASSWORD_LENGTH) {
+          return Response.json(
+            { error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` },
+            { status: 400 },
+          );
+        }
+
+        try {
+          const user = await setPasswordForUser(target.username, password);
+          return Response.json(
+            { user: publicUser(user) },
+            { headers: { "Cache-Control": "no-store" } },
+          );
+        } catch (error) {
+          if (error instanceof PasswordError) {
+            return Response.json({ error: error.message }, { status: 400 });
+          }
+          throw error;
+        }
       },
     },
 
@@ -1924,9 +2175,11 @@ const routes: RouteTable = {
 
 // --- Optional auth guard -----------------------------------------------------
 //
-// When auth is enabled, every /api, /opds, /mcp, and /pdfjs route requires a
-// valid session cookie or HTTP Basic credentials (the mechanism OPDS clients
-// use). The SPA shell and the endpoints above stay public.
+// Handlers are always wrapped; on each request the wrapper checks the live
+// AUTH_ENABLED binding so the Settings UI can toggle auth without a restart.
+// When enabled, every /api, /opds, /mcp, and /pdfjs route requires a valid
+// session cookie or HTTP Basic credentials (the mechanism OPDS clients use).
+// The SPA shell and the endpoints above stay public.
 
 const PUBLIC_AUTH_PATHS = new Set([
   "/api/health",
@@ -1968,6 +2221,7 @@ function withAuthGuard(routeTable: RouteTable): Record<string, unknown> {
       route as { [method: string]: RouteHandler },
     )) {
       wrapped[method] = async (req) => {
+        if (!AUTH_ENABLED) return handler(req);
         const pathname = new URL(req.url).pathname;
         if (PUBLIC_AUTH_PATHS.has(pathname)) return handler(req);
         const authenticated = await authenticateRequest(req);
@@ -1984,7 +2238,7 @@ function withAuthGuard(routeTable: RouteTable): Record<string, unknown> {
 const server = serve({
   hostname: HOST,
   port: parseBoundedInt(PORT, DEFAULT_PORT, { min: 1, max: 65535 }),
-  routes: (AUTH_ENABLED ? withAuthGuard(routes) : routes) as typeof routes,
+  routes: withAuthGuard(routes) as typeof routes,
   development: process.env.NODE_ENV !== "production" && {
     hmr: true,
     console: true,

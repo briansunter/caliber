@@ -214,10 +214,44 @@ export const COOKIE_SECURE = readEnvBoolean(
   "CALIBER_COOKIE_SECURE",
   readBoolean(config.cookieSecure, DEFAULTS.cookieSecure),
 );
-export const AUTH_ENABLED = readEnvBoolean(
+export const AUTH_ENV_CONTROLLED = process.env.CALIBER_AUTH_ENABLED !== undefined;
+export let AUTH_ENABLED = readEnvBoolean(
   "CALIBER_AUTH_ENABLED",
   readBoolean(config.authEnabled, DEFAULTS.authEnabled),
 );
+
+export class AuthConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AuthConfigError";
+  }
+}
+
+/**
+ * Toggle authentication at runtime and persist the choice to config.json.
+ * Importers see the new value through the live `AUTH_ENABLED` binding.
+ */
+export function setAuthEnabled(enabled: boolean): void {
+  if (AUTH_ENV_CONTROLLED) {
+    throw new AuthConfigError(
+      "Authentication is controlled by the CALIBER_AUTH_ENABLED environment variable",
+    );
+  }
+
+  AUTH_ENABLED = enabled;
+  config.authEnabled = enabled;
+
+  try {
+    mkdirSync(CONFIG_DIR, { recursive: true });
+  } catch {
+    // A read-only config directory still allows runtime toggling; the choice
+    // just will not persist across restarts.
+    return;
+  }
+  const temporaryPath = `${CONFIG_PATH}.tmp-${process.pid}`;
+  writeFileSync(temporaryPath, `${JSON.stringify({ ...config }, null, 2)}\n`);
+  replaceFile(temporaryPath, CONFIG_PATH);
+}
 const configuredRefreshInterval = Number(
   process.env.CALIBER_DB_REFRESH_INTERVAL_MS ?? config.dbRefreshIntervalMs,
 );

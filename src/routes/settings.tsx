@@ -1,5 +1,6 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { ArrowLeft, RotateCcw, Settings as SettingsIcon } from "lucide-react";
+import { AuthConfigPanel } from "@/components/AuthConfigPanel";
 import { LibraryConfigPanel } from "@/components/LibraryConfigPanel";
 import {
   DEFAULT_READER_SETTINGS,
@@ -91,6 +92,7 @@ function SettingsComponent() {
         </div>
 
         <LibraryConfigPanel />
+        <AuthConfigPanel />
 
         {/* Reader memory section */}
         <section className="bg-surface border border-ink rounded-lg shadow-sm p-4 sm:p-6">
