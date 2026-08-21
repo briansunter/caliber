@@ -1,6 +1,6 @@
 import { createFileRoute, useNavigate, useParams } from "@tanstack/react-router";
 import { BookOpen } from "lucide-react";
-import { lazy, Suspense, useEffect } from "react";
+import { lazy, Suspense, useCallback, useEffect } from "react";
 import { normalizeReaderLoadMode } from "@/components/reader-types";
 import { useBook } from "@/hooks/useBooksInfinite";
 import { loadReaderSettings } from "@/lib/reader-settings";
@@ -31,13 +31,13 @@ function ReaderPage() {
     ? normalizeReaderLoadMode(modeParam)
     : loadReaderSettings().defaultLoadMode;
 
-  const goBack = () => {
+  const goBack = useCallback(() => {
     if (!Number.isNaN(bookId)) {
       navigate({ to: "/book/$id", params: { id: String(bookId) } });
     } else {
       navigate({ to: "/" });
     }
-  };
+  }, [bookId, navigate]);
 
   // Ensure the browser's back button goes to the book detail instead of
   // leaving the app when the reader was opened as a direct link (e.g.

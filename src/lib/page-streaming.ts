@@ -5,6 +5,7 @@ import { basename, extname, join } from "node:path";
 import { CONFIG_DIR_PATH } from "./config";
 import { getBookFormatPath } from "./calibre-optimized";
 import { getPathContentType } from "./book-files";
+import { runSingleFlight } from "./epub-cache";
 import { type SourceSignature, getSourceSignature, isSameSignature } from "./file-signature";
 
 const PAGE_CACHE_DIR = join(CONFIG_DIR_PATH, "page-cache");
@@ -124,63 +125,65 @@ async function ensureCbzCache(bookId: number): Promise<{ cacheDir: string; meta:
     return { cacheDir, meta: memEntry.meta };
   }
 
-  const existingMeta = await readJson<PageCacheMeta>(metaPath);
+  return runSingleFlight(cacheKey, async () => {
+    const existingMeta = await readJson<PageCacheMeta>(metaPath);
 
-  if (
-    existingMeta &&
-    isSameSignature(existingMeta.source, source) &&
-    existingMeta.pages.every((page) => existsSync(join(cacheDir, page.fileName)))
-  ) {
-    metaMemCache.set(cacheKey, { meta: existingMeta, signature: source });
-    return { cacheDir, meta: existingMeta };
-  }
-
-  metaMemCache.delete(cacheKey);
-  rmSync(cacheDir, { recursive: true, force: true });
-  mkdirSync(cacheDir, { recursive: true });
-
-  const zip = await JSZip.loadAsync(await Bun.file(sourcePath).arrayBuffer());
-  const imageEntries = Object.values(zip.files)
-    .filter((entry) => !entry.dir && IMAGE_EXTENSIONS.has(extname(entry.name).toLowerCase()))
-    .sort((a, b) => sortPageNames(a.name, b.name));
-
-  if (imageEntries.length === 0) {
-    throw new PageStreamingError(422, "CBZ contains no image pages");
-  }
-  if (imageEntries.length > MAX_PAGE_COUNT) {
-    throw new PageStreamingError(413, "CBZ contains too many pages");
-  }
-
-  const pages: CachedPage[] = [];
-  let extractedBytes = 0;
-  for (const [offset, entry] of imageEntries.entries()) {
-    const index = offset + 1;
-    const ext = extname(entry.name).toLowerCase() || ".bin";
-    const fileName = `${String(index).padStart(5, "0")}${ext}`;
-    const outputPath = join(cacheDir, fileName);
-    const data = await entry.async("uint8array");
-    extractedBytes += data.byteLength;
-    if (extractedBytes > MAX_CACHE_BYTES) {
-      throw new PageStreamingError(413, "CBZ expands beyond the reader cache limit");
+    if (
+      existingMeta &&
+      isSameSignature(existingMeta.source, source) &&
+      existingMeta.pages.every((page) => existsSync(join(cacheDir, page.fileName)))
+    ) {
+      metaMemCache.set(cacheKey, { meta: existingMeta, signature: source });
+      return { cacheDir, meta: existingMeta };
     }
-    await Bun.write(outputPath, data);
-    pages.push({
-      index,
-      name: basename(entry.name),
-      fileName,
-      contentType: getPathContentType(fileName),
-    });
-  }
 
-  const meta: PageCacheMeta = {
-    source,
-    pageCount: pages.length,
-    pages,
-  };
-  await Bun.write(metaPath, `${JSON.stringify(meta)}\n`);
-  metaMemCache.set(cacheKey, { meta, signature: source });
+    metaMemCache.delete(cacheKey);
+    rmSync(cacheDir, { recursive: true, force: true });
+    mkdirSync(cacheDir, { recursive: true });
 
-  return { cacheDir, meta };
+    const zip = await JSZip.loadAsync(await Bun.file(sourcePath).arrayBuffer());
+    const imageEntries = Object.values(zip.files)
+      .filter((entry) => !entry.dir && IMAGE_EXTENSIONS.has(extname(entry.name).toLowerCase()))
+      .sort((a, b) => sortPageNames(a.name, b.name));
+
+    if (imageEntries.length === 0) {
+      throw new PageStreamingError(422, "CBZ contains no image pages");
+    }
+    if (imageEntries.length > MAX_PAGE_COUNT) {
+      throw new PageStreamingError(413, "CBZ contains too many pages");
+    }
+
+    const pages: CachedPage[] = [];
+    let extractedBytes = 0;
+    for (const [offset, entry] of imageEntries.entries()) {
+      const index = offset + 1;
+      const ext = extname(entry.name).toLowerCase() || ".bin";
+      const fileName = `${String(index).padStart(5, "0")}${ext}`;
+      const outputPath = join(cacheDir, fileName);
+      const data = await entry.async("uint8array");
+      extractedBytes += data.byteLength;
+      if (extractedBytes > MAX_CACHE_BYTES) {
+        throw new PageStreamingError(413, "CBZ expands beyond the reader cache limit");
+      }
+      await Bun.write(outputPath, data);
+      pages.push({
+        index,
+        name: basename(entry.name),
+        fileName,
+        contentType: getPathContentType(fileName),
+      });
+    }
+
+    const meta: PageCacheMeta = {
+      source,
+      pageCount: pages.length,
+      pages,
+    };
+    await Bun.write(metaPath, `${JSON.stringify(meta)}\n`);
+    metaMemCache.set(cacheKey, { meta, signature: source });
+
+    return { cacheDir, meta };
+  });
 }
 
 async function getUnrarWasmBinary(): Promise<ArrayBuffer> {
@@ -202,83 +205,85 @@ async function ensureCbrCache(bookId: number): Promise<{ cacheDir: string; meta:
     return { cacheDir, meta: memEntry.meta };
   }
 
-  const existingMeta = await readJson<PageCacheMeta>(metaPath);
+  return runSingleFlight(cacheKey, async () => {
+    const existingMeta = await readJson<PageCacheMeta>(metaPath);
 
-  if (
-    existingMeta &&
-    isSameSignature(existingMeta.source, source) &&
-    existingMeta.pages.every((page) => existsSync(join(cacheDir, page.fileName)))
-  ) {
-    metaMemCache.set(cacheKey, { meta: existingMeta, signature: source });
-    return { cacheDir, meta: existingMeta };
-  }
-
-  metaMemCache.delete(cacheKey);
-  rmSync(cacheDir, { recursive: true, force: true });
-  mkdirSync(cacheDir, { recursive: true });
-
-  const archiveData = await Bun.file(sourcePath).arrayBuffer();
-  const extractor = await createExtractorFromData({
-    data: archiveData,
-    wasmBinary: await getUnrarWasmBinary(),
-  });
-  const list = extractor.getFileList();
-  const imageNames = [...list.fileHeaders]
-    .filter((header) => !header.flags.directory && IMAGE_EXTENSIONS.has(extname(header.name).toLowerCase()))
-    .map((header) => header.name)
-    .sort(sortPageNames);
-
-  if (imageNames.length === 0) {
-    throw new PageStreamingError(422, "CBR contains no image pages");
-  }
-  if (imageNames.length > MAX_PAGE_COUNT) {
-    throw new PageStreamingError(413, "CBR contains too many pages");
-  }
-
-  const imageNameSet = new Set(imageNames);
-  const extracted = extractor.extract({ files: (header) => imageNameSet.has(header.name) });
-  const extractedPages = new Map<string, Uint8Array>();
-  for (const file of extracted.files) {
-    if (file.extraction) {
-      extractedPages.set(file.fileHeader.name, file.extraction);
-    }
-  }
-
-  const pages: CachedPage[] = [];
-  let extractedBytes = 0;
-  for (const [offset, name] of imageNames.entries()) {
-    const data = extractedPages.get(name);
-    if (!data) continue;
-    extractedBytes += data.byteLength;
-    if (extractedBytes > MAX_CACHE_BYTES) {
-      throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
+    if (
+      existingMeta &&
+      isSameSignature(existingMeta.source, source) &&
+      existingMeta.pages.every((page) => existsSync(join(cacheDir, page.fileName)))
+    ) {
+      metaMemCache.set(cacheKey, { meta: existingMeta, signature: source });
+      return { cacheDir, meta: existingMeta };
     }
 
-    const index = offset + 1;
-    const ext = extname(name).toLowerCase() || ".bin";
-    const fileName = `${String(index).padStart(5, "0")}${ext}`;
-    await Bun.write(join(cacheDir, fileName), data);
-    pages.push({
-      index,
-      name: basename(name),
-      fileName,
-      contentType: getPathContentType(fileName),
+    metaMemCache.delete(cacheKey);
+    rmSync(cacheDir, { recursive: true, force: true });
+    mkdirSync(cacheDir, { recursive: true });
+
+    const archiveData = await Bun.file(sourcePath).arrayBuffer();
+    const extractor = await createExtractorFromData({
+      data: archiveData,
+      wasmBinary: await getUnrarWasmBinary(),
     });
-  }
+    const list = extractor.getFileList();
+    const imageNames = [...list.fileHeaders]
+      .filter((header) => !header.flags.directory && IMAGE_EXTENSIONS.has(extname(header.name).toLowerCase()))
+      .map((header) => header.name)
+      .sort(sortPageNames);
 
-  if (pages.length === 0) {
-    throw new PageStreamingError(422, "CBR pages could not be extracted");
-  }
+    if (imageNames.length === 0) {
+      throw new PageStreamingError(422, "CBR contains no image pages");
+    }
+    if (imageNames.length > MAX_PAGE_COUNT) {
+      throw new PageStreamingError(413, "CBR contains too many pages");
+    }
 
-  const meta: PageCacheMeta = {
-    source,
-    pageCount: pages.length,
-    pages,
-  };
-  await Bun.write(metaPath, `${JSON.stringify(meta)}\n`);
-  metaMemCache.set(cacheKey, { meta, signature: source });
+    const imageNameSet = new Set(imageNames);
+    const extracted = extractor.extract({ files: (header) => imageNameSet.has(header.name) });
+    const extractedPages = new Map<string, Uint8Array>();
+    for (const file of extracted.files) {
+      if (file.extraction) {
+        extractedPages.set(file.fileHeader.name, file.extraction);
+      }
+    }
 
-  return { cacheDir, meta };
+    const pages: CachedPage[] = [];
+    let extractedBytes = 0;
+    for (const [offset, name] of imageNames.entries()) {
+      const data = extractedPages.get(name);
+      if (!data) continue;
+      extractedBytes += data.byteLength;
+      if (extractedBytes > MAX_CACHE_BYTES) {
+        throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
+      }
+
+      const index = offset + 1;
+      const ext = extname(name).toLowerCase() || ".bin";
+      const fileName = `${String(index).padStart(5, "0")}${ext}`;
+      await Bun.write(join(cacheDir, fileName), data);
+      pages.push({
+        index,
+        name: basename(name),
+        fileName,
+        contentType: getPathContentType(fileName),
+      });
+    }
+
+    if (pages.length === 0) {
+      throw new PageStreamingError(422, "CBR pages could not be extracted");
+    }
+
+    const meta: PageCacheMeta = {
+      source,
+      pageCount: pages.length,
+      pages,
+    };
+    await Bun.write(metaPath, `${JSON.stringify(meta)}\n`);
+    metaMemCache.set(cacheKey, { meta, signature: source });
+
+    return { cacheDir, meta };
+  });
 }
 
 function executable(candidates: string[], fallback: string): string {
@@ -371,34 +376,38 @@ async function ensurePdfCache(bookId: number): Promise<{ cacheDir: string; sourc
   const source = getSourceSignature(sourcePath);
   const cacheDir = getCacheDir(bookId, format);
   const metaPath = join(cacheDir, CACHE_META_FILE);
-  const existingMeta = await readJson<PageCacheMeta>(metaPath);
+  const cacheKey = metaCacheKey(bookId, format);
 
-  if (existingMeta && isSameSignature(existingMeta.source, source)) {
-    return {
-      cacheDir,
-      sourcePath,
+  return runSingleFlight(cacheKey, async () => {
+    const existingMeta = await readJson<PageCacheMeta>(metaPath);
+
+    if (existingMeta && isSameSignature(existingMeta.source, source)) {
+      return {
+        cacheDir,
+        sourcePath,
+        source,
+        pageCount: existingMeta.pageCount,
+      };
+    }
+
+    rmSync(cacheDir, { recursive: true, force: true });
+    mkdirSync(cacheDir, { recursive: true });
+
+    const pageCount = await getPdfPageCount(sourcePath);
+    const meta: PageCacheMeta = {
       source,
-      pageCount: existingMeta.pageCount,
+      pageCount,
+      pages: Array.from({ length: pageCount }, (_, offset) => ({
+        index: offset + 1,
+        name: `Page ${offset + 1}`,
+        fileName: `${String(offset + 1).padStart(5, "0")}.png`,
+        contentType: "image/png",
+      })),
     };
-  }
+    await Bun.write(metaPath, `${JSON.stringify(meta)}\n`);
 
-  rmSync(cacheDir, { recursive: true, force: true });
-  mkdirSync(cacheDir, { recursive: true });
-
-  const pageCount = await getPdfPageCount(sourcePath);
-  const meta: PageCacheMeta = {
-    source,
-    pageCount,
-    pages: Array.from({ length: pageCount }, (_, offset) => ({
-      index: offset + 1,
-      name: `Page ${offset + 1}`,
-      fileName: `${String(offset + 1).padStart(5, "0")}.png`,
-      contentType: "image/png",
-    })),
-  };
-  await Bun.write(metaPath, `${JSON.stringify(meta)}\n`);
-
-  return { cacheDir, sourcePath, source, pageCount };
+    return { cacheDir, sourcePath, source, pageCount };
+  });
 }
 
 async function getPdfPageFile(bookId: number, page: number): Promise<PageFile> {

@@ -110,7 +110,9 @@ let libraryPath = "";
 let configDir = "";
 let lib: CalibrerLib;
 
-// 10 books with known properties for cursor / sort tests
+// 22 books: ids 1-10 ASCII fixtures; ids 11-22 add non-ASCII regression
+// coverage where JS `.toLowerCase()` and SQLite's ASCII-only `lower()`
+// disagree (É/é, İ, ß, Ü, Å, Æ) — see "non-ASCII" describes below.
 const BOOKS: BookSpec[] = [
   { id: 1, title: "Aardvark Tales", sort: "Aardvark Tales", authorSort: "Smith, Alice", timestamp: "2024-01-10 00:00:00+00:00", rating: 10 },
   { id: 2, title: "Banana Dreams", sort: "Banana Dreams", authorSort: "Jones, Bob", timestamp: "2024-01-02 00:00:00+00:00", rating: 8 },
@@ -122,6 +124,18 @@ const BOOKS: BookSpec[] = [
   { id: 8, title: "Honey Bee", sort: "Honey Bee", authorSort: "Clark, Hank", timestamp: "2024-01-03 00:00:00+00:00", rating: 4 },
   { id: 9, title: "Igloo Nights", sort: "Igloo Nights", authorSort: "Davis, Iris", timestamp: "2024-01-07 00:00:00+00:00", rating: 2 },
   { id: 10, title: "Jungle Book", sort: "Jungle Book", authorSort: "Evans, Jack", timestamp: "2024-01-05 00:00:00+00:00" },
+  { id: 11, title: "Alpha", sort: "Alpha", authorSort: "Adams, John", timestamp: "2024-01-13 00:00:00+00:00" },
+  { id: 12, title: "Apfel", sort: "Apfel", authorSort: "Böll, Heinrich", timestamp: "2024-01-14 00:00:00+00:00" },
+  { id: 13, title: "Banane", sort: "Banane", authorSort: "Céline, Louis-Ferdinand", timestamp: "2024-01-15 00:00:00+00:00" },
+  { id: 14, title: "Cidre", sort: "Cidre", authorSort: "Dumas, Alexandre", timestamp: "2024-01-16 00:00:00+00:00" },
+  { id: 15, title: "Éclair", sort: "Éclair", authorSort: "Eco, Umberto", timestamp: "2024-01-17 00:00:00+00:00" },
+  { id: 16, title: "étagère", sort: "étagère", authorSort: "Foer, Jonathan Safran", timestamp: "2024-01-18 00:00:00+00:00" },
+  { id: 17, title: "İstanbul", sort: "İstanbul", authorSort: "Gauguin, Paul", timestamp: "2024-01-19 00:00:00+00:00" },
+  { id: 18, title: "Straße", sort: "Straße", authorSort: "Høeg, Peter", timestamp: "2024-01-20 00:00:00+00:00" },
+  { id: 19, title: "Überfall", sort: "Überfall", authorSort: "Ibsen, Henrik", timestamp: "2024-01-21 00:00:00+00:00" },
+  { id: 20, title: "Zebra", sort: "Zebra", authorSort: "Jansson, Tove", timestamp: "2024-01-22 00:00:00+00:00" },
+  { id: 21, title: "Ångström", sort: "Ångström", authorSort: "Knausgård, Karl Ove", timestamp: "2024-01-23 00:00:00+00:00" },
+  { id: 22, title: "Ærø", sort: "Ærø", authorSort: "Lagerlöf, Selma", timestamp: "2024-01-24 00:00:00+00:00" },
 ];
 
 // Tags for the tag-filter (OR) tests. Membership:
@@ -181,108 +195,93 @@ function allIds(
   return ids;
 }
 
+type ListOpts = NonNullable<Parameters<CalibrerLib["listBooksCursor"]>[0]>;
+
+// Follows nextCursor to assemble the full ordered item list.
+function collectPages(
+  sortBy: NonNullable<ListOpts["sortBy"]>,
+  sortOrder: NonNullable<ListOpts["sortOrder"]>,
+  pageSize = 5,
+): ReturnType<CalibrerLib["listBooksCursor"]>["items"] {
+  const items: ReturnType<CalibrerLib["listBooksCursor"]>["items"] = [];
+  let cursor: string | undefined = undefined;
+  let guard = 0;
+  for (;;) {
+    const page = lib.listBooksCursor({ limit: pageSize, sortBy, sortOrder, cursor });
+    for (const item of page.items) items.push(item);
+    if (!page.nextCursor) break;
+    cursor = page.nextCursor;
+    guard += 1;
+    expect(guard).toBeLessThan(100); // no runaway pagination loops
+  }
+  return items;
+}
+
 // ---------------------------------------------------------------------------
 // 1. Cursor round-trip tests
 // ---------------------------------------------------------------------------
 
 describe("cursor round-trip: title sort", () => {
-  test("asc: page1 + page2 contain all ids, no dups, correct order", () => {
-    const page1 = lib.listBooksCursor({ limit: 5, sortBy: "title", sortOrder: "asc" });
-    expect(page1.items).toHaveLength(5);
-    expect(page1.nextCursor).toBeTruthy();
+  function expectWalkMatchesSingleQuery(sortBy: "title", sortOrder: "asc" | "desc") {
+    const walked = collectPages(sortBy, sortOrder);
+    const ids = walked.map((b) => b.id);
+    expect(ids).toHaveLength(BOOKS.length);
+    expect(new Set(ids).size).toBe(BOOKS.length);
 
-    const page2 = lib.listBooksCursor({
-      limit: 5,
-      sortBy: "title",
-      sortOrder: "asc",
-      cursor: page1.nextCursor!,
-    });
-    expect(page2.items).toHaveLength(5);
+    const expected = lib.listBooksCursor({ limit: 200, sortBy, sortOrder }).items.map((b) => b.id);
+    expect(ids).toEqual(expected);
+  }
 
-    const allItems = [...page1.items, ...page2.items];
-    const ids = allItems.map((b) => b.id);
-    expect(new Set(ids).size).toBe(10);
-    expect(ids).toHaveLength(10);
-
-    // Verify ordering holds across boundary
-    for (let i = 1; i < allItems.length; i++) {
-      const prev = allItems[i - 1]!;
-      const curr = allItems[i]!;
-      const prevSort = (prev.sort || prev.title).toLowerCase();
-      const currSort = (curr.sort || curr.title).toLowerCase();
-      expect(prevSort <= currSort).toBe(true);
-      if (prevSort === currSort) expect(prev.id).toBeLessThan(curr.id);
-    }
+  test("asc: walk covers every book once and matches single-query order", () => {
+    expectWalkMatchesSingleQuery("title", "asc");
   });
 
-  test("desc: page1 + page2 contain all ids, no dups, correct order", () => {
-    const page1 = lib.listBooksCursor({ limit: 5, sortBy: "title", sortOrder: "desc" });
-    expect(page1.nextCursor).toBeTruthy();
+  test("desc: walk covers every book once and matches single-query order", () => {
+    expectWalkMatchesSingleQuery("title", "desc");
+  });
 
-    const page2 = lib.listBooksCursor({
-      limit: 5,
-      sortBy: "title",
-      sortOrder: "desc",
-      cursor: page1.nextCursor!,
-    });
-
-    const allItems = [...page1.items, ...page2.items];
-    const ids = allItems.map((b) => b.id);
-    expect(new Set(ids).size).toBe(10);
-
-    for (let i = 1; i < allItems.length; i++) {
-      const prev = allItems[i - 1]!;
-      const curr = allItems[i]!;
-      const prevSort = (prev.sort || prev.title).toLowerCase();
-      const currSort = (curr.sort || curr.title).toLowerCase();
-      expect(prevSort >= currSort).toBe(true);
-    }
+  test("non-ASCII titles survive page-size-1 boundaries", () => {
+    const ids = collectPages("title", "asc", 1).map((b) => b.id);
+    const expected = lib.listBooksCursor({ limit: 200, sortBy: "title", sortOrder: "asc" }).items.map(
+      (b) => b.id,
+    );
+    expect(ids).toEqual(expected);
+    // Titles whose JS-lowercased key differs from the SQL sort key are present
+    expect(ids).toEqual(expect.arrayContaining([15, 16, 17, 18, 19, 21, 22]));
   });
 });
 
 describe("cursor round-trip: author sort", () => {
-  test("asc: page1 + page2 no dups, ordering holds", () => {
-    const page1 = lib.listBooksCursor({ limit: 5, sortBy: "author", sortOrder: "asc" });
-    expect(page1.nextCursor).toBeTruthy();
+  test("asc: walk covers every book once and matches single-query order", () => {
+    const walked = collectPages("author", "asc");
+    const ids = walked.map((b) => b.id);
+    expect(ids).toHaveLength(BOOKS.length);
+    expect(new Set(ids).size).toBe(BOOKS.length);
 
-    const page2 = lib.listBooksCursor({
-      limit: 5,
-      sortBy: "author",
-      sortOrder: "asc",
-      cursor: page1.nextCursor!,
-    });
-
-    const allItems = [...page1.items, ...page2.items];
-    expect(new Set(allItems.map((b) => b.id)).size).toBe(10);
-
-    for (let i = 1; i < allItems.length; i++) {
-      const prev = allItems[i - 1]!;
-      const curr = allItems[i]!;
-      const a = (prev.author_sort || "").toLowerCase();
-      const b = (curr.author_sort || "").toLowerCase();
-      expect(a <= b).toBe(true);
-    }
+    const expected = lib.listBooksCursor({ limit: 200, sortBy: "author", sortOrder: "asc" }).items.map(
+      (b) => b.id,
+    );
+    expect(ids).toEqual(expected);
   });
 
-  test("desc: page1 + page2 no dups, ordering holds", () => {
-    const page1 = lib.listBooksCursor({ limit: 5, sortBy: "author", sortOrder: "desc" });
-    const page2 = lib.listBooksCursor({
-      limit: 5,
-      sortBy: "author",
-      sortOrder: "desc",
-      cursor: page1.nextCursor!,
-    });
+  test("desc: walk covers every book once and matches single-query order", () => {
+    const walked = collectPages("author", "desc");
+    const ids = walked.map((b) => b.id);
+    expect(ids).toHaveLength(BOOKS.length);
+    expect(new Set(ids).size).toBe(BOOKS.length);
 
-    const allItems = [...page1.items, ...page2.items];
-    expect(new Set(allItems.map((b) => b.id)).size).toBe(10);
+    const expected = lib.listBooksCursor({ limit: 200, sortBy: "author", sortOrder: "desc" }).items.map(
+      (b) => b.id,
+    );
+    expect(ids).toEqual(expected);
+  });
 
-    for (let i = 1; i < allItems.length; i++) {
-      const prev = allItems[i - 1]!;
-      const curr = allItems[i]!;
-      const a = (prev.author_sort || "").toLowerCase();
-      const b = (curr.author_sort || "").toLowerCase();
-      expect(a >= b).toBe(true);
-    }
+  test("non-ASCII author_sort survives page-size-1 boundaries", () => {
+    const ids = collectPages("author", "asc", 1).map((b) => b.id);
+    const expected = lib.listBooksCursor({ limit: 200, sortBy: "author", sortOrder: "asc" }).items.map(
+      (b) => b.id,
+    );
+    expect(ids).toEqual(expected);
   });
 });
 
@@ -383,13 +382,13 @@ describe("cursor round-trip: rating sort", () => {
     expect(ratingVal(lastPage1) >= ratingVal(firstPage2)).toBe(true);
   });
 
-  test("all pages together contain exactly all 10 books with no dups", () => {
+  test("all pages together contain exactly all books with no dups", () => {
     const collected = allIds(
       (cursor) => lib.listBooksCursor({ limit: 3, sortBy: "rating", sortOrder: "asc", cursor }),
       3,
     );
-    expect(collected).toHaveLength(10);
-    expect(new Set(collected).size).toBe(10);
+    expect(collected).toHaveLength(BOOKS.length);
+    expect(new Set(collected).size).toBe(BOOKS.length);
   });
 });
 
@@ -604,7 +603,7 @@ describe("tag filter (OR logic)", () => {
 
   test("no tagIds returns all books (filter disabled)", () => {
     const all = lib.listBooksCursor({ sortBy: "title", sortOrder: "asc" }).items.map((b) => b.id);
-    expect(all).toHaveLength(10);
+    expect(all).toHaveLength(BOOKS.length);
   });
 
   test("single tag filters to its books", () => {

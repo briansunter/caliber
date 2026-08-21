@@ -27,25 +27,7 @@ interface CachedZip {
   zip: JSZip;
 }
 
-interface StatCacheEntry {
-  signature: SourceSignature;
-  expiresAt: number;
-}
-
 const openEpubs = new Map<string, CachedZip>();
-const statCache = new Map<string, StatCacheEntry>();
-const STAT_TTL_MS = 5_000;
-
-function getCachedSignature(path: string): SourceSignature {
-  const now = Date.now();
-  const entry = statCache.get(path);
-  if (entry && entry.expiresAt > now) {
-    return entry.signature;
-  }
-  const signature = getSourceSignature(path);
-  statCache.set(path, { signature, expiresAt: now + STAT_TTL_MS });
-  return signature;
-}
 
 async function readCacheSignature(cacheDir: string): Promise<SourceSignature | null> {
   try {
@@ -101,6 +83,20 @@ function safeCachePath(cacheDir: string, entryPath: string): string | null {
   return target;
 }
 
+const inflightRebuilds = new Map<string, Promise<unknown>>();
+
+// Ensures concurrent callers sharing key await one in-flight task instead of racing.
+export async function runSingleFlight<T>(key: string, task: () => Promise<T>): Promise<T> {
+  const existing = inflightRebuilds.get(key);
+  if (existing) return existing as Promise<T>;
+
+  const promise = task().finally(() => {
+    inflightRebuilds.delete(key);
+  });
+  inflightRebuilds.set(key, promise);
+  return promise;
+}
+
 async function resetCacheDir(cacheDir: string): Promise<void> {
   rmSync(cacheDir, { recursive: true, force: true });
   mkdirSync(cacheDir, { recursive: true });
@@ -114,15 +110,19 @@ async function ensureEpubCache(bookId: number): Promise<{
   const epubPath = getBookFormatPath(bookId, "EPUB");
   if (!epubPath || !existsSync(epubPath)) return null;
 
-  const signature = getCachedSignature(epubPath);
   const cacheDir = join(EPUB_CACHE_DIR, String(bookId));
-  const cachedSignature = await readCacheSignature(cacheDir);
 
-  if (!isSameSignature(cachedSignature, signature)) {
-    await resetCacheDir(cacheDir);
-  } else {
-    mkdirSync(cacheDir, { recursive: true });
-  }
+  const signature = await runSingleFlight(`epub:${bookId}`, async () => {
+    const current = getSourceSignature(epubPath);
+    const cachedSignature = await readCacheSignature(cacheDir);
+    if (!isSameSignature(cachedSignature, current)) {
+      await resetCacheDir(cacheDir);
+      await Bun.write(join(cacheDir, CACHE_META_FILE), `${JSON.stringify(current)}\n`);
+    } else {
+      mkdirSync(cacheDir, { recursive: true });
+    }
+    return current;
+  });
 
   return { cacheDir, epubPath, signature };
 }
@@ -153,7 +153,10 @@ async function extractEpubEntry(
     throw new EpubCacheError("EPUB resource is too large", 413, "entry_too_large");
   }
   await Bun.write(target, data);
-  await Bun.write(join(cacheDir, CACHE_META_FILE), `${JSON.stringify(signature)}\n`);
+  const existingSignature = await readCacheSignature(cacheDir);
+  if (!isSameSignature(existingSignature, signature)) {
+    await Bun.write(join(cacheDir, CACHE_META_FILE), `${JSON.stringify(signature)}\n`);
+  }
 
   return target;
 }

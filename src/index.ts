@@ -411,40 +411,16 @@ function parseBookId(value: string): number | null {
   return Number.isSafeInteger(id) && id > 0 ? id : null;
 }
 
-const MAX_JSON_BODY_BYTES = 64 * 1024;
+// Mirrors the 1MB stdio MCP frame limit in mcp-server.ts so both transports
+// accept the same maximum JSON-RPC payload.
+const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
 
-class RequestBodyError extends Error {
-  constructor(readonly status: 400 | 413, message: string) {
-    super(message);
-    this.name = "RequestBodyError";
-  }
-}
-
-async function readJsonBody(req: Request): Promise<unknown> {
-  const contentLength = req.headers.get("Content-Length");
-  if (contentLength && /^\d+$/.test(contentLength)) {
-    if (Number(contentLength) > MAX_JSON_BODY_BYTES) {
-      throw new RequestBodyError(413, "Request body is too large");
-    }
-  }
-
-  const text = await req.text();
-  if (new TextEncoder().encode(text).byteLength > MAX_JSON_BODY_BYTES) {
-    throw new RequestBodyError(413, "Request body is too large");
-  }
-
+async function readJsonBodyOr400(req: Request): Promise<unknown> {
   try {
-    return JSON.parse(text) as unknown;
+    return JSON.parse(await req.text()) as unknown;
   } catch {
-    throw new RequestBodyError(400, "Invalid JSON");
+    return Response.json({ error: "Invalid JSON" }, { status: 400 });
   }
-}
-
-function requestBodyErrorResponse(error: unknown): Response {
-  if (error instanceof RequestBodyError) {
-    return Response.json({ error: error.message }, { status: error.status });
-  }
-  return Response.json({ error: "Invalid JSON" }, { status: 400 });
 }
 
 function opdsCatalogResponse(
@@ -804,12 +780,8 @@ const routes: RouteTable = {
             { status: 403, headers: { "Cache-Control": "no-store" } },
           );
         }
-        let rawBody: unknown;
-        try {
-          rawBody = await readJsonBody(req);
-        } catch (error) {
-          return requestBodyErrorResponse(error);
-        }
+        const rawBody = await readJsonBodyOr400(req);
+        if (rawBody instanceof Response) return rawBody;
         if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
           return Response.json({ error: "Request body must be an object" }, { status: 400 });
         }
@@ -827,6 +799,7 @@ const routes: RouteTable = {
           });
           reconfigureLibraryDatabase();
           libraryReady = true;
+          apiCache.clear();
           return Response.json(
             { ...status, ready: libraryReady, applied: true },
             { headers: { "Cache-Control": "no-store" } },
@@ -884,12 +857,8 @@ const routes: RouteTable = {
           );
         }
 
-        let rawBody: unknown;
-        try {
-          rawBody = await readJsonBody(req);
-        } catch (error) {
-          return requestBodyErrorResponse(error);
-        }
+        const rawBody = await readJsonBodyOr400(req);
+        if (rawBody instanceof Response) return rawBody;
         if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
           return Response.json({ error: "Request body must be an object" }, { status: 400 });
         }
@@ -973,12 +942,8 @@ const routes: RouteTable = {
           );
         }
 
-        let rawBody: unknown;
-        try {
-          rawBody = await readJsonBody(req);
-        } catch (error) {
-          return requestBodyErrorResponse(error);
-        }
+        const rawBody = await readJsonBodyOr400(req);
+        if (rawBody instanceof Response) return rawBody;
         if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
           return Response.json({ error: "Request body must be an object" }, { status: 400 });
         }
@@ -1052,12 +1017,8 @@ const routes: RouteTable = {
           return Response.json({ error: "User not found" }, { status: 404 });
         }
 
-        let rawBody: unknown;
-        try {
-          rawBody = await readJsonBody(req);
-        } catch (error) {
-          return requestBodyErrorResponse(error);
-        }
+        const rawBody = await readJsonBodyOr400(req);
+        if (rawBody instanceof Response) return rawBody;
         if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
           return Response.json({ error: "Request body must be an object" }, { status: 400 });
         }
@@ -1124,12 +1085,8 @@ const routes: RouteTable = {
     // reading progress.
     "/api/user/login": {
       POST: async (req) => {
-        let rawBody: unknown;
-        try {
-          rawBody = await readJsonBody(req);
-        } catch (error) {
-          return requestBodyErrorResponse(error);
-        }
+        const rawBody = await readJsonBodyOr400(req);
+        if (rawBody instanceof Response) return rawBody;
         if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
           return Response.json({ error: "Request body must be an object" }, { status: 400 });
         }
@@ -1200,12 +1157,8 @@ const routes: RouteTable = {
           );
         }
 
-        let rawBody: unknown;
-        try {
-          rawBody = await readJsonBody(req);
-        } catch (error) {
-          return requestBodyErrorResponse(error);
-        }
+        const rawBody = await readJsonBodyOr400(req);
+        if (rawBody instanceof Response) return rawBody;
         if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
           return Response.json({ error: "Request body must be an object" }, { status: 400 });
         }
@@ -1331,12 +1284,8 @@ const routes: RouteTable = {
         const book = getBookByIdOptimized(bookId);
         if (!book) return Response.json({ error: "Book not found" }, { status: 404 });
 
-        let rawBody: unknown;
-        try {
-          rawBody = await readJsonBody(req);
-        } catch (error) {
-          return requestBodyErrorResponse(error);
-        }
+        const rawBody = await readJsonBodyOr400(req);
+        if (rawBody instanceof Response) return rawBody;
 
         if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
           return Response.json({ error: "Request body must be an object" }, { status: 400 });
@@ -2173,6 +2122,86 @@ const routes: RouteTable = {
     "/*": index,
 } satisfies RouteTable;
 
+// --- Host header validation --------------------------------------------------
+//
+// Requests are only served when the effective host is one the operator
+// configured (loopback names plus CALIBER_HOST / PUBLIC_BASE_URL). This keeps
+// DNS-rebinding browsers out of privileged endpoints and stops attacker-chosen
+// Host values from reaching OPDS feed rendering and cache keys. Behind a
+// trusted proxy the forwarded host is authoritative and is accepted as-is.
+// When bound to a non-loopback address without PUBLIC_BASE_URL, client host
+// names cannot be enumerated, so any Host is accepted and DNS-rebinding
+// protection is delegated to the optional auth gate.
+
+const ALLOWED_HOST_NAMES = new Set<string>(LOCAL_SETUP_HOSTS);
+
+function normalizedHostName(value: string): string {
+  const trimmed = value.trim().toLowerCase();
+  if (!trimmed) return "";
+  if (trimmed.startsWith("[")) {
+    const end = trimmed.indexOf("]");
+    return end === -1 ? "" : trimmed.slice(1, end);
+  }
+  const firstColon = trimmed.indexOf(":");
+  const lastColon = trimmed.lastIndexOf(":");
+  const host =
+    firstColon === -1 || firstColon !== lastColon ? trimmed : trimmed.slice(0, firstColon);
+  return host.endsWith(".") ? host.slice(0, -1) : host;
+}
+
+function allowHostName(candidate: string | null | undefined): void {
+  const name = candidate ? normalizedHostName(candidate) : "";
+  if (name && !ALLOWED_HOST_NAMES.has(name)) ALLOWED_HOST_NAMES.add(name);
+}
+
+allowHostName(HOST);
+if (PUBLIC_BASE_URL) {
+  try {
+    allowHostName(new URL(PUBLIC_BASE_URL).hostname);
+  } catch {
+    // PUBLIC_BASE_URL is validated at load; ignore unexpected shapes.
+  }
+}
+
+const HOST_IS_LOOPBACK = LOCAL_SETUP_HOSTS.has(normalizedHostName(HOST));
+const HOST_VALIDATION_PERMISSIVE = !PUBLIC_BASE_URL && !HOST_IS_LOOPBACK;
+
+function isRequestHostAllowed(req: Request): boolean {
+  if (TRUST_PROXY && req.headers.get("X-Forwarded-Host")) return true;
+  if (HOST_VALIDATION_PERMISSIVE) return true;
+  const host = req.headers.get("Host");
+  if (host === null) return HOST_IS_LOOPBACK;
+  return ALLOWED_HOST_NAMES.has(normalizedHostName(host));
+}
+
+function hostValidationErrorResponse(): Response {
+  return Response.json(
+    { error: "Request host is not allowed" },
+    { status: 421, headers: { "Cache-Control": "no-store" } },
+  );
+}
+
+function withHostValidation(routeTable: Record<string, unknown>): Record<string, unknown> {
+  const validated: Record<string, unknown> = {};
+  for (const [pattern, route] of Object.entries(routeTable)) {
+    if (typeof route !== "object" || route === null || pattern === "/*") {
+      validated[pattern] = route;
+      continue;
+    }
+    const wrapped: { [method: string]: RouteHandler } = {};
+    for (const [method, handler] of Object.entries(
+      route as { [method: string]: RouteHandler },
+    )) {
+      wrapped[method] = async (req) => {
+        if (!isRequestHostAllowed(req)) return hostValidationErrorResponse();
+        return handler(req);
+      };
+    }
+    validated[pattern] = wrapped;
+  }
+  return validated;
+}
+
 // --- Optional auth guard -----------------------------------------------------
 //
 // Handlers are always wrapped; on each request the wrapper checks the live
@@ -2238,7 +2267,8 @@ function withAuthGuard(routeTable: RouteTable): Record<string, unknown> {
 const server = serve({
   hostname: HOST,
   port: parseBoundedInt(PORT, DEFAULT_PORT, { min: 1, max: 65535 }),
-  routes: withAuthGuard(routes) as typeof routes,
+  maxRequestBodySize: MAX_REQUEST_BODY_BYTES,
+  routes: withHostValidation(withAuthGuard(routes)) as typeof routes,
   development: process.env.NODE_ENV !== "production" && {
     hmr: true,
     console: true,

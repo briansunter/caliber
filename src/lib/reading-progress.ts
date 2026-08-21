@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { fetchJson } from "./http";
+import { queryClient } from "./query-client";
 
 export interface ProgressRecord {
   bookId: number;
@@ -81,7 +82,11 @@ function flush(bookId: number, useBeacon = false): void {
     headers: { "Content-Type": "application/json" },
     body: payload,
     keepalive: true,
-  }).catch(() => {});
+  })
+    .then(() => {
+      void queryClient.invalidateQueries({ queryKey: ["reading-list"] });
+    })
+    .catch(() => {});
 }
 
 // Debounced, fire-and-forget progress save. Safe to call on every page turn.

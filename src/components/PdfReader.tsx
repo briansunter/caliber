@@ -15,7 +15,7 @@ import {
 import { stored } from "@/lib/utils";
 import { useReaderSettings } from "@/lib/reader-settings";
 import { useFullscreen } from "@/lib/use-fullscreen";
-import { fetchBookProgress, saveBookProgress } from "@/lib/reading-progress";
+import { flushBookProgress, fetchBookProgress, saveBookProgress } from "@/lib/reading-progress";
 import {
   getNextReaderLoadMode,
   prefetchOrder,
@@ -29,6 +29,10 @@ const PDF_CLEANUP_EVERY = 12;
 
 // Worker setup — served from our API (versioned URL to bust cache)
 pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdfjs/pdf.worker.min.mjs?v=4.10.38";
+
+// Cap on waiting for the initial server-progress restore; a stalled request
+// must not keep suppressing server saves for the whole session.
+const RESTORE_TIMEOUT_MS = 5000;
 
 interface PdfReaderProps {
   url: string;
@@ -177,6 +181,7 @@ export function PdfReader({
 
   useEffect(() => {
     return () => {
+      flushBookProgress(bookId);
       if (renderTaskRef.current) {
         try { renderTaskRef.current.cancel(); } catch {}
         renderTaskRef.current = null;
@@ -186,7 +191,7 @@ export function PdfReader({
         pdfRef.current = null;
       }
     };
-  }, []);
+  }, [bookId]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -404,6 +409,16 @@ export function PdfReader({
     };
   }, [url, loadMode]);
 
+  const currentPageRef = useRef(currentPage);
+  const totalPagesRef = useRef(totalPages);
+  const serverRestoredRef = useRef(false);
+  const restoreSettledRef = useRef(false);
+
+  useEffect(() => {
+    currentPageRef.current = currentPage;
+    totalPagesRef.current = totalPages;
+  });
+
   // Render current page
   useEffect(() => {
     const pdf = pdfRef.current;
@@ -507,8 +522,10 @@ export function PdfReader({
     try {
       localStorage.setItem(posKey, JSON.stringify({ page: currentPage, ts: Date.now() }));
     } catch {}
-    // Sync to the signed-in user's server-side progress (debounced).
-    if (totalPages > 0) {
+    // Sync to the signed-in user's server-side progress (debounced). Held back
+    // until the initial restore attempt settles so a slow/failed fetch can't
+    // let this device's older page clobber newer server progress.
+    if (totalPages > 0 && restoreSettledRef.current) {
       saveBookProgress(bookId, {
         format: "PDF",
         location: String(currentPage),
@@ -534,18 +551,40 @@ export function PdfReader({
   ]);
 
   // Restore the signed-in user's server-side page once, after the doc loads.
-  const serverRestoredRef = useRef(false);
   useEffect(() => {
     if (serverRestoredRef.current || isLoading || totalPages === 0) return;
-    serverRestoredRef.current = true;
     let cancelled = false;
-    fetchBookProgress(bookId).then((p) => {
-      if (cancelled || !p?.location) return;
-      const page = Number.parseInt(p.location, 10);
-      if (Number.isFinite(page) && page >= 1 && page <= totalPages) {
-        setCurrentPage(page);
+
+    void (async () => {
+      let timerId: ReturnType<typeof setTimeout> | null = null;
+      const record = await Promise.race([
+        fetchBookProgress(bookId).catch(() => null),
+        new Promise<null>((resolve) => {
+          timerId = setTimeout(() => resolve(null), RESTORE_TIMEOUT_MS);
+        }),
+      ]);
+      if (timerId) clearTimeout(timerId);
+      serverRestoredRef.current = true;
+      restoreSettledRef.current = true;
+      // Catch-up save: a page turned while the gate was closed never entered
+      // the debounced pending map; queue one canonical save for current state.
+      if (!cancelled && totalPagesRef.current > 0) {
+        const page = currentPageRef.current;
+        const total = totalPagesRef.current;
+        saveBookProgress(bookId, {
+          format: "PDF",
+          location: String(page),
+          percentage: (page / total) * 100,
+          finished: page >= total,
+        });
       }
-    });
+      if (cancelled || !record?.location) return;
+      const restored = Number.parseInt(record.location, 10);
+      if (Number.isFinite(restored) && restored >= 1 && restored <= totalPages) {
+        setCurrentPage(restored);
+      }
+    })();
+
     return () => {
       cancelled = true;
     };

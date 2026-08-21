@@ -19,11 +19,15 @@ import {
 } from "lucide-react";
 import { stored } from "@/lib/utils";
 import { useFullscreen } from "@/lib/use-fullscreen";
-import { fetchBookProgress, saveBookProgress } from "@/lib/reading-progress";
+import { flushBookProgress, fetchBookProgress, saveBookProgress } from "@/lib/reading-progress";
 import {
   getNextReaderLoadMode,
   type ReaderLoadMode,
 } from "./reader-types";
+
+// Cap on waiting for the initial server-progress restore; a stalled request
+// must not keep suppressing server saves for the whole session.
+const RESTORE_TIMEOUT_MS = 5000;
 
 interface EpubReaderProps {
   streamUrl: string;
@@ -272,6 +276,7 @@ export function EpubReader({
   const bookRef = useRef<Book | null>(null);
   const lastLocationRef = useRef<Location | null>(null);
   const touchRef = useRef<{ x: number; y: number; t: number } | null>(null);
+  const restoreSettledRef = useRef(false);
 
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -293,6 +298,7 @@ export function EpubReader({
   const themeRef = useRef(theme);
   const showSettingsRef = useRef(showSettings);
   const showTocRef = useRef(showToc);
+  const onBackRef = useRef(onBack);
 
   const posKey = `caliber-pos-${bookId}-epub`;
 
@@ -338,6 +344,10 @@ export function EpubReader({
   useEffect(() => {
     showTocRef.current = showToc;
   }, [showToc]);
+
+  useEffect(() => {
+    onBackRef.current = onBack;
+  }, [onBack]);
 
   // Initialize epub.js. Stream mode reads unpacked entries; full mode loads the archive once.
   useEffect(() => {
@@ -424,22 +434,33 @@ export function EpubReader({
               localStorage.setItem(posKey, JSON.stringify({ cfi, ts: Date.now() }));
             } catch {}
             // Sync to the signed-in user's server-side progress (debounced).
-            saveBookProgress(bookId, {
-              format: "EPUB",
-              location: cfi,
-              percentage: pct,
-              finished: Boolean(location.atEnd) || pct >= 99,
-            });
+            // Held back until the initial restore attempt settles so a slow or
+            // failed fetch can't let this device's older position clobber
+            // newer server progress.
+            if (restoreSettledRef.current) {
+              saveBookProgress(bookId, {
+                format: "EPUB",
+                location: cfi,
+                percentage: pct,
+                finished: Boolean(location.atEnd) || pct >= 99,
+              });
+            }
           }
         });
 
         // Restore position: prefer the signed-in user's server progress, then
         // fall back to this device's localStorage.
         let savedCfi: string | null = null;
-        try {
-          const serverProgress = await fetchBookProgress(bookId);
-          if (serverProgress?.location) savedCfi = serverProgress.location;
-        } catch {}
+        let timerId: ReturnType<typeof setTimeout> | null = null;
+        const serverProgress = await Promise.race([
+          fetchBookProgress(bookId).catch(() => null),
+          new Promise<null>((resolve) => {
+            timerId = setTimeout(() => resolve(null), RESTORE_TIMEOUT_MS);
+          }),
+        ]);
+        if (timerId) clearTimeout(timerId);
+        restoreSettledRef.current = true;
+        if (serverProgress?.location) savedCfi = serverProgress.location;
         if (!savedCfi) {
           try {
             const s = localStorage.getItem(posKey);
@@ -561,7 +582,7 @@ export function EpubReader({
           else if (e.key === "ArrowRight" || e.key === "ArrowDown" || e.key === " ")
             rendition.next();
           else if (e.key === "f" || e.key === "F") toggleImmersive();
-          else if (e.key === "Escape") onBack();
+          else if (e.key === "Escape") onBackRef.current();
         };
         rendition.on("keyup", keyHandler);
         document.addEventListener("keyup", keyHandler);
@@ -583,6 +604,7 @@ export function EpubReader({
     return () => {
       cancelled = true;
       if (keyHandler) document.removeEventListener("keyup", keyHandler);
+      flushBookProgress(bookId);
       const r = renditionRef.current;
       const b = bookRef.current;
       renditionRef.current = null;
@@ -601,7 +623,7 @@ export function EpubReader({
           b.destroy();
         } catch {}
     };
-  }, [streamUrl, fullUrl, loadMode, onBack, posKey, toggleUI, toggleImmersive, bookId]);
+  }, [streamUrl, fullUrl, loadMode, posKey, toggleUI, toggleImmersive, bookId]);
 
   // Theme changes
   useEffect(() => {

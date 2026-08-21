@@ -47,7 +47,7 @@ CALIBRE_LIBRARY_PATH="/path/to/Calibre Library" bunx caliber-app
 
 Use `--no-open` or `CALIBER_OPEN_BROWSER=false` for headless environments.
 
-Caliber binds to `127.0.0.1` by default. If you intentionally expose it on another interface, set `CALIBER_HOST` and enable the built-in authentication (see [Authentication](#authentication)) plus HTTPS; without auth enabled, the username prompt is only a local reading-progress profile, not authentication.
+Caliber binds to `127.0.0.1` by default. If you intentionally expose it on another interface, set `CALIBER_HOST` and enable the built-in authentication (see [Authentication](#authentication)) plus HTTPS; without auth enabled, the username prompt is only a local reading-progress profile, not authentication. When bound to a non-loopback `CALIBER_HOST` with no `CALIBER_BASE_URL`, requests with any `Host` header are accepted (client host names cannot be enumerated), so enable authentication in that configuration.
 
 ## Configuration
 
