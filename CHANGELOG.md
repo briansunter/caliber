@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.11](https://github.com/briansunter/caliber/compare/v0.1.10...v0.1.11) (2026-08-21)
+
+
+### Bug Fixes
+
+* harden pagination, host validation, and reader progress persistence ([ea90b47](https://github.com/briansunter/caliber/commit/ea90b473f7e2b2a1876d8e028e6195de6d2894b1))
+
 ## [0.1.10](https://github.com/briansunter/caliber/compare/v0.1.9...v0.1.10) (2026-08-20)
 
 
