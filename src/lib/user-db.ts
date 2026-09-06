@@ -37,6 +37,8 @@ export interface ProgressRow {
   finished: boolean;
   startedAt: number;
   updatedAt: number;
+  serverSeq: number;
+  lastMutationId: string | null;
 }
 
 let db: Database | null = null;
@@ -86,8 +88,9 @@ function progressPkNames(database: Database): string[] {
     .map((c) => c.name);
 }
 
-// F04/F05/FUP1: bring legacy progress tables forward without losing rows:
+// F04/F05/FUP1/R2: bring legacy progress tables forward without losing rows:
 // - add library_id (default 'default') and furthest_percentage columns
+// - add server_seq + last_mutation_id ordering columns (R2 stale-overwrite guard)
 // - rebuild PK to (user_id, library_id, book_id, format) when needed,
 //   keeping the most recently updated row on new-PK collisions
 function migrateProgressTable(database: Database): void {
@@ -104,6 +107,14 @@ function migrateProgressTable(database: Database): void {
     try {
       database.exec("UPDATE progress SET furthest_percentage = percentage WHERE furthest_percentage = 0;");
     } catch {}
+    cols = progressColumnNames(database);
+  }
+  if (!cols.includes("server_seq")) {
+    database.exec("ALTER TABLE progress ADD COLUMN server_seq INTEGER NOT NULL DEFAULT 0;");
+    cols = progressColumnNames(database);
+  }
+  if (!cols.includes("last_mutation_id")) {
+    database.exec("ALTER TABLE progress ADD COLUMN last_mutation_id TEXT;");
     cols = progressColumnNames(database);
   }
   const pk = progressPkNames(database);
@@ -129,20 +140,26 @@ function migrateProgressTable(database: Database): void {
       finished INTEGER NOT NULL DEFAULT 0,
       started_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
+      server_seq INTEGER NOT NULL DEFAULT 0,
+      last_mutation_id TEXT,
       PRIMARY KEY (user_id, library_id, book_id, format)
     );
   `);
   const hasFurthest = cols.includes("furthest_percentage");
   const hasLibrary = cols.includes("library_id");
+  const hasSeq = cols.includes("server_seq");
+  const hasMutation = cols.includes("last_mutation_id");
   const furthestExpr = hasFurthest
     ? "COALESCE(furthest_percentage, percentage, 0)"
     : "COALESCE(percentage, 0)";
   const libraryExpr = hasLibrary ? "COALESCE(library_id, 'default')" : "'default'";
+  const seqExpr = hasSeq ? "COALESCE(server_seq, 0)" : "0";
+  const mutationExpr = hasMutation ? "last_mutation_id" : "NULL";
   database.exec(`
     INSERT OR IGNORE INTO progress_new
-      (user_id, library_id, book_id, format, location, percentage, furthest_percentage, finished, started_at, updated_at)
+      (user_id, library_id, book_id, format, location, percentage, furthest_percentage, finished, started_at, updated_at, server_seq, last_mutation_id)
     SELECT user_id, ${libraryExpr}, book_id, format, location, percentage,
-           ${furthestExpr}, finished, started_at, updated_at
+           ${furthestExpr}, finished, started_at, updated_at, ${seqExpr}, ${mutationExpr}
     FROM progress ORDER BY updated_at DESC;
   `);
   database.exec("DROP TABLE progress;");
@@ -180,6 +197,8 @@ function getDb(): Database {
       finished INTEGER NOT NULL DEFAULT 0,
       started_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
+      server_seq INTEGER NOT NULL DEFAULT 0,
+      last_mutation_id TEXT,
       PRIMARY KEY (user_id, library_id, book_id, format)
     );
   `);
@@ -464,6 +483,8 @@ function rowToProgress(row: {
   finished: number;
   started_at: number;
   updated_at: number;
+  server_seq?: number | null;
+  last_mutation_id?: string | null;
 }): ProgressRow {
   return {
     bookId: row.book_id,
@@ -478,11 +499,13 @@ function rowToProgress(row: {
     finished: row.finished === 1,
     startedAt: row.started_at,
     updatedAt: row.updated_at,
+    serverSeq: typeof row.server_seq === "number" && Number.isFinite(row.server_seq) ? row.server_seq : 0,
+    lastMutationId: typeof row.last_mutation_id === "string" && row.last_mutation_id ? row.last_mutation_id : null,
   };
 }
 
 const PROGRESS_COLUMNS =
-  "book_id, library_id, format, location, percentage, furthest_percentage, finished, started_at, updated_at";
+  "book_id, library_id, format, location, percentage, furthest_percentage, finished, started_at, updated_at, server_seq, last_mutation_id";
 
 export function normalizeLibraryId(raw: unknown): string {
   const s = typeof raw === "string" ? raw.trim() : "";
@@ -574,6 +597,15 @@ export interface ProgressInput {
   location?: string | null;
   percentage?: number;
   finished?: boolean;
+  mutationId?: string | null;
+  clientTs?: number | null;
+  baseRevision?: number | null;
+}
+
+export interface UpsertProgressResult {
+  progress: ProgressRow | null;
+  applied: boolean;
+  reason?: string;
 }
 
 export function upsertProgress(
@@ -581,12 +613,12 @@ export function upsertProgress(
   libraryId: string,
   bookId: number,
   input: ProgressInput,
-): ProgressRow | null {
+): UpsertProgressResult {
   const now = Date.now();
   const format = String(input.format || "").toUpperCase().slice(0, 10);
   // Format is part of the PK: writes always target one format row. Callers
   // must pass the reader's format explicitly.
-  if (!format) return null;
+  if (!format) return { progress: null, applied: false, reason: "invalid-format" };
   const lib = normalizeLibraryId(libraryId);
   // F03: drop locators that cannot belong to this format instead of storing
   // a value readers would mis-restore (e.g. a page number as an EPUB CFI).
@@ -599,21 +631,54 @@ export function upsertProgress(
     ? Math.min(100, Math.max(0, Number(input.percentage)))
     : 0;
   const finished = input.finished ? 1 : 0;
+  // R2 ordering: per-(user,library,book,format) stale-overwrite guard.
+  const incomingMutation =
+    typeof input.mutationId === "string" && input.mutationId ? input.mutationId.slice(0, 128) : null;
+  const incomingTs =
+    typeof input.clientTs === "number" && Number.isFinite(input.clientTs) ? input.clientTs : null;
+
+  const existing = getProgress(userId, lib, bookId, format);
+  if (existing && incomingMutation && incomingMutation === existing.lastMutationId) {
+    // Same mutation retried (at-least-once delivery): dedup without bumping
+    // server_seq again.
+    return { progress: existing, applied: true, reason: "duplicate" };
+  }
+  if (
+    existing &&
+    incomingTs !== null &&
+    incomingMutation !== null &&
+    incomingTs < existing.updatedAt &&
+    incomingMutation !== existing.lastMutationId
+  ) {
+    // Stale write: keep the newer location/percentage/updated_at, but still
+    // advance furthest/completion monotonically so forward progress is never lost.
+    getDb()
+      .query(
+        `UPDATE progress SET
+           furthest_percentage = MAX(progress.furthest_percentage, ?),
+           finished = MAX(progress.finished, ?)
+         WHERE user_id = ? AND library_id = ? AND book_id = ? AND format = ?`,
+      )
+      .run(resume, finished, userId, lib, bookId, format);
+    return { progress: getProgress(userId, lib, bookId, format), applied: false, reason: "stale" };
+  }
 
   getDb()
     .query(
-      `INSERT INTO progress (user_id, library_id, book_id, format, location, percentage, furthest_percentage, finished, started_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO progress (user_id, library_id, book_id, format, location, percentage, furthest_percentage, finished, started_at, updated_at, server_seq, last_mutation_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
        ON CONFLICT(user_id, library_id, book_id, format) DO UPDATE SET
          location = excluded.location,
          percentage = excluded.percentage,
          furthest_percentage = MAX(progress.furthest_percentage, excluded.furthest_percentage),
          finished = MAX(progress.finished, excluded.finished),
-         updated_at = excluded.updated_at`,
+         updated_at = excluded.updated_at,
+         server_seq = progress.server_seq + 1,
+         last_mutation_id = excluded.last_mutation_id`,
     )
-    .run(userId, lib, bookId, format, location, resume, resume, finished, now, now);
+    .run(userId, lib, bookId, format, location, resume, resume, finished, now, now, incomingMutation);
 
-  return getProgress(userId, lib, bookId, format);
+  return { progress: getProgress(userId, lib, bookId, format), applied: true };
 }
 
 export function deleteProgress(

@@ -35,6 +35,15 @@ const GRID_COLS_DESKTOP =
   "xl:grid-cols-[minmax(0,3fr)_minmax(0,1.5fr)_minmax(0,1.2fr)_minmax(0,1.5fr)_90px_minmax(0,1fr)_60px]";
 
 const ROW_HEIGHT = 72;
+// Sticky chrome above the table measured ~140px in devtools (desktop):
+// search bar ~64px + table header ~48px + filter row ~28px. scrollMargin
+// keeps the restored/focused row clear of it.
+const MEASURED_STICKY_CHROME_PX = 140;
+const TABLE_SCROLL_MARGIN = 140;
+// Invariant: the virtualizer margin must cover the measured sticky chrome.
+if (TABLE_SCROLL_MARGIN < MEASURED_STICKY_CHROME_PX) {
+  throw new Error("TABLE_SCROLL_MARGIN is below the measured sticky chrome height");
+}
 const SKELETON_ROW_KEYS = [
   "skeleton-1",
   "skeleton-2",
@@ -408,7 +417,8 @@ export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, 
   const queryClient = useQueryClient();
 
   // Set up window virtualizer - uses window scroll. scrollMargin keeps the
-  // restored/focused row clear of the sticky search + table headers.
+  // restored/focused row clear of the sticky search + table headers (see
+  // TABLE_SCROLL_MARGIN measured constant above).
   // FUP8 TanStack contract: keep scrollMargin on the virtualizer AND do NOT
   // manually offset rows — rows use translateY(virtualItem.start) verbatim
   // and the virtualizer applies the margin internally.
@@ -416,7 +426,7 @@ export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, 
     count: books.length,
     estimateSize: useCallback(() => ROW_HEIGHT, []),
     overscan: 20,
-    scrollMargin: 140,
+    scrollMargin: TABLE_SCROLL_MARGIN,
     scrollPaddingStart: 200,
     useFlushSync: false,
   });

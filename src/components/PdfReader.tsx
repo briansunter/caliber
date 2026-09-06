@@ -413,8 +413,15 @@ export function PdfReader({
 
   const currentPageRef = useRef(currentPage);
   const totalPagesRef = useRef(totalPages);
-  const serverRestoredRef = useRef(false);
-  const restoreSettledRef = useRef(false);
+  // R5: reactive restore gate (refs alone never rerender, which caused the
+  // first-save miss). serverTarget === undefined means the fetch has not
+  // completed yet; null means fetched with no usable server position.
+  // Checkpoint save effect below persists displayedPage only when
+  // restoreState === "ready". Settle effect flips to ready on first
+  // displayedPage when serverTarget == null, else when
+  // displayedPage === serverTarget.
+  const [restoreState, setRestoreState] = useState<"pending" | "ready">("pending");
+  const [serverTarget, setServerTarget] = useState<number | null | undefined>(undefined);
   // FUP4: explicit checkpoint of the page actually swapped onto the canvas.
   // Set ONLY in the successful canvas-swap callback (with latest-token
   // guard). Saves must use this, never the merely-requested currentPage.
@@ -422,8 +429,6 @@ export function PdfReader({
   // save effect below no-ops while displayedPage is null.
   const [displayedPage, setDisplayedPage] = useState<number | null>(null);
   const displayedPageRef = useRef<number | null>(null);
-  const initialLocalRef = useRef<number>(currentPage);
-  const serverTargetRef = useRef<number | null>(null);
 
   useEffect(() => {
     currentPageRef.current = currentPage;
@@ -562,9 +567,10 @@ export function PdfReader({
     settings.maxRenderScale,
   ]);
 
-  // FUP4: save ONLY the successfully displayed page. No-op until the first
-  // canvas swap sets displayedPage — this is the guard that prevents saving
-  // page 1 over a restored page 20 that has not displayed yet.
+  // FUP4 + R5: single checkpoint — save ONLY the successfully displayed
+  // page, and only when restoreState === "ready". Deps include
+  // displayedPage, restoreState, and totalPages so the first display after
+  // the gate opens is never missed (ref-only gating could not rerender).
   useEffect(() => {
     if (displayedPage === null) return;
     try {
@@ -573,7 +579,7 @@ export function PdfReader({
     // Sync to the signed-in user's server-side progress (debounced). Held
     // back until restore settles (see settle effect below) so a slow/failed
     // fetch can't let this device's older page clobber newer server progress.
-    if (totalPages > 0 && restoreSettledRef.current) {
+    if (totalPages > 0 && restoreState === "ready") {
       saveBookProgress(bookId, {
         format: "PDF",
         location: String(displayedPage),
@@ -581,70 +587,75 @@ export function PdfReader({
         finished: displayedPage >= totalPages,
       });
     }
-  }, [displayedPage, totalPages, posKey, bookId]);
+  }, [displayedPage, restoreState, totalPages, posKey, bookId]);
+
+  // Reset the reactive gate when switching books.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: bookId is a prop; reset must run on book change.
+  useEffect(() => {
+    setRestoreState("pending");
+    setServerTarget(undefined);
+  }, [bookId]);
 
   // Restore the signed-in user's server-side page once, after the doc loads.
   // F03: ignore locators from a different format; fall back to local state
-  // with no reload loop.
+  // with no reload loop. R4: format-scoped fetch (PDF only).
   // FUP4: do NOT settle the save gate or queue a catch-up save here. The
   // gate settles in the display-settle effect below, only after the restored
   // (or initial) page has successfully displayed.
   useEffect(() => {
-    if (serverRestoredRef.current || isLoading || totalPages === 0) return;
+    if (isLoading || totalPages === 0) return;
+    if (serverTarget !== undefined) return;
     let cancelled = false;
 
     void (async () => {
       let timerId: ReturnType<typeof setTimeout> | null = null;
       const record = await Promise.race([
-        fetchBookProgress(bookId).catch(() => null),
+        fetchBookProgress(bookId, "PDF").catch(() => null),
         new Promise<null>((resolve) => {
           timerId = setTimeout(() => resolve(null), RESTORE_TIMEOUT_MS);
         }),
       ]);
       if (timerId) clearTimeout(timerId);
       if (cancelled) return;
-      serverRestoredRef.current = true;
-      if (!record?.location) return;
-      if (record.format && record.format.toUpperCase() !== "PDF") return;
+      if (!record?.location) {
+        setServerTarget(null);
+        return;
+      }
+      if (record.format && record.format.toUpperCase() !== "PDF") {
+        setServerTarget(null);
+        return;
+      }
       const restored = Number.parseInt(record.location, 10);
       if (Number.isFinite(restored) && restored >= 1 && restored <= totalPages) {
         // Record the server target so the settle effect can wait for its
         // display before opening the save gate.
-        if (restored !== initialLocalRef.current) {
-          serverTargetRef.current = restored;
-        }
+        setServerTarget(restored);
         if (restored !== currentPageRef.current) {
           setCurrentPage(restored);
         }
+      } else {
+        setServerTarget(null);
       }
     })().catch(() => {
-      serverRestoredRef.current = true;
+      if (!cancelled) setServerTarget(null);
     });
 
     return () => {
       cancelled = true;
     };
-  }, [bookId, isLoading, totalPages]);
+  }, [bookId, isLoading, totalPages, serverTarget]);
 
-  // FUP4: settle the save gate only after successful display. If the server
-  // position differed from the initial local page, the catch-up save is
-  // queued here — from the display callback path — never before display.
+  // FUP4 + R5: settle the save gate only after successful display. If the
+  // server position differed from the initial local page, the catch-up save
+  // flows through the checkpoint effect above once ready flips — never
+  // before display.
   useEffect(() => {
     if (displayedPage === null) return;
-    if (!serverRestoredRef.current) return;
-    if (restoreSettledRef.current) return;
-    const target = serverTargetRef.current;
-    if (target !== null && displayedPage !== target) return;
-    restoreSettledRef.current = true;
-    if (target !== null && totalPagesRef.current > 0) {
-      saveBookProgress(bookId, {
-        format: "PDF",
-        location: String(displayedPage),
-        percentage: (displayedPage / totalPagesRef.current) * 100,
-        finished: displayedPage >= totalPagesRef.current,
-      });
-    }
-  }, [displayedPage, bookId]);
+    if (serverTarget === undefined) return;
+    if (restoreState === "ready") return;
+    if (serverTarget !== null && displayedPage !== serverTarget) return;
+    setRestoreState("ready");
+  }, [displayedPage, serverTarget, restoreState]);
 
   useEffect(() => {
     const pdf = pdfRef.current;

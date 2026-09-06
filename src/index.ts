@@ -930,7 +930,32 @@ async function serveThumbById(req: Request, id: number): Promise<Response> {
       await Bun.write(thumbPath, resized);
     });
     if (resizeUnavailable && !(await thumbFile.exists())) {
-      return Response.json({ error: "thumbnail resize unavailable" }, { status: 501 });
+      // Resize pipeline unavailable (e.g. Bun without image support):
+      // degrade to the original cover bytes with a 200 + marker header so
+      // <img> clients keep working. 501 is reserved for the case where no
+      // cover bytes exist at all (already 404'd above, or unreadable here).
+      try {
+        const originalBytes = new Uint8Array(await coverFile.arrayBuffer());
+        if (!originalBytes || originalBytes.byteLength === 0) {
+          return Response.json({ error: "thumbnail resize unavailable" }, { status: 501 });
+        }
+      } catch {
+        return Response.json({ error: "thumbnail resize unavailable" }, { status: 501 });
+      }
+      if (!thumbDegradedLogged) {
+        thumbDegradedLogged = true;
+        console.warn(
+          `[thumb] serving original cover for book ${id} (resize-unavailable, Bun ${Bun.version})`,
+        );
+      }
+      return new Response(coverFile, {
+        headers: {
+          "Content-Type": "image/jpeg",
+          "Cache-Control": cacheControl,
+          ETag: etag,
+          "X-Thumbnail-Degraded": "resize-unavailable",
+        },
+      });
     }
   }
 
@@ -974,8 +999,9 @@ const streamEncoder = new TextEncoder();
 // are cached on disk as {id}-{size}-{sig}.jpg where sig is a revision key
 // over (library path, cover size, cover mtime), so a changed cover naturally
 // misses the old file. Resize uses Bun's built-in image pipeline when present;
-// when no pipeline is available the endpoint returns 501 so clients can
-// detect the degraded state (instead of silently serving full-size covers).
+// when the pipeline is unavailable the endpoint degrades to the original
+// cover bytes with a 200 + `X-Thumbnail-Degraded: resize-unavailable` header
+// so <img> clients keep working (501 is reserved for no cover bytes at all).
 // Generations run through a FIFO queue with max 2 concurrent jobs.
 const THUMB_SIZES = { small: 256, medium: 512 } as const;
 type ThumbSize = keyof typeof THUMB_SIZES;
@@ -987,6 +1013,7 @@ function parseThumbSize(value: string | null): ThumbSize {
 const THUMB_MAX_CONCURRENT = 2;
 let thumbActiveJobs = 0;
 const thumbWaitQueue: Array<() => void> = [];
+let thumbDegradedLogged = false;
 
 function runThumbJob<T>(job: () => Promise<T>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -1021,9 +1048,10 @@ interface BunFileWithImagePipeline {
 }
 
 // Resize via Bun's built-in image pipeline when available; null means
-// "unavailable, caller returns 501". Both pipeline shapes are
-// feature-detected: the in-memory `new Bun.Image(bytes)` constructor first,
-// then the file-backed `Bun.file(path).image()` fallback.
+// "unavailable, caller serves the degraded original". Both pipeline shapes
+// are feature-detected: the in-memory `new Bun.Image(bytes)` constructor
+// first, then the file-backed `Bun.file(path).image()` fallback. Failures are
+// logged (message + runtime + attempted path) instead of swallowed.
 async function tryResizeImage(
   bytes: Uint8Array,
   targetWidth: number,
@@ -1034,13 +1062,28 @@ async function tryResizeImage(
       const encoded = new ImageCtor(bytes).resize(targetWidth).jpeg();
       const out = await encoded.bytes();
       if (out && out.byteLength > 0) return out;
+      console.warn(
+        `[thumb] Bun.Image pipeline returned empty bytes (Bun ${Bun.version}, path Bun.Image)`,
+      );
+      return null;
     }
-  } catch {
+    console.warn(
+      `[thumb] Bun.Image constructor unavailable (Bun ${Bun.version}, path Bun.Image)`,
+    );
+  } catch (error) {
     // Fall through to the file-backed pipeline.
+    console.warn(
+      `[thumb] Bun.Image resize failed (Bun ${Bun.version}, path Bun.Image): ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
   try {
     const probe = Bun.file("") as BunFileWithImagePipeline;
-    if (typeof probe.image !== "function") return null;
+    if (typeof probe.image !== "function") {
+      console.warn(
+        `[thumb] file-backed image pipeline unavailable (Bun ${Bun.version}, path Bun.file().image)`,
+      );
+      return null;
+    }
     const { mkdtempSync, rmSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const dir = mkdtempSync(join(tmpdir(), "caliber-thumb-"));
@@ -1049,13 +1092,25 @@ async function tryResizeImage(
       await Bun.write(tmpPath, bytes);
       const fileImage = Bun.file(tmpPath) as BunFileWithImagePipeline;
       const encoded = (await fileImage.image?.())?.resize(targetWidth).jpeg();
-      if (!encoded) return null;
+      if (!encoded) {
+        console.warn(
+          `[thumb] file-backed resize returned no encoder (Bun ${Bun.version}, path Bun.file().image)`,
+        );
+        return null;
+      }
       const out = await encoded.bytes();
-      return out && out.byteLength > 0 ? out : null;
+      if (out && out.byteLength > 0) return out;
+      console.warn(
+        `[thumb] file-backed pipeline returned empty bytes (Bun ${Bun.version}, path Bun.file().image)`,
+      );
+      return null;
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
-  } catch {
+  } catch (error) {
+    console.warn(
+      `[thumb] file-backed resize failed (Bun ${Bun.version}, path Bun.file().image): ${error instanceof Error ? error.message : String(error)}`,
+    );
     return null;
   }
 }
@@ -1698,20 +1753,26 @@ const routes: RouteTable = {
           location?: unknown;
           percentage?: unknown;
           finished?: unknown;
+          mutationId?: unknown;
+          clientTs?: unknown;
+          baseRevision?: unknown;
         };
         const format = typeof body.format === "string" ? body.format.trim().toUpperCase() : "";
         if (!FORMAT_PATTERN.test(format) || !book.formats.includes(format)) {
           return Response.json({ error: "Invalid book format" }, { status: 400 });
         }
 
-        const progress = upsertProgress(user.id, resolveLibraryId(req), bookId, {
+        const result = upsertProgress(user.id, resolveLibraryId(req), bookId, {
           format,
           location: typeof body.location === "string" ? body.location : null,
           percentage: typeof body.percentage === "number" ? body.percentage : 0,
           finished: body.finished === true,
+          mutationId: typeof body.mutationId === "string" ? body.mutationId : null,
+          clientTs: typeof body.clientTs === "number" ? body.clientTs : null,
+          baseRevision: typeof body.baseRevision === "number" ? body.baseRevision : null,
         });
         return Response.json(
-          { progress },
+          { progress: result.progress, applied: result.applied, reason: result.reason },
           { headers: { "Cache-Control": "private, no-store" } },
         );
       },
@@ -1740,6 +1801,9 @@ const routes: RouteTable = {
           location?: unknown;
           percentage?: unknown;
           finished?: unknown;
+          mutationId?: unknown;
+          clientTs?: unknown;
+          baseRevision?: unknown;
         };
         const format = typeof body.format === "string" ? body.format.trim().toUpperCase() : "";
         if (!FORMAT_PATTERN.test(format) || !book.formats.includes(format)) {
@@ -1751,9 +1815,12 @@ const routes: RouteTable = {
           location: typeof body.location === "string" ? body.location : null,
           percentage: typeof body.percentage === "number" ? body.percentage : 0,
           finished: body.finished === true,
+          mutationId: typeof body.mutationId === "string" ? body.mutationId : null,
+          clientTs: typeof body.clientTs === "number" ? body.clientTs : null,
+          baseRevision: typeof body.baseRevision === "number" ? body.baseRevision : null,
         });
         return Response.json(
-          { progress },
+          { progress: progress.progress, applied: progress.applied, reason: progress.reason },
           { headers: { "Cache-Control": "private, no-store" } },
         );
       },
@@ -2847,6 +2914,7 @@ const server = serve({
 
 console.log(`🚀 Server running at ${server.url}`);
 console.log(`📚 Library: ${LIBRARY_PATH}`);
+console.log(`⚙️ Runtime: Bun ${Bun.version} (${process.execPath})`);
 if (AUTH_ENABLED) {
   console.log(
     needsInitialSetup()

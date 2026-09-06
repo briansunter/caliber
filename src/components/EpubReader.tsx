@@ -283,7 +283,18 @@ export function EpubReader({
   const bookRef = useRef<Book | null>(null);
   const lastLocationRef = useRef<Location | null>(null);
   const touchRef = useRef<{ x: number; y: number; t: number } | null>(null);
-  const restoreSettledRef = useRef(false);
+  // R5: reactive restore gate. Epub displays the server target directly
+  // (fetch → display target), so the gate flips to "ready" right after the
+  // fetch settles and BEFORE display — the first relocated event is already
+  // the target, so no first-save miss. restoreStateRef mirrors the state
+  // for the non-reactive relocated event callback.
+  const [restoreState, setRestoreState] = useState<"pending" | "ready">("pending");
+  const restoreStateRef = useRef<"pending" | "ready">("pending");
+  // R5: keep the event-callback mirror in sync; the state itself drives
+  // rerenders so save gating is never ref-only.
+  useEffect(() => {
+    restoreStateRef.current = restoreState;
+  }, [restoreState]);
 
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -426,6 +437,10 @@ export function EpubReader({
 
     async function openBook() {
       setIsLoading(true);
+      // R5: reset the restore gate for each (re)open so a previous book's
+      // ready state never unblocks saves for the new book.
+      restoreStateRef.current = "pending";
+      setRestoreState("pending");
       setLoadError(null);
       setHtmlDocument(null);
       setProgress(0);
@@ -508,8 +523,10 @@ export function EpubReader({
             // Sync to the signed-in user's server-side progress (debounced).
             // Held back until the initial restore attempt settles so a slow or
             // failed fetch can't let this device's older position clobber
-            // newer server progress.
-            if (restoreSettledRef.current) {
+            // newer server progress. R5: restoreState (mirrored in
+            // restoreStateRef for this event callback) — refs alone don't
+            // rerender, so the gate must be state.
+            if (restoreStateRef.current === "ready") {
               saveBookProgress(bookId, {
                 format: "EPUB",
                 location: cfi,
@@ -526,14 +543,19 @@ export function EpubReader({
         // F04: scoped key first, legacy key as fallback.
         let savedCfi: string | null = null;
         let timerId: ReturnType<typeof setTimeout> | null = null;
+        // R4: format-scoped fetch — EPUB position only.
         const serverProgress = await Promise.race([
-          fetchBookProgress(bookId).catch(() => null),
+          fetchBookProgress(bookId, "EPUB").catch(() => null),
           new Promise<null>((resolve) => {
             timerId = setTimeout(() => resolve(null), RESTORE_TIMEOUT_MS);
           }),
         ]);
         if (timerId) clearTimeout(timerId);
-        restoreSettledRef.current = true;
+        // R5: fetch settles before display, and display targets the fetched
+        // CFI directly — so flipping to ready here is safe. The first
+        // relocated event already reflects the server position.
+        restoreStateRef.current = "ready";
+        setRestoreState("ready");
         if (
           serverProgress?.location &&
           (!serverProgress.format || serverProgress.format.toUpperCase() === "EPUB")

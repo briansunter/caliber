@@ -1,8 +1,11 @@
 import { Database } from "bun:sqlite";
 import { join, resolve, sep } from "node:path";
 import {
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -215,6 +218,19 @@ function copyDbToWritable(): void {
       throw new Error(`Unsupported Calibre database; missing ${missingTables.join(", ")}`);
     }
     writeFileSync(temporaryPath, sourceDb.serialize());
+    // Durability: fsync the tmp generation so its bytes are on stable storage
+    // before it is ever renamed into place (best-effort: exotic filesystems
+    // may not support fsync).
+    try {
+      const fd = openSync(temporaryPath, "r");
+      try {
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      // ignore: durability best-effort only
+    }
   } finally {
     sourceDb.close();
   }
@@ -230,6 +246,14 @@ function copyDbToWritable(): void {
       setupSnapshotDb(tmpDb);
     } finally {
       tmpDb.close();
+    }
+
+    // Fault-injection hook for tests: CALIBER_SNAPSHOT_FAULT=1 throws here —
+    // after the tmp generation is fully built, before any rename — so the
+    // crash window is exercisable. The stale tmp file is removed by the
+    // catch below; the published generation is untouched.
+    if (process.env.CALIBER_SNAPSHOT_FAULT === "1") {
+      throw new Error("CALIBER_SNAPSHOT_FAULT: injected failure mid-publish");
     }
 
     for (const suffix of ["-wal", "-shm"]) {
@@ -252,6 +276,33 @@ function copyDbToWritable(): void {
       if (code !== "EEXIST" && code !== "EPERM") throw error;
       unlinkSync(WRITABLE_DB_PATH);
       renameSync(temporaryPath, WRITABLE_DB_PATH);
+    }
+    // Durability: fsync the published file and the directory entry so a crash
+    // right after publish cannot leave a zero-length generation visible.
+    // Residual crash window (explicit): rename(2) itself is atomic, but
+    // without a durable directory entry a power loss between the rename and
+    // the directory fsync can still lose the publish. Recovery is safe
+    // regardless — the next boot rebuilds from the read-only source and never
+    // serves a half-published snapshot.
+    try {
+      const fd = openSync(WRITABLE_DB_PATH, "r");
+      try {
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      // ignore: durability best-effort only
+    }
+    try {
+      const dirFd = openSync(WORK_DIR, "r");
+      try {
+        fsyncSync(dirFd);
+      } finally {
+        closeSync(dirFd);
+      }
+    } catch {
+      // ignore: directory fsync is not supported on all platforms (macOS)
     }
   } catch (error) {
     if (existsSync(temporaryPath)) unlinkSync(temporaryPath);
@@ -474,8 +525,14 @@ function setupSnapshotDb(db: Database): void {
   //   title:        SEARCH b USING INDEX idx_books_sort_key
   //   author:       SEARCH b USING INDEX idx_books_author_sort_key
   //   added:        SEARCH b USING INDEX idx_books_timestamp_matching
-  //   rating:       SEARCH b USING INDEX idx_book_list_projection_rating
-  //                 (via JOIN book_list_projection p ON p.book = b.id)
+  //   rating:       SCAN p USING COVERING INDEX idx_book_list_projection_rating
+  //                 (first page; SEARCH p on rating>? with a cursor) then
+  //                 SEARCH b USING INTEGER PRIMARY KEY — via JOIN
+  //                 book_list_projection p ON p.book = b.id.
+  //                 The rating ORDER BY / cursor tie-break use p.book — not
+  //                 b.id — so the (rating, book) index covers the full key.
+  //                 Verified: b.id as the last term adds
+  //                 "USE TEMP B-TREE FOR LAST TERM OF ORDER BY"; p.book has none.
   //   series_index: SEARCH b USING INDEX idx_books_series_index_key
   // The explicit `key >= ?` seek bound plus the
   // `(key > ? OR (key = ? AND id > ?))` tie-break both resolve against
@@ -963,7 +1020,9 @@ const BOOK_SORT_EXPRESSIONS = {
   added: `COALESCE(b.timestamp, '')`,
   // Rating orders the materialized book_list_projection (joined as `p` in the
   // rating page query); unrated books are stored as 0, preserving the old
-  // COALESCE(r.rating, 0) semantics. Indexed by idx_book_list_projection_rating.
+  // COALESCE(r.rating, 0) semantics. Indexed by idx_book_list_projection_rating
+  // (rating, book): ORDER BY and the cursor tie-break both use p.book so the
+  // index covers the full sort key with no TEMP B-TREE on the last term.
   rating: `p.rating`,
   series_index: `COALESCE(b.series_index, 1)`,
 } as const;
@@ -992,16 +1051,18 @@ function buildBookOrderBy(
   sortOrder: NonNullable<ListOptions["sortOrder"]>,
 ): string {
   const dir = sortOrder.toUpperCase();
+  // Rating tie-break is p.book (not b.id): p.book = b.id via the projection
+  // JOIN, but only p.book matches idx_book_list_projection_rating(rating,
+  // book)'s second column, letting SQLite walk the index for the full key.
+  if (sortBy === "rating") return `ORDER BY p.rating ${dir}, p.book ${dir}`;
   const expr =
     sortBy === "author"
       ? BOOK_SORT_EXPRESSIONS.author
       : sortBy === "added"
         ? BOOK_SORT_EXPRESSIONS.added
-        : sortBy === "rating"
-          ? BOOK_SORT_EXPRESSIONS.rating
-          : sortBy === "series_index"
-            ? BOOK_SORT_EXPRESSIONS.series_index
-            : BOOK_SORT_EXPRESSIONS.title;
+        : sortBy === "series_index"
+          ? BOOK_SORT_EXPRESSIONS.series_index
+          : BOOK_SORT_EXPRESSIONS.title;
   return `ORDER BY ${expr} ${dir}, b.id ${dir}`;
 }
 
@@ -1031,8 +1092,10 @@ function appendBookCursorWhere(
     if (typeof cursorData.sort !== "number" || !Number.isFinite(cursorData.sort)) {
       throw new CursorError("Cursor sort value does not match rating sort");
     }
+    // Tie-break on p.book (== b.id via the JOIN) so the predicate matches
+    // idx_book_list_projection_rating(rating, book) exactly.
     params.push(cursorData.sort, cursorData.sort, cursorData.sort, cursorData.id);
-    return `${bookWhere} AND ${expr} ${seekOp} ? AND (${expr} ${sortOp} ? OR (${expr} = ? AND b.id ${sortOp} ?))`;
+    return `${bookWhere} AND ${expr} ${seekOp} ? AND (${expr} ${sortOp} ? OR (${expr} = ? AND p.book ${sortOp} ?))`;
   }
 
   if (sortBy === "series_index") {
@@ -1096,14 +1159,16 @@ function listBooksWithWhere(
       // Rating orders the materialized projection (unrated = 0): the JOIN
       // against book_list_projection AS p seeks idx_book_list_projection_rating
       // for both the ORDER BY and the cursor predicate (BOOK_SORT_EXPRESSIONS.rating
-      // is `p.rating`, matching the index key exactly).
+      // is `p.rating`, matching the index key exactly). The tie-break is
+      // p.book — not b.id — so the (rating, book) index covers the full
+      // ORDER BY key and EXPLAIN QUERY PLAN shows no TEMP B-TREE.
       pageQuery = `
         SELECT b.id, p.rating AS rating_val,
                p.rating AS cursor_sort
         FROM books b
         JOIN book_list_projection p ON p.book = b.id
         ${bookWhere}
-        ORDER BY p.rating ${dir}, b.id ${dir}
+        ORDER BY p.rating ${dir}, p.book ${dir}
         LIMIT ${limit + 1}
       `;
     } else {

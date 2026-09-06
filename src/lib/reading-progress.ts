@@ -92,11 +92,18 @@ refreshLibraryScopeId();
 
 // --- Reader-side helpers (plain async, no hooks) -------------------------
 
-// Fetch saved progress for a book. Returns null when not signed in or none.
-export async function fetchBookProgress(bookId: number): Promise<ProgressRecord | null> {
+// Fetch saved progress for a book + format. Format is REQUIRED — the
+// server is format-scoped (GET /api/user/progress/:id?format=X) so an EPUB
+// position never restores into the PDF reader and vice versa. Returns null
+// when not signed in or none.
+export type ProgressFormat = "EPUB" | "PDF" | "CBZ" | "CBR";
+export async function fetchBookProgress(
+  bookId: number,
+  format: ProgressFormat,
+): Promise<ProgressRecord | null> {
   try {
     const res = await fetchJson<{ progress: ProgressRecord | null }>(
-      `/api/user/progress/${bookId}`,
+      `/api/user/progress/${bookId}?format=${encodeURIComponent(format)}`,
     );
     return res.progress ?? null;
   } catch {
@@ -111,9 +118,46 @@ interface PendingSave {
   finished: boolean;
 }
 
+// R3: immutable operation captured at creation. saveBookProgress snapshots
+// principal+library+mutation+ts into the pending entry immediately; flush and
+// putProgress reuse that captured identity and never re-read lastKnownUserId.
+export interface ProgressOp {
+  bookId: number;
+  data: PendingSave;
+  mutationId: string;
+  userId: number | null;
+  libraryId: string;
+  ts: number;
+}
+
+export interface PutProgressResult {
+  ok: boolean;
+  applied: boolean;
+  reason?: string;
+}
+
 const SAVE_DEBOUNCE_MS = 1500;
-const pending = new Map<number, PendingSave>();
+const pending = new Map<number, ProgressOp>();
 const timers = new Map<number, ReturnType<typeof setTimeout>>();
+
+// R2: one ordered coordinator per identity. Drains for the same
+// user+library+book+format are chained so overlapping flush/retry drains never
+// run in parallel for the same identity.
+const opChains = new Map<string, Promise<void>>();
+
+function identityKey(userId: number | null, libraryId: string, bookId: number, format: string): string {
+  return `${userId ?? "anon"}:${libraryId}:${bookId}:${format}`;
+}
+
+function chainIdentity(key: string, fn: () => Promise<void>): Promise<void> {
+  const prev = opChains.get(key) ?? Promise.resolve();
+  const next = prev.then(fn, fn);
+  opChains.set(key, next);
+  void next.finally(() => {
+    if (opChains.get(key) === next) opChains.delete(key);
+  });
+  return next;
+}
 
 // F01/FUP2/FUP3: durable outbox for failed saves. Beacon/pagehide delivery
 // is queue-only (never treated as acked); entries stay queued until a
@@ -282,19 +326,25 @@ function pickEvictionIndex(entries: OutboxEntry[], newestIdx: number): number {
 export function enqueueProgressOutbox(
   bookId: number,
   data: PendingSave,
-  opts?: { mutationId?: string },
+  opts?: { mutationId?: string; userId?: number | null; libraryId?: string; ts?: number },
 ): string {
   const mutationId = opts?.mutationId ?? newMutationId();
+  const userId =
+    opts && "userId" in opts
+      ? opts.userId ?? null
+      : lastKnownUserId;
+  const libraryId = opts?.libraryId ?? getLibraryScopeId();
+  const ts = typeof opts?.ts === "number" && Number.isFinite(opts.ts) ? opts.ts : Date.now();
   const entries = readOutbox().filter((e) => e.mutationId !== mutationId);
   entries.push({
     mutationId,
-    userId: lastKnownUserId,
-    libraryId: getLibraryScopeId(),
+    userId,
+    libraryId,
     bookId,
     format: data.format,
     data,
     attempts: 0,
-    ts: Date.now(),
+    ts,
   });
   while (entries.length > OUTBOX_MAX_ENTRIES) {
     entries.splice(pickEvictionIndex(entries, entries.length - 1), 1);
@@ -354,6 +404,9 @@ export async function retryOutbox(): Promise<void> {
     | { kind: "suspended" };
   const outcomes = new Map<string, Outcome>();
   let suspended = false;
+  // R2: ordered drain per identity — sorted by client ts so older mutations
+  // apply first; the loop awaits each PUT sequentially (never parallel) for
+  // the same book+format identity.
   const queue = [...eligible].sort((a, b) => a.ts - b.ts);
   for (const entry of queue) {
     if (generation !== outboxGeneration) break; // principal switched: abort drain
@@ -362,10 +415,20 @@ export async function retryOutbox(): Promise<void> {
       const res = await fetch(`/api/user/progress/${entry.bookId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(entry.data),
+        // R2: per-(user,library,book,format) ordering fields.
+        body: JSON.stringify({ ...entry.data, mutationId: entry.mutationId, clientTs: entry.ts }),
         keepalive: true,
       });
       if (res.ok) {
+        // R2: applied:false (stale) is still processed — drop only that
+        // mutation without clobbering UI (no refetch of stale state).
+        try {
+          const body = (await res.clone().json()) as { applied?: unknown };
+          if (body && body.applied === false) {
+            outcomes.set(entry.mutationId, { kind: "acked" });
+            continue;
+          }
+        } catch {}
         outcomes.set(entry.mutationId, { kind: "acked" });
         continue;
       }
@@ -449,9 +512,10 @@ if (typeof window !== "undefined") {
   })();
 }
 
-async function putProgress(bookId: number, data: PendingSave): Promise<boolean> {
-  const url = `/api/user/progress/${bookId}`;
-  const payload = JSON.stringify(data);
+async function putProgress(op: ProgressOp): Promise<PutProgressResult> {
+  const url = `/api/user/progress/${op.bookId}`;
+  // R2+R3: same captured identity on both attempts.
+  const payload = JSON.stringify({ ...op.data, mutationId: op.mutationId, clientTs: op.ts });
   // Server accepts both PUT and POST (beacon can only POST).
   for (const method of ["PUT", "POST"] as const) {
     try {
@@ -461,29 +525,40 @@ async function putProgress(bookId: number, data: PendingSave): Promise<boolean> 
         body: payload,
         keepalive: true,
       });
-      if (res.ok) return true;
+      if (res.ok) {
+        try {
+          const body = (await res.clone().json()) as { applied?: unknown; reason?: unknown };
+          if (body && body.applied === false) {
+            return { ok: true, applied: false, reason: typeof body.reason === "string" ? body.reason : "stale" };
+          }
+        } catch {}
+        return { ok: true, applied: true };
+      }
       // POST fallback only helps on 404/405 (old server without the alias).
       if (method === "PUT" && (res.status === 404 || res.status === 405)) continue;
-      return false;
+      return { ok: false, applied: false };
     } catch {
       if (method === "PUT") continue;
-      return false;
+      return { ok: false, applied: false };
     }
   }
-  return false;
+  return { ok: false, applied: false };
 }
 
 function flush(bookId: number, useBeacon = false): void {
-  const data = pending.get(bookId);
-  if (!data) return;
+  const op = pending.get(bookId);
+  if (!op) return;
   const timer = timers.get(bookId);
   if (timer) {
     clearTimeout(timer);
     timers.delete(bookId);
   }
-  const mutationId = newMutationId();
+  // R3: capture generation at flush start; the completion callback aborts if
+  // it changed (account switch) instead of enqueueing under a new principal.
+  const generationAtStart = outboxGeneration;
   const url = `/api/user/progress/${bookId}`;
-  const payload = JSON.stringify(data);
+  const payload = JSON.stringify({ ...op.data, mutationId: op.mutationId, clientTs: op.ts });
+  const payloadDataJson = JSON.stringify(op.data);
   if (useBeacon && typeof navigator !== "undefined" && navigator.sendBeacon) {
     // sendBeacon POSTs; the server has a POST alias for this reason. Queueing
     // in the browser is NOT an ack: persist to the outbox so the next load
@@ -491,18 +566,34 @@ function flush(bookId: number, useBeacon = false): void {
     try {
       const blob = new Blob([payload], { type: "application/json" });
       if (navigator.sendBeacon(url, blob)) {
-        enqueueProgressOutbox(bookId, data, { mutationId });
+        enqueueProgressOutbox(bookId, op.data, {
+          mutationId: op.mutationId,
+          userId: op.userId,
+          libraryId: op.libraryId,
+          ts: op.ts,
+        });
         return;
       }
     } catch {}
   }
-  // Keep pending until the server acks; only delete on response.ok.
-  void putProgress(bookId, data).then((ok) => {
-    if (ok) {
+  // R2: serialize drains per book+format identity; never parallel overlapping
+  // drains for the same identity.
+  const key = identityKey(op.userId, op.libraryId, op.bookId, op.data.format);
+  void chainIdentity(key, async () => {
+    // Keep pending until the server acks; only delete on response.ok.
+    const result = await putProgress(op);
+    if (generationAtStart !== outboxGeneration) return;
+    if (result.ok) {
       // Only clear if no newer save arrived while the request was in flight.
       const current = pending.get(bookId);
-      if (current === data || JSON.stringify(current) === payload) {
+      if (current === op || (current && JSON.stringify(current.data) === payloadDataJson)) {
         pending.delete(bookId);
+      }
+      // R2: applied:false is processed (remove only that mutation) without
+      // clobbering UI — no reading-list invalidation for stale acks.
+      if (result.applied === false) {
+        writeOutbox(readOutbox().filter((e) => e.mutationId !== op.mutationId));
+        return;
       }
       void queryClient.invalidateQueries({ queryKey: ["reading-list"] });
       // Remove only the acknowledged mutation: this attempt plus any queued
@@ -510,24 +601,40 @@ function flush(bookId: number, useBeacon = false): void {
       // same book (concurrent writes) are preserved.
       const rest = readOutbox().filter(
         (e) =>
-          e.mutationId !== mutationId &&
+          e.mutationId !== op.mutationId &&
           !(
             e.bookId === bookId &&
-            e.format === data.format &&
-            JSON.stringify(e.data) === payload
+            e.format === op.data.format &&
+            JSON.stringify(e.data) === payloadDataJson
           ),
       );
       writeOutbox(rest);
     } else {
-      enqueueProgressOutbox(bookId, data, { mutationId });
+      // R3: failure reuses the SAME captured identity, never re-reads principal.
+      enqueueProgressOutbox(bookId, op.data, {
+        mutationId: op.mutationId,
+        userId: op.userId,
+        libraryId: op.libraryId,
+        ts: op.ts,
+      });
       scheduleOutboxRetry();
     }
   });
 }
 
 // Debounced, fire-and-forget progress save. Safe to call on every page turn.
+// R3: captures {userId, libraryId, mutationId, ts} into the pending entry
+// immediately (not at enqueue-after-failure).
 export function saveBookProgress(bookId: number, data: PendingSave): void {
-  pending.set(bookId, data);
+  const op: ProgressOp = {
+    bookId,
+    data: { ...data },
+    mutationId: newMutationId(),
+    userId: lastKnownUserId,
+    libraryId: getLibraryScopeId(),
+    ts: Date.now(),
+  };
+  pending.set(bookId, op);
   const existing = timers.get(bookId);
   if (existing) clearTimeout(existing);
   timers.set(

@@ -1,11 +1,11 @@
 import JSZip from "jszip";
-import { createExtractorFromData } from "node-unrar-js/esm";
+import { createExtractorFromData, type FileHeader } from "node-unrar-js/esm";
 import { type Dirent, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
-import { basename, extname, join } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 import { CONFIG_DIR_PATH, LIBRARY_PATH } from "./config";
 import { getBookFormatPath, getLibraryPath, getSnapshotRevision } from "./calibre-optimized";
 import { getPathContentType } from "./book-files";
-import { runSingleFlight } from "./epub-cache";
+import { cacheLibraryHash, runSingleFlight } from "./epub-cache";
 import { type SourceSignature, getSourceSignature, isSameSignature } from "./file-signature";
 
 const PAGE_CACHE_DIR = join(CONFIG_DIR_PATH, "page-cache");
@@ -63,16 +63,20 @@ export function acquirePageLease(path: string): () => void {
   };
 }
 
-export function pageSingleFlightKey(bookId: number, op: string, page: string): string {
-  let library = "";
+export function pageSingleFlightKey(bookId: number, op: string, page: string, library?: string): string {
+  let resolved = library;
   let rev = 0;
-  try {
-    library = getLibraryPath();
-  } catch { /* ignore */ }
+  if (resolved === undefined) {
+    try {
+      resolved = getLibraryPath();
+    } catch {
+      resolved = "";
+    }
+  }
   try {
     rev = getSnapshotRevision();
   } catch { /* ignore */ }
-  return `${library}|${bookId}|${rev}|${op}|${page}`;
+  return `${resolved}|${bookId}|${rev}|${op}|${page}`;
 }
 
 /** Pixel-count guard via PNG IHDR header without a full decode. */
@@ -93,6 +97,12 @@ export function assertPixelCountGuard(data: Uint8Array, fileName: string): void 
 function entryUncompressedSize(entry: unknown): number | null {
   const size = (entry as { _data?: { uncompressedSize?: number } })._data?.uncompressedSize;
   return typeof size === "number" && Number.isFinite(size) ? size : null;
+}
+
+/** Declared uncompressed size from a RAR file header, if sane. */
+function declaredOf(header: FileHeader): number | null {
+  const size = header.unpSize;
+  return typeof size === "number" && Number.isFinite(size) && size >= 0 ? size : null;
 }
 
 export function sweepPageCacheQuota(): void {
@@ -173,6 +183,8 @@ interface PageCacheMeta {
   source: SourceSignature;
   pageCount: number;
   pages: CachedPage[];
+  /** Library hash owning this scoped dir; entries without it predate scoping. */
+  libHash?: string;
 }
 
 export interface PageManifestPage {
@@ -211,10 +223,12 @@ interface MetaMemEntry {
 }
 const metaMemCache = new Map<string, MetaMemEntry>();
 
-function metaCacheKey(bookId: number, format: string): string {
+function metaCacheKey(bookId: number, format: string, library?: string): string {
   // F04: scope the in-memory + singleflight key by library so switching
-  // libraries never serves another library's validated meta.
-  return `${LIBRARY_PATH}::${bookId}/${format.toUpperCase()}`;
+  // libraries never serves another library's validated meta. Pass the
+  // entry-captured library (see coherence rule in epub-cache.ts) instead of
+  // re-reading mid-await; the default covers best-effort callers.
+  return `${library ?? LIBRARY_PATH}::${bookId}/${format.toUpperCase()}`;
 }
 
 // Reverse a metaCacheKey back to its on-disk cache dir so quota eviction can
@@ -242,8 +256,48 @@ async function readJson<T>(path: string): Promise<T | null> {
   }
 }
 
-function getCacheDir(bookId: number, format: string): string {
+function getCacheDir(bookId: number, format: string, libHash: string = cacheLibraryHash()): string {
+  // PHYSICAL namespace: scoped by library hash so two libraries serving the
+  // same book id never share extracted pages. See coherence rule in
+  // epub-cache.ts: ensure functions capture the library once at entry and
+  // pass the derived libHash down instead of re-reading mid-await.
+  return join(PAGE_CACHE_DIR, `${libHash}-${bookId}`, format.toUpperCase());
+}
+
+function getLegacyCacheDir(bookId: number, format: string): string {
   return join(PAGE_CACHE_DIR, String(bookId), format.toUpperCase());
+}
+
+/**
+ * One-time migration from the old unscoped dir: when the scoped dir does not
+ * exist yet and the legacy dir holds the same generation, move it once onto
+ * the scoped path (stamping libHash) instead of re-extracting. Otherwise drop
+ * the stale legacy dir so the caller rebuilds. Returns the adopted meta, or
+ * null when the caller must rebuild.
+ */
+async function adoptOrRebuildPageDir(
+  cacheDir: string,
+  legacyDir: string,
+  source: SourceSignature,
+  libHash: string,
+  requirePages: boolean,
+): Promise<PageCacheMeta | null> {
+  if (existsSync(cacheDir) || !existsSync(legacyDir)) return null;
+  const legacyMeta = await readJson<PageCacheMeta>(join(legacyDir, CACHE_META_FILE));
+  if (
+    legacyMeta &&
+    (legacyMeta.libHash === undefined || legacyMeta.libHash === libHash) &&
+    isSameSignature(legacyMeta.source, source) &&
+    (!requirePages || legacyMeta.pages.every((page) => existsSync(join(legacyDir, page.fileName))))
+  ) {
+    mkdirSync(dirname(cacheDir), { recursive: true });
+    renameSync(legacyDir, cacheDir);
+    const adopted: PageCacheMeta = { ...legacyMeta, libHash };
+    await Bun.write(join(cacheDir, CACHE_META_FILE), `${JSON.stringify(adopted)}\n`);
+    return adopted;
+  }
+  rmSync(legacyDir, { recursive: true, force: true });
+  return null;
 }
 
 function getSourcePath(bookId: number, format: string): string {
@@ -274,17 +328,24 @@ function sortPageNames(a: string, b: string): number {
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
 }
 
-async function ensureCbzCache(bookId: number): Promise<{ cacheDir: string; meta: PageCacheMeta }> {
+async function ensureCbzCache(
+  bookId: number,
+  library?: string,
+): Promise<{ cacheDir: string; meta: PageCacheMeta }> {
+  // Capture the coherent catalog context at entry (see epub-cache.ts).
+  const resolvedLibrary = library ?? getLibraryPath();
+  const libHash = cacheLibraryHash(resolvedLibrary);
   const format = "CBZ";
   const sourcePath = getSourcePath(bookId, format);
   assertArchiveSize(sourcePath);
   const source = getSourceSignature(sourcePath);
-  const cacheDir = getCacheDir(bookId, format);
+  const cacheDir = getCacheDir(bookId, format, libHash);
+  const legacyDir = getLegacyCacheDir(bookId, format);
   const metaPath = join(cacheDir, CACHE_META_FILE);
-  const cacheKey = metaCacheKey(bookId, format);
+  const cacheKey = metaCacheKey(bookId, format, resolvedLibrary);
 
   const memEntry = metaMemCache.get(cacheKey);
-  if (memEntry && isSameSignature(memEntry.signature, source)) {
+  if (memEntry && memEntry.meta.libHash === libHash && isSameSignature(memEntry.signature, source)) {
     return { cacheDir, meta: memEntry.meta };
   }
 
@@ -293,11 +354,19 @@ async function ensureCbzCache(bookId: number): Promise<{ cacheDir: string; meta:
 
     if (
       existingMeta &&
+      existingMeta.libHash === libHash &&
       isSameSignature(existingMeta.source, source) &&
       existingMeta.pages.every((page) => existsSync(join(cacheDir, page.fileName)))
     ) {
       metaMemCache.set(cacheKey, { meta: existingMeta, signature: source });
       return { cacheDir, meta: existingMeta };
+    }
+
+    // CBZ pages materialize lazily, so adoption never requires page files.
+    const adopted = await adoptOrRebuildPageDir(cacheDir, legacyDir, source, libHash, false);
+    if (adopted) {
+      metaMemCache.set(cacheKey, { meta: adopted, signature: source });
+      return { cacheDir, meta: adopted };
     }
 
     metaMemCache.delete(cacheKey);
@@ -353,6 +422,7 @@ async function ensureCbzCache(bookId: number): Promise<{ cacheDir: string; meta:
 
     const meta: PageCacheMeta = {
       source,
+      libHash,
       pageCount: pages.length,
       pages,
     };
@@ -375,6 +445,7 @@ async function extractCbzPage(
   sourcePath: string,
   source: SourceSignature,
   pageNumber: number,
+  library?: string,
 ): Promise<PageFile> {
   const cachedPage = meta.pages[pageNumber - 1];
   if (!cachedPage) throw new PageStreamingError(404, "Page not found");
@@ -382,7 +453,10 @@ async function extractCbzPage(
   if (existsSync(outputPath)) {
     return { path: outputPath, contentType: cachedPage.contentType };
   }
-  return runSingleFlight(pageSingleFlightKey(bookId, "cbz", String(pageNumber)), () =>
+  // Thread the entry-captured library (see epub-cache.ts coherence rule) so
+  // the singleflight key cannot mix generations across a library switch.
+  const resolvedLibrary = library ?? getLibraryPath();
+  return runSingleFlight(pageSingleFlightKey(bookId, "cbz", String(pageNumber), resolvedLibrary), () =>
     archiveExtractSemaphore.run(async () => {
       if (existsSync(outputPath)) {
         return { path: outputPath, contentType: cachedPage.contentType };
@@ -434,17 +508,23 @@ async function getUnrarWasmBinary(): Promise<ArrayBuffer> {
   return Bun.file(wasmPath).arrayBuffer();
 }
 
-async function ensureCbrCache(bookId: number): Promise<{ cacheDir: string; meta: PageCacheMeta }> {
+async function ensureCbrCache(
+  bookId: number,
+  library?: string,
+): Promise<{ cacheDir: string; meta: PageCacheMeta }> {
+  const resolvedLibrary = library ?? getLibraryPath();
+  const libHash = cacheLibraryHash(resolvedLibrary);
   const format = "CBR";
   const sourcePath = getSourcePath(bookId, format);
   assertArchiveSize(sourcePath);
   const source = getSourceSignature(sourcePath);
-  const cacheDir = getCacheDir(bookId, format);
+  const cacheDir = getCacheDir(bookId, format, libHash);
+  const legacyDir = getLegacyCacheDir(bookId, format);
   const metaPath = join(cacheDir, CACHE_META_FILE);
-  const cacheKey = metaCacheKey(bookId, format);
+  const cacheKey = metaCacheKey(bookId, format, resolvedLibrary);
 
   const memEntry = metaMemCache.get(cacheKey);
-  if (memEntry && isSameSignature(memEntry.signature, source)) {
+  if (memEntry && memEntry.meta.libHash === libHash && isSameSignature(memEntry.signature, source)) {
     return { cacheDir, meta: memEntry.meta };
   }
 
@@ -453,11 +533,19 @@ async function ensureCbrCache(bookId: number): Promise<{ cacheDir: string; meta:
 
     if (
       existingMeta &&
+      existingMeta.libHash === libHash &&
       isSameSignature(existingMeta.source, source) &&
       existingMeta.pages.every((page) => existsSync(join(cacheDir, page.fileName)))
     ) {
       metaMemCache.set(cacheKey, { meta: existingMeta, signature: source });
       return { cacheDir, meta: existingMeta };
+    }
+
+    // CBR extracts eagerly, so adoption requires every page file present.
+    const adopted = await adoptOrRebuildPageDir(cacheDir, legacyDir, source, libHash, true);
+    if (adopted) {
+      metaMemCache.set(cacheKey, { meta: adopted, signature: source });
+      return { cacheDir, meta: adopted };
     }
 
     metaMemCache.delete(cacheKey);
@@ -491,33 +579,55 @@ async function ensureCbrCache(bookId: number): Promise<{ cacheDir: string; meta:
     }
 
     const imageNameSet = new Set(imageNames);
+    const indexByName = new Map(imageNames.map((name, offset) => [name, offset + 1]));
+    const declaredByName = new Map<string, number>();
+    for (const header of fileHeaders) {
+      if (imageNameSet.has(header.name)) declaredByName.set(header.name, header.unpSize);
+    }
+    // Declared-size gate BEFORE retaining any bytes: sum the archive headers'
+    // uncompressed sizes first and abort before extract() allocates.
+    let declaredTotal = 0;
+    for (const name of imageNames) {
+      const declared = declaredByName.get(name);
+      if (declared === undefined || !Number.isFinite(declared) || declared < 0) continue;
+      if (declared > MAX_CACHE_BYTES) {
+        throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
+      }
+      declaredTotal += declared;
+      if (declaredTotal > MAX_CACHE_BYTES) {
+        throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
+      }
+    }
     // The whole retain path runs INSIDE the semaphore: extraction, per-entry +
-    // cumulative caps, pixel guards, and writes. Nothing is collected outside
-    // the semaphore — each page is accounted as it is retained and the build
-    // aborts early once the cap is exceeded, before further Bun.write calls.
+    // cumulative caps, pixel guards, and writes. Files stream through the
+    // generator one at a time — each page's cumulative total is checked BEFORE
+    // it is retained/written, and the build aborts before further Bun.write
+    // calls. Buffers are never collected into a map first (that would hold
+    // the whole archive in memory before any cap is enforced).
     const pages: CachedPage[] = await archiveExtractSemaphore.run(async () => {
       const extracted = await extractor.extract({ files: (header) => imageNameSet.has(header.name) });
-      const extractedPages = new Map<string, Uint8Array>();
-      for (const file of extracted.files) {
-        if (file.extraction) {
-          extractedPages.set(file.fileHeader.name, file.extraction);
-        }
-      }
 
       const retained: CachedPage[] = [];
       let retainedBytes = 0;
-      for (const [offset, name] of imageNames.entries()) {
-        const data = extractedPages.get(name);
+      for (const file of extracted.files) {
+        const data = file.extraction;
         if (!data) continue;
-        if (data.byteLength > MAX_CACHE_BYTES) {
+        const name: string = file.fileHeader.name;
+        const index = indexByName.get(name);
+        if (index === undefined) continue;
+        // Declared size first (abort before accounting the retained buffer),
+        // then the actual bytes — both against the running cumulative total.
+        const declared = declaredOf(file.fileHeader);
+        if (declared !== null) {
+          if (declared > MAX_CACHE_BYTES || retainedBytes + declared > MAX_CACHE_BYTES) {
+            throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
+          }
+        }
+        if (data.byteLength > MAX_CACHE_BYTES || retainedBytes + data.byteLength > MAX_CACHE_BYTES) {
           throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
         }
         retainedBytes += data.byteLength;
-        if (retainedBytes > MAX_CACHE_BYTES) {
-          throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
-        }
 
-        const index = offset + 1;
         const ext = extname(name).toLowerCase() || ".bin";
         const fileName = `${String(index).padStart(5, "0")}${ext}`;
         assertPixelCountGuard(data, fileName);
@@ -557,6 +667,7 @@ async function ensureCbrCache(bookId: number): Promise<{ cacheDir: string; meta:
 
     const meta: PageCacheMeta = {
       source,
+      libHash,
       pageCount: pages.length,
       pages,
     };
@@ -579,6 +690,7 @@ async function extractCbrPage(
   sourcePath: string,
   source: SourceSignature,
   pageNumber: number,
+  library?: string,
 ): Promise<PageFile> {
   const cachedPage = meta.pages[pageNumber - 1];
   if (!cachedPage) throw new PageStreamingError(404, "Page not found");
@@ -586,7 +698,8 @@ async function extractCbrPage(
   if (existsSync(outputPath)) {
     return { path: outputPath, contentType: cachedPage.contentType };
   }
-  return runSingleFlight(pageSingleFlightKey(bookId, "cbr", String(pageNumber)), () =>
+  const resolvedLibrary = library ?? getLibraryPath();
+  return runSingleFlight(pageSingleFlightKey(bookId, "cbr", String(pageNumber), resolvedLibrary), () =>
     archiveExtractSemaphore.run(async () => {
       if (existsSync(outputPath)) {
         return { path: outputPath, contentType: cachedPage.contentType };
@@ -606,7 +719,14 @@ async function extractCbrPage(
         files: (header) => header.name === entryName || basename(header.name) === cachedPage.name,
       });
       let data: Uint8Array | undefined;
+      // One-shot generator: yields one file at a time, so peak memory is one
+      // page. The declared-size gate runs BEFORE retaining each buffer —
+      // abort before assignment/Bun.write, never after collecting.
       for (const file of extracted.files) {
+        const declared = declaredOf(file.fileHeader);
+        if (declared !== null && declared > MAX_CACHE_BYTES) {
+          throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
+        }
         if (file.extraction && file.fileHeader.name === entryName) {
           data = file.extraction;
           break;
@@ -731,19 +851,25 @@ async function getPdfPageCount(sourcePath: string): Promise<number> {
   return pageCount;
 }
 
-async function ensurePdfCache(bookId: number): Promise<{ cacheDir: string; sourcePath: string; source: SourceSignature; pageCount: number }> {
+async function ensurePdfCache(
+  bookId: number,
+  library?: string,
+): Promise<{ cacheDir: string; sourcePath: string; source: SourceSignature; pageCount: number }> {
+  const resolvedLibrary = library ?? getLibraryPath();
+  const libHash = cacheLibraryHash(resolvedLibrary);
   const format = "PDF";
   const sourcePath = getSourcePath(bookId, format);
   assertArchiveSize(sourcePath);
   const source = getSourceSignature(sourcePath);
-  const cacheDir = getCacheDir(bookId, format);
+  const cacheDir = getCacheDir(bookId, format, libHash);
+  const legacyDir = getLegacyCacheDir(bookId, format);
   const metaPath = join(cacheDir, CACHE_META_FILE);
-  const cacheKey = metaCacheKey(bookId, format);
+  const cacheKey = metaCacheKey(bookId, format, resolvedLibrary);
 
   return runSingleFlight(cacheKey, async () => {
     const existingMeta = await readJson<PageCacheMeta>(metaPath);
 
-    if (existingMeta && isSameSignature(existingMeta.source, source)) {
+    if (existingMeta && existingMeta.libHash === libHash && isSameSignature(existingMeta.source, source)) {
       return {
         cacheDir,
         sourcePath,
@@ -752,12 +878,19 @@ async function ensurePdfCache(bookId: number): Promise<{ cacheDir: string; sourc
       };
     }
 
+    // PDF pages render lazily, so adoption never requires page files.
+    const adopted = await adoptOrRebuildPageDir(cacheDir, legacyDir, source, libHash, false);
+    if (adopted) {
+      return { cacheDir, sourcePath, source, pageCount: adopted.pageCount };
+    }
+
     rmSync(cacheDir, { recursive: true, force: true });
     mkdirSync(cacheDir, { recursive: true });
 
     const pageCount = await getPdfPageCount(sourcePath);
     const meta: PageCacheMeta = {
       source,
+      libHash,
       pageCount,
       pages: Array.from({ length: pageCount }, (_, offset) => ({
         index: offset + 1,
@@ -772,8 +905,10 @@ async function ensurePdfCache(bookId: number): Promise<{ cacheDir: string; sourc
   });
 }
 
-async function getPdfPageFile(bookId: number, page: number): Promise<PageFile> {
-  const { cacheDir, sourcePath, source, pageCount } = await ensurePdfCache(bookId);
+async function getPdfPageFile(bookId: number, page: number, library?: string): Promise<PageFile> {
+  // Capture the coherent catalog context at entry (see epub-cache.ts).
+  const resolvedLibrary = library ?? getLibraryPath();
+  const { cacheDir, sourcePath, source, pageCount } = await ensurePdfCache(bookId, resolvedLibrary);
   const pageNumber = normalizePageNumber(page, pageCount);
   const outputPrefix = join(cacheDir, String(pageNumber).padStart(5, "0"));
   const outputPath = `${outputPrefix}.png`;
@@ -786,7 +921,7 @@ async function getPdfPageFile(bookId: number, page: number): Promise<PageFile> {
   }
 
   // Per-key singleflight: library|book|rev|op|page shares one render.
-  return runSingleFlight(pageSingleFlightKey(bookId, "pdf", String(pageNumber)), () =>
+  return runSingleFlight(pageSingleFlightKey(bookId, "pdf", String(pageNumber), resolvedLibrary), () =>
     pdfRenderSemaphore.run(async () => {
       if (existsSync(outputPath)) {
         return { path: outputPath, contentType: "image/png" };
@@ -859,9 +994,13 @@ function unsupportedFormat(format: string): never {
 
 export async function getPageManifest(bookId: number, formatParam: string): Promise<PageManifest> {
   const format = formatParam.toUpperCase();
+  // Capture the coherent catalog context at entry (see epub-cache.ts): every
+  // ensure call below uses this same resolved library — never re-read
+  // mid-await, where a library switch could mix generations on disk.
+  const library = getLibraryPath();
 
   if (format === "CBZ") {
-    const { meta } = await ensureCbzCache(bookId);
+    const { meta } = await ensureCbzCache(bookId, library);
     return {
       bookId,
       format,
@@ -876,7 +1015,7 @@ export async function getPageManifest(bookId: number, formatParam: string): Prom
   }
 
   if (format === "CBR") {
-    const { meta } = await ensureCbrCache(bookId);
+    const { meta } = await ensureCbrCache(bookId, library);
     return {
       bookId,
       format,
@@ -891,7 +1030,7 @@ export async function getPageManifest(bookId: number, formatParam: string): Prom
   }
 
   if (format === "PDF") {
-    const { pageCount } = await ensurePdfCache(bookId);
+    const { pageCount } = await ensurePdfCache(bookId, library);
     return {
       bookId,
       format,
@@ -910,19 +1049,21 @@ export async function getPageManifest(bookId: number, formatParam: string): Prom
 
 export async function getPageFile(bookId: number, formatParam: string, page: number): Promise<PageFile> {
   const format = formatParam.toUpperCase();
+  // Same entry-captured library discipline as getPageManifest.
+  const library = getLibraryPath();
 
   if (format === "CBZ") {
-    const { cacheDir, meta } = await ensureCbzCache(bookId);
+    const { cacheDir, meta } = await ensureCbzCache(bookId, library);
     const pageNumber = normalizePageNumber(page, meta.pageCount);
     const cachedPage = meta.pages[pageNumber - 1];
     if (!cachedPage) throw new PageStreamingError(404, "Page not found");
     const sourcePath = getSourcePath(bookId, format);
     const source = getSourceSignature(sourcePath);
-    return extractCbzPage(bookId, cacheDir, meta, sourcePath, source, pageNumber);
+    return extractCbzPage(bookId, cacheDir, meta, sourcePath, source, pageNumber, library);
   }
 
   if (format === "CBR") {
-    const { cacheDir, meta } = await ensureCbrCache(bookId);
+    const { cacheDir, meta } = await ensureCbrCache(bookId, library);
     const pageNumber = normalizePageNumber(page, meta.pageCount);
     const cachedPage = meta.pages[pageNumber - 1];
     if (!cachedPage) throw new PageStreamingError(404, "Page not found");
@@ -937,11 +1078,11 @@ export async function getPageFile(bookId: number, formatParam: string, page: num
     const sourcePath = getSourcePath(bookId, format);
     const source = getSourceSignature(sourcePath);
     try {
-      return await extractCbrPage(bookId, cacheDir, meta, sourcePath, source, pageNumber);
+      return await extractCbrPage(bookId, cacheDir, meta, sourcePath, source, pageNumber, library);
     } catch (error) {
       if (error instanceof PageStreamingError && error.status === 404) throw error;
-      metaMemCache.delete(metaCacheKey(bookId, format));
-      const reensured = await ensureCbrCache(bookId);
+      metaMemCache.delete(metaCacheKey(bookId, format, library));
+      const reensured = await ensureCbrCache(bookId, library);
       const rePage = reensured.meta.pages[pageNumber - 1];
       if (!rePage) throw new PageStreamingError(404, "Page not found");
       const rePath = join(reensured.cacheDir, rePage.fileName);
@@ -956,12 +1097,13 @@ export async function getPageFile(bookId: number, formatParam: string, page: num
         reSourcePath,
         getSourceSignature(reSourcePath),
         pageNumber,
+        library,
       );
     }
   }
 
   if (format === "PDF") {
-    return getPdfPageFile(bookId, page);
+    return getPdfPageFile(bookId, page, library);
   }
 
   return unsupportedFormat(format);

@@ -18,6 +18,16 @@ interface BookGridInfiniteProps {
 const CARD_GAP = 16;
 const CARD_MIN_WIDTH = 140;
 
+// Sticky chrome above the grid measured ~120px in devtools (desktop + mobile):
+// search bar ~64px + section/filter header ~56px. scrollMargin keeps the
+// restored/focused row from sliding under it.
+const MEASURED_STICKY_CHROME_PX = 120;
+const GRID_SCROLL_MARGIN = 120;
+// Invariant: the virtualizer margin must cover the measured sticky chrome.
+if (GRID_SCROLL_MARGIN < MEASURED_STICKY_CHROME_PX) {
+  throw new Error("GRID_SCROLL_MARGIN is below the measured sticky chrome height");
+}
+
 const GridCard = memo(function GridCard({ book }: { book: BookListItem }) {
   const unknown = isUnknownAuthor(book.authors);
   return (
@@ -108,8 +118,9 @@ export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, so
 
   const rowCount = Math.ceil(books.length / columns);
 
-  // Sticky search + table header reserve ~120px; scrollMargin keeps the
-  // restored/focused row from sliding under them.
+  // Sticky search + table header reserve GRID_SCROLL_MARGIN (see measured
+  // constant above); scrollMargin keeps the restored/focused row from
+  // sliding under them.
   // FUP8 TanStack contract: keep scrollMargin on the virtualizer AND do NOT
   // manually offset rows — rows use translateY(virtualRow.start) verbatim and
   // the virtualizer applies the margin internally.
@@ -117,7 +128,7 @@ export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, so
     count: rowCount,
     estimateSize: useCallback(() => cardHeight, [cardHeight]),
     overscan: 5,
-    scrollMargin: 120,
+    scrollMargin: GRID_SCROLL_MARGIN,
     scrollPaddingStart: 200,
     // React 19 warns when the adapter flushes a virtualizer rerender while a
     // route transition is still rendering. Normal scheduling is sufficient
@@ -128,9 +139,13 @@ export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, so
   const virtualItems = virtualizer.getVirtualItems();
   const totalSize = virtualizer.getTotalSize();
 
+  // Re-measure when the row size changes: cardHeight derives from the column
+  // count, and columns is listed explicitly so a width-only change that
+  // re-flows columns also invalidates cached measurements.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: columns intentionally included to invalidate measurements on re-flow.
   useEffect(() => {
     if (cardHeight > 0) virtualizer.measure();
-  }, [cardHeight, virtualizer]);
+  }, [cardHeight, columns, virtualizer]);
 
   // Infinite scroll — just use isFetchingNextPage, no extra state
   const lastVirtualItem = virtualItems[virtualItems.length - 1];

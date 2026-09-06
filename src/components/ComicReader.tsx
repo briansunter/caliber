@@ -340,8 +340,14 @@ export function ComicReader({
 
   const currentPageRef = useRef(currentPage);
   const totalPagesRef = useRef(totalPages);
-  const serverRestoredRef = useRef(false);
-  const restoreSettledRef = useRef(false);
+  // R5: reactive restore gate (refs alone never rerender, which caused the
+  // first-save miss). serverTarget === undefined means the fetch has not
+  // completed yet; null means fetched with no usable server position.
+  // Checkpoint save effect below persists the displayed index only when
+  // restoreState === "ready". Settle effect flips to ready on first display
+  // when serverTarget == null, else when displayed.index === serverTarget.
+  const [restoreState, setRestoreState] = useState<"pending" | "ready">("pending");
+  const [serverTarget, setServerTarget] = useState<number | null | undefined>(undefined);
   // FUP4: checkpoint of the successfully displayed page index. displayed
   // state itself is set ONLY on successful image onLoad/decode (or an
   // already-decoded instant swap) — never on request. displayedPageRef
@@ -349,8 +355,6 @@ export function ComicReader({
   // Guard: never save page 1 over restored page 20 without display — the
   // save effect below no-ops while displayed is null.
   const displayedPageRef = useRef<number | null>(null);
-  const initialLocalRef = useRef<number>(currentPage);
-  const serverTargetRef = useRef<number | null>(null);
 
   useEffect(() => {
     currentPageRef.current = currentPage;
@@ -363,8 +367,10 @@ export function ComicReader({
     if (displayed) displayedPageRef.current = displayed.index;
   }, [displayed]);
 
-  // FUP4: save ONLY the successfully displayed index. Deps include displayed
-  // so no save fires before the first successful image display.
+  // FUP4 + R5: single checkpoint — save ONLY the successfully displayed
+  // index, and only when restoreState === "ready". Deps include displayed,
+  // restoreState, and totalPages so the first display after the gate opens
+  // is never missed (ref-only gating could not rerender).
   useEffect(() => {
     if (!displayed) return;
     const shown = displayed.index;
@@ -374,7 +380,7 @@ export function ComicReader({
     // Sync to the signed-in user's server-side progress (debounced). Held
     // back until restore settles (settle effect below) so a slow/failed
     // fetch can't let this device's older page clobber newer server progress.
-    if (totalPages > 0 && restoreSettledRef.current) {
+    if (totalPages > 0 && restoreState === "ready") {
       saveBookProgress(bookId, {
         format,
         location: String(shown),
@@ -382,68 +388,74 @@ export function ComicReader({
         finished: shown >= totalPages,
       });
     }
-  }, [displayed, posKey, bookId, totalPages, format]);
+  }, [displayed, restoreState, posKey, bookId, totalPages, format]);
+
+  // Reset the reactive gate when switching books/formats.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: bookId/format are props; reset must run on identity change.
+  useEffect(() => {
+    setRestoreState("pending");
+    setServerTarget(undefined);
+  }, [bookId, format]);
 
   // Restore the signed-in user's server-side page once, after pages load.
   // F03: ignore server locators whose format doesn't match this reader and
   // fall back to local state — never trigger a full-file redownload loop.
+  // R4: format-scoped fetch (CBZ/CBR only).
   // FUP4: do NOT settle the gate or queue a catch-up save here. Settle
   // happens in the display-settle effect below, only after the restored (or
   // initial) page has successfully displayed.
   useEffect(() => {
-    if (serverRestoredRef.current || totalPages === 0) return;
+    if (totalPages === 0) return;
+    if (serverTarget !== undefined) return;
     let cancelled = false;
 
     void (async () => {
       let timerId: ReturnType<typeof setTimeout> | null = null;
       const record = await Promise.race([
-        fetchBookProgress(bookId).catch(() => null),
+        fetchBookProgress(bookId, format).catch(() => null),
         new Promise<null>((resolve) => {
           timerId = setTimeout(() => resolve(null), RESTORE_TIMEOUT_MS);
         }),
       ]);
       if (timerId) clearTimeout(timerId);
       if (cancelled) return;
-      serverRestoredRef.current = true;
-      if (!record?.location) return;
-      if (record.format && record.format.toUpperCase() !== format) return;
+      if (!record?.location) {
+        setServerTarget(null);
+        return;
+      }
+      if (record.format && record.format.toUpperCase() !== format) {
+        setServerTarget(null);
+        return;
+      }
       const restored = Number.parseInt(record.location, 10);
       if (Number.isFinite(restored) && restored >= 1 && restored <= totalPages) {
-        if (restored !== initialLocalRef.current) {
-          serverTargetRef.current = restored;
-        }
+        setServerTarget(restored);
         if (restored !== currentPageRef.current) {
           setCurrentPage(restored);
         }
+      } else {
+        setServerTarget(null);
       }
     })().catch(() => {
-      serverRestoredRef.current = true;
+      if (!cancelled) setServerTarget(null);
     });
 
     return () => {
       cancelled = true;
     };
-  }, [bookId, totalPages, format]);
+  }, [bookId, totalPages, format, serverTarget]);
 
-  // FUP4: settle the save gate only after successful display. If the server
-  // position differed from the initial local page, the catch-up save is
-  // queued here — from the display path — never before display.
+  // FUP4 + R5: settle the save gate only after successful display. If the
+  // server position differed from the initial local page, the catch-up save
+  // flows through the checkpoint effect above once ready flips — never
+  // before display.
   useEffect(() => {
     if (!displayed) return;
-    if (!serverRestoredRef.current) return;
-    if (restoreSettledRef.current) return;
-    const target = serverTargetRef.current;
-    if (target !== null && displayed.index !== target) return;
-    restoreSettledRef.current = true;
-    if (target !== null && totalPagesRef.current > 0) {
-      saveBookProgress(bookId, {
-        format,
-        location: String(displayed.index),
-        percentage: (displayed.index / totalPagesRef.current) * 100,
-        finished: displayed.index >= totalPagesRef.current,
-      });
-    }
-  }, [displayed, bookId, format]);
+    if (serverTarget === undefined) return;
+    if (restoreState === "ready") return;
+    if (serverTarget !== null && displayed.index !== serverTarget) return;
+    setRestoreState("ready");
+  }, [displayed, serverTarget, restoreState]);
 
   // Double-buffer page turns: if the target page is already decoded (warm
   // buffer), swap instantly with no flash. Otherwise hold the old page only

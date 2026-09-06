@@ -12,6 +12,19 @@ const MAX_EPUB_BYTES = 256 * 1024 * 1024;
 const MAX_EPUB_ENTRY_BYTES = 32 * 1024 * 1024;
 const MAX_EPUB_CACHE_BYTES = 1024 * 1024 * 1024;
 
+// PHYSICAL namespace: on-disk cache dirs are scoped by library identity so
+// two libraries serving the same book id can never share extracted bytes.
+// libHash is a short hash of the resolved library path (same derivation as
+// the progress library id in src/index.ts).
+export function cacheLibraryHash(libraryPath?: string): string {
+  return Bun.hash(libraryPath ?? getLibraryPath()).toString(36);
+}
+
+// Coherence rule (also applies to page-streaming.ts): resolve the library
+// ONCE at the entry of each ensure/extract function and thread the captured
+// value through every await below. Re-reading getLibraryPath() mid-await
+// could observe a library switch and mix generations on disk.
+
 // Refcounted leases: every acquire must pair with its release (idempotent via
 // flag); the count drops to zero — and the entry is deleted — only when the
 // last holder releases, so concurrent readers never evict each other's dirs.
@@ -120,16 +133,25 @@ export function sweepEpubCacheQuota(): void {
   } catch { /* ignore */ }
 }
 
-export function epubSingleFlightKey(bookId: number, op: string, entryPath: string): string {
-  let library = "";
+export function epubSingleFlightKey(
+  bookId: number,
+  op: string,
+  entryPath: string,
+  library?: string,
+): string {
+  let resolved = library;
   let rev = 0;
-  try {
-    library = getLibraryPath();
-  } catch { /* ignore */ }
+  if (resolved === undefined) {
+    try {
+      resolved = getLibraryPath();
+    } catch {
+      resolved = "";
+    }
+  }
   try {
     rev = getSnapshotRevision();
   } catch { /* ignore */ }
-  return `${library}|${bookId}|${rev}|${op}|${entryPath}`;
+  return `${resolved}|${bookId}|${rev}|${op}|${entryPath}`;
 }
 
 export class EpubCacheError extends Error {
@@ -148,13 +170,20 @@ interface CachedZip {
   zip: JSZip;
 }
 
+// On-disk meta: the source signature plus the library hash that owns this
+// scoped dir. isSameSignature ignores the extra field, so legacy metas
+// without libHash still compare correctly.
+interface EpubCacheMeta extends SourceSignature {
+  libHash?: string;
+}
+
 const openEpubs = new Map<string, CachedZip>();
 
-async function readCacheSignature(cacheDir: string): Promise<SourceSignature | null> {
+async function readCacheSignature(cacheDir: string): Promise<EpubCacheMeta | null> {
   try {
     const file = Bun.file(join(cacheDir, CACHE_META_FILE));
     if (!(await file.exists())) return null;
-    return (await file.json()) as SourceSignature;
+    return (await file.json()) as EpubCacheMeta;
   } catch {
     return null;
   }
@@ -235,25 +264,42 @@ async function ensureEpubCache(bookId: number): Promise<{
   cacheDir: string;
   epubPath: string;
   signature: SourceSignature;
+  library: string;
 } | null> {
+  // Capture the coherent catalog context at entry (see coherence rule above).
+  const library = getLibraryPath();
+  const libHash = cacheLibraryHash(library);
   const epubPath = getBookFormatPath(bookId, "EPUB");
   if (!epubPath || !existsSync(epubPath)) return null;
 
-  const cacheDir = join(EPUB_CACHE_DIR, String(bookId));
+  const cacheDir = join(EPUB_CACHE_DIR, `${libHash}-${bookId}`);
+  const legacyDir = join(EPUB_CACHE_DIR, String(bookId));
 
-  const signature = await runSingleFlight(`${LIBRARY_PATH}::epub:${bookId}`, async () => {
+  const signature = await runSingleFlight(`${library}::epub:${bookId}`, async () => {
     const current = getSourceSignature(epubPath);
     const cachedSignature = await readCacheSignature(cacheDir);
-    if (!isSameSignature(cachedSignature, current)) {
+    if (!isSameSignature(cachedSignature, current) || cachedSignature?.libHash !== libHash) {
+      if (!existsSync(cacheDir) && existsSync(legacyDir)) {
+        // One-time migration: adopt the old unscoped dir when it holds the
+        // same generation instead of re-extracting; otherwise rebuild.
+        const legacySignature = await readCacheSignature(legacyDir);
+        if (isSameSignature(legacySignature, current)) {
+          mkdirSync(EPUB_CACHE_DIR, { recursive: true });
+          renameSync(legacyDir, cacheDir);
+          await Bun.write(join(cacheDir, CACHE_META_FILE), `${JSON.stringify({ ...current, libHash })}\n`);
+          return current;
+        }
+        rmSync(legacyDir, { recursive: true, force: true });
+      }
       await resetCacheDir(cacheDir);
-      await Bun.write(join(cacheDir, CACHE_META_FILE), `${JSON.stringify(current)}\n`);
+      await Bun.write(join(cacheDir, CACHE_META_FILE), `${JSON.stringify({ ...current, libHash })}\n`);
     } else {
       mkdirSync(cacheDir, { recursive: true });
     }
     return current;
   });
 
-  return { cacheDir, epubPath, signature };
+  return { cacheDir, epubPath, signature, library };
 }
 
 async function extractEpubEntry(
@@ -261,14 +307,16 @@ async function extractEpubEntry(
   cacheDir: string,
   entryPath: string,
   signature: SourceSignature,
+  library: string,
 ): Promise<string | null> {
   const target = safeCachePath(cacheDir, entryPath);
   if (!target) return null;
   if (existsSync(target)) return target;
+  const libHash = cacheLibraryHash(library);
 
   const releaseLease = acquireEpubLease(cacheDir);
   try {
-    return await runSingleFlight(epubSingleFlightKey(0, "extractEpubEntry", `${epubPath}:${entryPath}`), async () => {
+    return await runSingleFlight(epubSingleFlightKey(0, "extractEpubEntry", `${epubPath}:${entryPath}`, library), async () => {
       // Recheck after acquiring the singleflight slot: another worker may
       // have published while we waited.
       if (existsSync(target)) return target;
@@ -316,8 +364,8 @@ async function extractEpubEntry(
           try { rmSync(tmpPath, { force: true }); } catch { /* ignore */ }
         }
         const existingSignature = await readCacheSignature(cacheDir);
-        if (!isSameSignature(existingSignature, signature)) {
-          await Bun.write(join(cacheDir, CACHE_META_FILE), `${JSON.stringify(signature)}\n`);
+        if (!isSameSignature(existingSignature, signature) || existingSignature?.libHash !== libHash) {
+          await Bun.write(join(cacheDir, CACHE_META_FILE), `${JSON.stringify({ ...signature, libHash })}\n`);
         }
         sweepEpubCacheQuota();
 
@@ -345,5 +393,6 @@ export async function getEpubEntryPath(bookId: number, entryPath: string): Promi
     cache.cacheDir,
     decodedPath,
     cache.signature,
+    cache.library,
   );
 }
