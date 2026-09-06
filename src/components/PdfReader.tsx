@@ -415,8 +415,15 @@ export function PdfReader({
   const totalPagesRef = useRef(totalPages);
   const serverRestoredRef = useRef(false);
   const restoreSettledRef = useRef(false);
-  // F06: track the page actually swapped onto the canvas, not the requested one.
-  const displayedPageRef = useRef(currentPage);
+  // FUP4: explicit checkpoint of the page actually swapped onto the canvas.
+  // Set ONLY in the successful canvas-swap callback (with latest-token
+  // guard). Saves must use this, never the merely-requested currentPage.
+  // Guard: never save page 1 over restored page 20 without display — the
+  // save effect below no-ops while displayedPage is null.
+  const [displayedPage, setDisplayedPage] = useState<number | null>(null);
+  const displayedPageRef = useRef<number | null>(null);
+  const initialLocalRef = useRef<number>(currentPage);
+  const serverTargetRef = useRef<number | null>(null);
 
   useEffect(() => {
     currentPageRef.current = currentPage;
@@ -444,10 +451,13 @@ export function PdfReader({
     setRendering(true);
 
     const effectiveWidth = containerWidth > 0 ? containerWidth : container.clientWidth;
+    // Capture the requested page for the async swap; only this value may
+    // become displayedPage, and only under the token guard below.
+    const requestedPage = currentPage;
 
     // F06: terminal catch so a rejected getPage never becomes unhandled.
     void pdf
-      .getPage(currentPage)
+      .getPage(requestedPage)
       .then(async (page) => {
       if (renderTokenRef.current !== token) return;
 
@@ -490,7 +500,10 @@ export function PdfReader({
           // path — both success and cancellation free the canvas.
           offscreen.width = 0;
           offscreen.height = 0;
-          displayedPageRef.current = currentPage;
+          // FUP4: checkpoint ONLY on successful swap with the latest-token
+          // guard. This is the sole writer of displayedPage.
+          displayedPageRef.current = requestedPage;
+          setDisplayedPage(requestedPage);
           setRendering(false);
         })
         .catch(() => {
@@ -532,22 +545,9 @@ export function PdfReader({
       })
       .catch(() => {});
 
-    // Save position (displayed page, not merely requested).
-    try {
-      localStorage.setItem(posKey, JSON.stringify({ page: currentPage, ts: Date.now() }));
-    } catch {}
-    // Sync to the signed-in user's server-side progress (debounced). Held back
-    // until the initial restore attempt settles so a slow/failed fetch can't
-    // let this device's older page clobber newer server progress.
-    if (totalPages > 0 && restoreSettledRef.current) {
-      const shown = displayedPageRef.current || currentPage;
-      saveBookProgress(bookId, {
-        format: "PDF",
-        location: String(shown),
-        percentage: (shown / totalPages) * 100,
-        finished: shown >= totalPages,
-      });
-    }
+    // FUP4: no saves from the render-start path. Persistence lives in the
+    // displayedPage save effect below, which only fires after a successful
+    // canvas swap.
     // Save zoom
     try {
       localStorage.setItem(zoomKey, JSON.stringify({ zoom, ts: Date.now() }));
@@ -557,17 +557,38 @@ export function PdfReader({
     isLoading,
     zoom,
     containerWidth,
-    posKey,
     zoomKey,
     pdfLinkService,
     settings.maxRenderScale,
-    bookId,
-    totalPages,
   ]);
+
+  // FUP4: save ONLY the successfully displayed page. No-op until the first
+  // canvas swap sets displayedPage — this is the guard that prevents saving
+  // page 1 over a restored page 20 that has not displayed yet.
+  useEffect(() => {
+    if (displayedPage === null) return;
+    try {
+      localStorage.setItem(posKey, JSON.stringify({ page: displayedPage, ts: Date.now() }));
+    } catch {}
+    // Sync to the signed-in user's server-side progress (debounced). Held
+    // back until restore settles (see settle effect below) so a slow/failed
+    // fetch can't let this device's older page clobber newer server progress.
+    if (totalPages > 0 && restoreSettledRef.current) {
+      saveBookProgress(bookId, {
+        format: "PDF",
+        location: String(displayedPage),
+        percentage: (displayedPage / totalPages) * 100,
+        finished: displayedPage >= totalPages,
+      });
+    }
+  }, [displayedPage, totalPages, posKey, bookId]);
 
   // Restore the signed-in user's server-side page once, after the doc loads.
   // F03: ignore locators from a different format; fall back to local state
   // with no reload loop.
+  // FUP4: do NOT settle the save gate or queue a catch-up save here. The
+  // gate settles in the display-settle effect below, only after the restored
+  // (or initial) page has successfully displayed.
   useEffect(() => {
     if (serverRestoredRef.current || isLoading || totalPages === 0) return;
     let cancelled = false;
@@ -581,35 +602,49 @@ export function PdfReader({
         }),
       ]);
       if (timerId) clearTimeout(timerId);
+      if (cancelled) return;
       serverRestoredRef.current = true;
-      restoreSettledRef.current = true;
-      // Catch-up save: a page turned while the gate was closed never entered
-      // the debounced pending map; queue one canonical save for current state.
-      if (!cancelled && totalPagesRef.current > 0) {
-        const page = displayedPageRef.current || currentPageRef.current;
-        const total = totalPagesRef.current;
-        saveBookProgress(bookId, {
-          format: "PDF",
-          location: String(page),
-          percentage: (page / total) * 100,
-          finished: page >= total,
-        });
-      }
-      if (cancelled || !record?.location) return;
+      if (!record?.location) return;
       if (record.format && record.format.toUpperCase() !== "PDF") return;
       const restored = Number.parseInt(record.location, 10);
       if (Number.isFinite(restored) && restored >= 1 && restored <= totalPages) {
-        setCurrentPage(restored);
+        // Record the server target so the settle effect can wait for its
+        // display before opening the save gate.
+        if (restored !== initialLocalRef.current) {
+          serverTargetRef.current = restored;
+        }
+        if (restored !== currentPageRef.current) {
+          setCurrentPage(restored);
+        }
       }
     })().catch(() => {
       serverRestoredRef.current = true;
-      restoreSettledRef.current = true;
     });
 
     return () => {
       cancelled = true;
     };
   }, [bookId, isLoading, totalPages]);
+
+  // FUP4: settle the save gate only after successful display. If the server
+  // position differed from the initial local page, the catch-up save is
+  // queued here — from the display callback path — never before display.
+  useEffect(() => {
+    if (displayedPage === null) return;
+    if (!serverRestoredRef.current) return;
+    if (restoreSettledRef.current) return;
+    const target = serverTargetRef.current;
+    if (target !== null && displayedPage !== target) return;
+    restoreSettledRef.current = true;
+    if (target !== null && totalPagesRef.current > 0) {
+      saveBookProgress(bookId, {
+        format: "PDF",
+        location: String(displayedPage),
+        percentage: (displayedPage / totalPagesRef.current) * 100,
+        finished: displayedPage >= totalPagesRef.current,
+      });
+    }
+  }, [displayedPage, bookId]);
 
   useEffect(() => {
     const pdf = pdfRef.current;

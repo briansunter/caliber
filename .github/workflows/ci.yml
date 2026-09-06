@@ -53,16 +53,50 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y poppler-utils curl
       - name: Install dependencies
         run: bun install --frozen-lockfile
-      - name: Build packed artifact
+      - name: Build frontend
         run: bun run build
+      - name: Installed-artifact sanity (CLI)
+        run: bun src/cli.ts --help
       - name: Start production server and smoke-test
         run: |
+          set -euo pipefail
           export SMOKE_DIR="$(mktemp -d)"
+          echo "SMOKE_DIR=$SMOKE_DIR" >> "$GITHUB_ENV"
           export CALIBRE_LIBRARY_PATH="$SMOKE_DIR/library"
           export CALIBER_CONFIG_DIR="$SMOKE_DIR/config"
           export PORT=3099
           export NODE_ENV=production
-          mkdir -p "$CALIBRE_LIBRARY_PATH"
+          mkdir -p "$CALIBRE_LIBRARY_PATH/Smoke Book"
+          # Minimal fixture library: full Calibre schema (FTS setup requires
+          # every link table) with one book + format row + dummy file.
+          cat > "$SMOKE_DIR/seed.ts" <<'EOF'
+          import { Database } from "bun:sqlite";
+          const library = process.env.CALIBRE_LIBRARY_PATH!;
+          const db = new Database(`${library}/metadata.db`);
+          db.exec(`
+            CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT NOT NULL, sort TEXT, link TEXT NOT NULL DEFAULT '');
+            CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT NOT NULL, sort TEXT, timestamp TEXT, pubdate TEXT, series_index REAL NOT NULL DEFAULT 1.0, author_sort TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL DEFAULT 1, uuid TEXT NOT NULL, has_cover INTEGER DEFAULT 0, last_modified TEXT);
+            CREATE TABLE books_authors_link (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, author INTEGER NOT NULL, UNIQUE(book, author));
+            CREATE TABLE books_publishers_link (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, publisher INTEGER NOT NULL, UNIQUE(book, publisher));
+            CREATE TABLE books_ratings_link (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, rating INTEGER NOT NULL, UNIQUE(book, rating));
+            CREATE TABLE books_series_link (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, series INTEGER NOT NULL, UNIQUE(book));
+            CREATE TABLE books_tags_link (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, tag INTEGER NOT NULL, UNIQUE(book, tag));
+            CREATE TABLE comments (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, text TEXT NOT NULL);
+            CREATE TABLE data (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, format TEXT NOT NULL COLLATE NOCASE, uncompressed_size INTEGER NOT NULL, name TEXT);
+            CREATE TABLE identifiers (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, type TEXT NOT NULL DEFAULT 'isbn' COLLATE NOCASE, val TEXT NOT NULL COLLATE NOCASE, UNIQUE(book, type));
+            CREATE TABLE publishers (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE, sort TEXT COLLATE NOCASE);
+            CREATE TABLE ratings (id INTEGER PRIMARY KEY, rating INTEGER NOT NULL UNIQUE);
+            CREATE TABLE series (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE, sort TEXT COLLATE NOCASE);
+            CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE);
+          `);
+          db.run("INSERT INTO authors (id, name, sort) VALUES (1, 'Smoke Author', 'Author, Smoke')");
+          db.run("INSERT INTO books (id, title, sort, timestamp, pubdate, series_index, author_sort, path, flags, uuid, has_cover, last_modified) VALUES (1, 'Smoke Book', 'Smoke Book', '2024-01-02 00:00:00+00:00', '2023-01-01 00:00:00+00:00', 1.0, 'Author, Smoke', 'Smoke Book', 1, '11111111-1111-1111-1111-111111111111', 0, '2024-01-02 00:00:00+00:00')");
+          db.run("INSERT INTO books_authors_link (book, author) VALUES (1, 1)");
+          db.run("INSERT INTO data (book, format, uncompressed_size, name) VALUES (1, 'EPUB', 0, 'Smoke Book')");
+          db.close();
+          await Bun.write(`${library}/Smoke Book/Smoke Book.epub`, "dummy-epub-bytes");
+          EOF
+          CALIBRE_LIBRARY_PATH="$CALIBRE_LIBRARY_PATH" bun "$SMOKE_DIR/seed.ts"
           bun src/index.ts > "$SMOKE_DIR/server.log" 2>&1 &
           SERVER_PID=$!
           trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
@@ -72,14 +106,119 @@ jobs:
             fi
             sleep 1
           done
+          # Fail loudly if the server never came up (curl -f alone would
+          # already fail, but this names the cause and keeps the log).
+          curl -fsS "http://127.0.0.1:$PORT/api/health" > /dev/null || {
+            echo "server did not become healthy; last 50 log lines:"
+            tail -n 50 "$SMOKE_DIR/server.log"
+            exit 1
+          }
           echo "--- /api/health ---"
           curl -fsS "http://127.0.0.1:$PORT/api/health"
           echo
-          echo "--- /opds ---"
-          curl -fsS "http://127.0.0.1:$PORT/opds" | head -c 500
+          # Poll the catalog: the first request can race snapshot warmup.
+          for i in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:$PORT/opds" -o "$SMOKE_DIR/opds.xml" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          echo "--- /opds (from file, not pipe, so curl failures fail the job) ---"
+          curl -fsS "http://127.0.0.1:$PORT/opds" -o "$SMOKE_DIR/opds.xml"
+          grep -q "<feed" "$SMOKE_DIR/opds.xml"
+          grep -q "Smoke Book" "$SMOKE_DIR/opds.xml" || {
+            # The nav root lists sections, not books; the acquisition feed
+            # must contain the seeded book.
+            curl -fsS "http://127.0.0.1:$PORT/opds/books" -o "$SMOKE_DIR/acquisition.xml"
+            grep -q "<feed" "$SMOKE_DIR/acquisition.xml"
+            grep -q "Smoke Book" "$SMOKE_DIR/acquisition.xml"
+          }
+          head -c 500 "$SMOKE_DIR/opds.xml"
+          echo
+          echo "--- /opds/book/1/complete (entry document) ---"
+          curl -fsS "http://127.0.0.1:$PORT/opds/book/1/complete" -o "$SMOKE_DIR/complete.xml"
+          grep -q "<entry" "$SMOKE_DIR/complete.xml"
+          head -c 500 "$SMOKE_DIR/complete.xml"
           echo
           echo "--- /api/user/me (auth) ---"
           curl -fsS "http://127.0.0.1:$PORT/api/user/me"
           echo
           kill $SERVER_PID
           trap - EXIT
+          wait $SERVER_PID 2>/dev/null || true
+      - name: Smoke-test authenticated OPDS acquisition
+        run: |
+          set -euo pipefail
+          export SMOKE_DIR="${SMOKE_DIR:-$(mktemp -d)}"
+          export CALIBRE_LIBRARY_PATH="$SMOKE_DIR/library"
+          export CALIBER_CONFIG_DIR="$SMOKE_DIR/config"
+          export CALIBER_AUTH_ENABLED=1
+          export PORT=3100
+          export NODE_ENV=production
+          # Reuse the seed from the previous step when present, else reseed.
+          if [ ! -f "$CALIBRE_LIBRARY_PATH/metadata.db" ]; then
+            echo "no fixture library from previous step; reseeding"
+            mkdir -p "$CALIBRE_LIBRARY_PATH/Smoke Book"
+            cat > "$SMOKE_DIR/seed-auth.ts" <<'EOF'
+          import { Database } from "bun:sqlite";
+          const library = process.env.CALIBRE_LIBRARY_PATH!;
+          const db = new Database(`${library}/metadata.db`);
+          db.exec(`
+            CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT NOT NULL, sort TEXT, link TEXT NOT NULL DEFAULT '');
+            CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT NOT NULL, sort TEXT, timestamp TEXT, pubdate TEXT, series_index REAL NOT NULL DEFAULT 1.0, author_sort TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL DEFAULT 1, uuid TEXT NOT NULL, has_cover INTEGER DEFAULT 0, last_modified TEXT);
+            CREATE TABLE books_authors_link (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, author INTEGER NOT NULL, UNIQUE(book, author));
+            CREATE TABLE books_publishers_link (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, publisher INTEGER NOT NULL, UNIQUE(book, publisher));
+            CREATE TABLE books_ratings_link (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, rating INTEGER NOT NULL, UNIQUE(book, rating));
+            CREATE TABLE books_series_link (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, series INTEGER NOT NULL, UNIQUE(book));
+            CREATE TABLE books_tags_link (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, tag INTEGER NOT NULL, UNIQUE(book, tag));
+            CREATE TABLE comments (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, text TEXT NOT NULL);
+            CREATE TABLE data (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, format TEXT NOT NULL COLLATE NOCASE, uncompressed_size INTEGER NOT NULL, name TEXT);
+            CREATE TABLE identifiers (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, type TEXT NOT NULL DEFAULT 'isbn' COLLATE NOCASE, val TEXT NOT NULL COLLATE NOCASE, UNIQUE(book, type));
+            CREATE TABLE publishers (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE, sort TEXT COLLATE NOCASE);
+            CREATE TABLE ratings (id INTEGER PRIMARY KEY, rating INTEGER NOT NULL UNIQUE);
+            CREATE TABLE series (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE, sort TEXT COLLATE NOCASE);
+            CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE);
+          `);
+          db.run("INSERT INTO authors (id, name, sort) VALUES (1, 'Smoke Author', 'Author, Smoke')");
+          db.run("INSERT INTO books (id, title, sort, timestamp, pubdate, series_index, author_sort, path, flags, uuid, has_cover, last_modified) VALUES (1, 'Smoke Book', 'Smoke Book', '2024-01-02 00:00:00+00:00', '2023-01-01 00:00:00+00:00', 1.0, 'Author, Smoke', 'Smoke Book', 1, '11111111-1111-1111-1111-111111111111', 0, '2024-01-02 00:00:00+00:00')");
+          db.run("INSERT INTO books_authors_link (book, author) VALUES (1, 1)");
+          db.run("INSERT INTO data (book, format, uncompressed_size, name) VALUES (1, 'EPUB', 0, 'Smoke Book')");
+          db.close();
+          await Bun.write(`${library}/Smoke Book/Smoke Book.epub`, "dummy-epub-bytes");
+          EOF
+            CALIBRE_LIBRARY_PATH="$CALIBRE_LIBRARY_PATH" bun "$SMOKE_DIR/seed-auth.ts"
+          fi
+          bun src/index.ts > "$SMOKE_DIR/auth-server.log" 2>&1 &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 80); do
+            if curl -fsS "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS "http://127.0.0.1:$PORT/api/health" > /dev/null || {
+            echo "auth server did not become healthy; last 50 log lines:"
+            tail -n 50 "$SMOKE_DIR/auth-server.log"
+            exit 1
+          }
+          echo "--- first-run setup ---"
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d '{"username":"smoke","password":"smoke-pass-123"}' \
+            "http://127.0.0.1:$PORT/api/auth/setup"
+          echo
+          echo "--- unauthenticated OPDS must be 401 ---"
+          if curl -fsS "http://127.0.0.1:$PORT/opds/books" -o "$SMOKE_DIR/denied.xml"; then
+            echo "expected 401 for unauthenticated OPDS acquisition"
+            exit 1
+          fi
+          echo "--- authenticated OPDS acquisition (Basic) ---"
+          curl -fsS -u "smoke:smoke-pass-123" \
+            "http://127.0.0.1:$PORT/opds/books" -o "$SMOKE_DIR/auth-acquisition.xml"
+          grep -q "<feed" "$SMOKE_DIR/auth-acquisition.xml"
+          grep -q "Smoke Book" "$SMOKE_DIR/auth-acquisition.xml"
+          head -c 500 "$SMOKE_DIR/auth-acquisition.xml"
+          echo
+          kill $SERVER_PID
+          trap - EXIT
+          wait $SERVER_PID 2>/dev/null || true

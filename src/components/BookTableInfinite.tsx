@@ -1,4 +1,5 @@
 import { memo, useEffect, useCallback, useRef } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useWindowVirtualizer } from "@tanstack/react-virtual";
 import { useFlattenedBooks, type SortConfig, type SortField } from "@/hooks/useBooksInfinite";
 import type { BookListItem } from "@/lib/calibre-optimized";
@@ -402,11 +403,15 @@ export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, 
   const {
     books, totalCount, retainedCount, windowTruncated, hasNextPage, fetchNextPage,
     isFetchingNextPage, isFetchNextPageError, isLoading, isError, error, errorStage,
-    isPlaceholder, emptyReason, isAuthExpired, isOffline, refetch,
+    isPlaceholder, emptyReason, isAuthExpired, isOffline, refetch, queryKey,
   } = useFlattenedBooks(searchQuery, sortConfig, tagIds);
+  const queryClient = useQueryClient();
 
   // Set up window virtualizer - uses window scroll. scrollMargin keeps the
   // restored/focused row clear of the sticky search + table headers.
+  // FUP8 TanStack contract: keep scrollMargin on the virtualizer AND do NOT
+  // manually offset rows — rows use translateY(virtualItem.start) verbatim
+  // and the virtualizer applies the margin internally.
   const virtualizer = useWindowVirtualizer({
     count: books.length,
     estimateSize: useCallback(() => ROW_HEIGHT, []),
@@ -467,11 +472,21 @@ export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, 
 
   // Anchor restore: fetch the required window before scrolling. Cancelled on
   // unmount or when the query identity changes.
+  // FUP8: deps include books.length/hasNextPage readiness; the loop re-reads
+  // the latest books from the queryClient cache after each fetchNextPage
+  // (never the captured array, which goes stale across awaits).
   const restoreKey = `${searchQuery}|${sortConfig.field}|${sortConfig.order}|${(tagIds ?? []).join(",")}`;
-  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional - restore once per query identity
+  // biome-ignore lint/correctness/useExhaustiveDependencies: restore intentionally reads fresh books via queryClient after each fetch; captured books/fetchNextPage would go stale across awaits.
   useEffect(() => {
     let cancelled = false;
     let raf = 0;
+    const readFreshBooks = (): typeof books => {
+      try {
+        const data = queryClient.getQueryData<{ pages: { items: typeof books }[] }>(queryKey);
+        if (data?.pages) return data.pages.flatMap((p) => p.items);
+      } catch {}
+      return books;
+    };
     const run = async () => {
       let anchorId: number | null = null;
       let anchorOffset = 0;
@@ -481,20 +496,30 @@ export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, 
         if (saved && typeof saved.id === "number") anchorId = saved.id;
         if (saved && typeof saved.offset === "number") anchorOffset = saved.offset;
       } catch { anchorId = null; }
-      if (anchorId === null || books.length === 0) return;
+      let fresh = readFreshBooks();
+      if (anchorId === null || fresh.length === 0) return;
       const wanted = anchorId;
       let guard = 0;
-      while (!cancelled && guard < 10 && hasNextPage && !books.some((b) => b.id === wanted)) {
+      let latestHasNext = hasNextPage;
+      while (!cancelled && guard < 10 && latestHasNext && !fresh.some((b) => b.id === wanted)) {
         guard++;
-        try { await fetchNextPage(); } catch { break; }
+        try {
+          const result = await fetchNextPage();
+          latestHasNext = (result.data?.pages.length ?? 0) > 0 ? (result.hasNextPage ?? latestHasNext) : latestHasNext;
+        } catch { break; }
+        fresh = readFreshBooks();
+        if (fresh.some((b) => b.id === wanted)) break;
       }
       if (cancelled) return;
-      const idx = books.findIndex((b) => b.id === wanted);
+      fresh = readFreshBooks();
+      const idx = fresh.findIndex((b) => b.id === wanted);
       if (idx >= 0) {
         const off = anchorOffset;
         raf = requestAnimationFrame(() => {
           if (cancelled) return;
           try {
+            // Single offset adjust only: scrollToIndex already accounts for
+            // scrollMargin; apply the saved intra-row offset once.
             virtualizer.scrollToIndex(idx, { align: "start" });
             if (off > 0) window.scrollBy({ top: off });
           } catch {}
@@ -504,7 +529,8 @@ export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, 
     };
     void run();
     return () => { cancelled = true; cancelAnimationFrame(raf); };
-  }, [restoreKey]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [restoreKey, books.length, hasNextPage, queryClient, queryKey]);
 
   if (isLoading) {
     return (

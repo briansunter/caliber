@@ -1,6 +1,6 @@
 import JSZip from "jszip";
 import { createExtractorFromData } from "node-unrar-js/esm";
-import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { type Dirent, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { basename, extname, join } from "node:path";
 import { CONFIG_DIR_PATH, LIBRARY_PATH } from "./config";
 import { getBookFormatPath, getLibraryPath, getSnapshotRevision } from "./calibre-optimized";
@@ -46,15 +46,20 @@ class JobSemaphore {
 export const pdfRenderSemaphore = new JobSemaphore(3);
 export const archiveExtractSemaphore = new JobSemaphore(2);
 
-const activePageLeases = new Set<string>();
+// Refcounted leases: every acquire must pair with its release (idempotent via
+// flag); the count drops to zero — and the entry is deleted — only when the
+// last holder releases, so concurrent renders never evict each other's pages.
+const activePageLeases = new Map<string, number>();
 
 export function acquirePageLease(path: string): () => void {
-  activePageLeases.add(path);
+  activePageLeases.set(path, (activePageLeases.get(path) ?? 0) + 1);
   let released = false;
   return () => {
     if (released) return;
     released = true;
-    activePageLeases.delete(path);
+    const remaining = (activePageLeases.get(path) ?? 1) - 1;
+    if (remaining <= 0) activePageLeases.delete(path);
+    else activePageLeases.set(path, remaining);
   };
 }
 
@@ -92,46 +97,65 @@ function entryUncompressedSize(entry: unknown): number | null {
 
 export function sweepPageCacheQuota(): void {
   try {
-    const books = readdirSync(PAGE_CACHE_DIR, { withFileTypes: true });
-    const files: Array<{ path: string; mtime: number }> = [];
+    // Recursive walk: pages may live in nested directories; every file counts
+    // toward the quota (manifests included), while only unleased page files
+    // are eviction candidates.
     let total = 0;
+    const files: Array<{ path: string; mtime: number }> = [];
+    const walk = (dir: string): void => {
+      let entries: Dirent[] | undefined;
+      try {
+        entries = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const p = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(p);
+          continue;
+        }
+        if (!entry.isFile()) continue;
+        try {
+          const st = statSync(p);
+          total += st.size;
+          if (entry.name === CACHE_META_FILE) continue;
+          if ((activePageLeases.get(p) ?? 0) > 0) continue;
+          files.push({ path: p, mtime: st.mtimeMs });
+        } catch { /* ignore */ }
+      }
+    };
+    let books: Dirent[] | undefined;
+    try {
+      books = readdirSync(PAGE_CACHE_DIR, { withFileTypes: true });
+    } catch {
+      return;
+    }
     for (const book of books) {
       if (!book.isDirectory()) continue;
-      const bookDir = join(PAGE_CACHE_DIR, book.name);
-      let formats: Array<{ isDirectory(): boolean; name: string }>;
-      try {
-        formats = readdirSync(bookDir, { withFileTypes: true }) as unknown as Array<{ isDirectory(): boolean; name: string }>;
-      } catch { continue; }
-      for (const fmt of formats) {
-        if (!fmt.isDirectory()) continue;
-        const dir = join(bookDir, fmt.name);
-        let entries: string[];
-        try {
-          entries = readdirSync(dir);
-        } catch { continue; }
-        for (const entry of entries) {
-          if (entry === CACHE_META_FILE) continue;
-          const p = join(dir, entry);
-          if (activePageLeases.has(p)) continue;
-          try {
-            const st = statSync(p);
-            total += st.size;
-            files.push({ path: p, mtime: st.mtimeMs });
-          } catch { /* ignore */ }
-        }
-      }
+      walk(join(PAGE_CACHE_DIR, book.name));
     }
     if (total <= MAX_CACHE_BYTES) return;
     files.sort((a, b) => a.mtime - b.mtime);
     for (const { path } of files) {
       if (total <= MAX_CACHE_BYTES) break;
-      if (activePageLeases.has(path)) continue;
+      if ((activePageLeases.get(path) ?? 0) > 0) continue;
       try {
         total -= statSync(path).size;
       } catch { /* ignore */ }
       try {
         rmSync(path, { force: true });
       } catch { /* ignore */ }
+    }
+    // Eviction orphans in-memory metas: drop any entry whose pages no longer
+    // all exist on disk so the next read re-validates or lazily regenerates
+    // instead of serving a path to a deleted file.
+    for (const [key, entry] of metaMemCache) {
+      const dir = metaCacheDirForKey(key);
+      if (!dir) continue;
+      if (entry.meta.pages.some((page) => !existsSync(join(dir, page.fileName)))) {
+        metaMemCache.delete(key);
+      }
     }
   } catch { /* ignore */ }
 }
@@ -191,6 +215,21 @@ function metaCacheKey(bookId: number, format: string): string {
   // F04: scope the in-memory + singleflight key by library so switching
   // libraries never serves another library's validated meta.
   return `${LIBRARY_PATH}::${bookId}/${format.toUpperCase()}`;
+}
+
+// Reverse a metaCacheKey back to its on-disk cache dir so quota eviction can
+// invalidate the in-memory meta whose pages were deleted. Returns null for
+// foreign/malformed keys (never invalidate what we cannot attribute).
+function metaCacheDirForKey(key: string): string | null {
+  const sepIdx = key.lastIndexOf("::");
+  if (sepIdx < 0) return null;
+  const rest = key.slice(sepIdx + 2);
+  const slashIdx = rest.lastIndexOf("/");
+  if (slashIdx < 0) return null;
+  const bookId = Number(rest.slice(0, slashIdx));
+  const format = rest.slice(slashIdx + 1);
+  if (!Number.isInteger(bookId) || bookId <= 0 || !format) return null;
+  return getCacheDir(bookId, format);
 }
 
 async function readJson<T>(path: string): Promise<T | null> {
@@ -452,45 +491,140 @@ async function ensureCbrCache(bookId: number): Promise<{ cacheDir: string; meta:
     }
 
     const imageNameSet = new Set(imageNames);
-    const extracted = await archiveExtractSemaphore.run(async () =>
-      extractor.extract({ files: (header) => imageNameSet.has(header.name) }),
-    );
-    const extractedPages = new Map<string, Uint8Array>();
-    for (const file of extracted.files) {
-      if (file.extraction) {
-        extractedPages.set(file.fileHeader.name, file.extraction);
+    // The whole retain path runs INSIDE the semaphore: extraction, per-entry +
+    // cumulative caps, pixel guards, and writes. Nothing is collected outside
+    // the semaphore — each page is accounted as it is retained and the build
+    // aborts early once the cap is exceeded, before further Bun.write calls.
+    const pages: CachedPage[] = await archiveExtractSemaphore.run(async () => {
+      const extracted = await extractor.extract({ files: (header) => imageNameSet.has(header.name) });
+      const extractedPages = new Map<string, Uint8Array>();
+      for (const file of extracted.files) {
+        if (file.extraction) {
+          extractedPages.set(file.fileHeader.name, file.extraction);
+        }
       }
+
+      const retained: CachedPage[] = [];
+      let retainedBytes = 0;
+      for (const [offset, name] of imageNames.entries()) {
+        const data = extractedPages.get(name);
+        if (!data) continue;
+        if (data.byteLength > MAX_CACHE_BYTES) {
+          throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
+        }
+        retainedBytes += data.byteLength;
+        if (retainedBytes > MAX_CACHE_BYTES) {
+          throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
+        }
+
+        const index = offset + 1;
+        const ext = extname(name).toLowerCase() || ".bin";
+        const fileName = `${String(index).padStart(5, "0")}${ext}`;
+        assertPixelCountGuard(data, fileName);
+        const outputPath = join(cacheDir, fileName);
+        const tmpPath = `${outputPath}.tmp-${process.pid}`;
+        await Bun.write(tmpPath, data);
+        const beforePublish = getSourceSignature(sourcePath);
+        if (!isSameSignature(beforePublish, source)) {
+          try {
+            rmSync(tmpPath, { force: true });
+          } catch { /* ignore */ }
+          throw new PageStreamingError(409, "Reader source changed during extraction");
+        }
+        try {
+          renameSync(tmpPath, outputPath);
+        } catch {
+          await Bun.write(outputPath, data);
+          try {
+            rmSync(tmpPath, { force: true });
+          } catch { /* ignore */ }
+        }
+        retained.push({
+          index,
+          name: basename(name),
+          fileName,
+          contentType: getPathContentType(fileName),
+          sourceName: name,
+        });
+      }
+      return retained;
+    });
+    sweepPageCacheQuota();
+
+    if (pages.length === 0) {
+      throw new PageStreamingError(422, "CBR pages could not be extracted");
     }
 
-    // Per-entry + cumulative cap checks BEFORE retaining: bound the total
-    // before writing any file.
-    let declaredTotal = 0;
-    for (const name of imageNames) {
-      const data = extractedPages.get(name);
-      if (!data) continue;
+    const meta: PageCacheMeta = {
+      source,
+      pageCount: pages.length,
+      pages,
+    };
+    await Bun.write(metaPath, `${JSON.stringify(meta)}\n`);
+    metaMemCache.set(cacheKey, { meta, signature: source });
+
+    return { cacheDir, meta };
+  });
+}
+
+/**
+ * Lazily extract a single CBR page on demand (e.g. after quota eviction
+ * deleted the file while the meta survived). Bytes are materialized under the
+ * archive semaphore with pre-retain caps, pixel guard, and atomic publish.
+ */
+async function extractCbrPage(
+  bookId: number,
+  cacheDir: string,
+  meta: PageCacheMeta,
+  sourcePath: string,
+  source: SourceSignature,
+  pageNumber: number,
+): Promise<PageFile> {
+  const cachedPage = meta.pages[pageNumber - 1];
+  if (!cachedPage) throw new PageStreamingError(404, "Page not found");
+  const outputPath = join(cacheDir, cachedPage.fileName);
+  if (existsSync(outputPath)) {
+    return { path: outputPath, contentType: cachedPage.contentType };
+  }
+  return runSingleFlight(pageSingleFlightKey(bookId, "cbr", String(pageNumber)), () =>
+    archiveExtractSemaphore.run(async () => {
+      if (existsSync(outputPath)) {
+        return { path: outputPath, contentType: cachedPage.contentType };
+      }
+      // Never publish for a stale generation.
+      const fresh = getSourceSignature(sourcePath);
+      if (!isSameSignature(fresh, source)) {
+        throw new PageStreamingError(409, "Reader source changed during extraction");
+      }
+      const archiveData = await Bun.file(sourcePath).arrayBuffer();
+      const extractor = await createExtractorFromData({
+        data: archiveData,
+        wasmBinary: await getUnrarWasmBinary(),
+      });
+      const entryName = cachedPage.sourceName ?? cachedPage.name;
+      const extracted = await extractor.extract({
+        files: (header) => header.name === entryName || basename(header.name) === cachedPage.name,
+      });
+      let data: Uint8Array | undefined;
+      for (const file of extracted.files) {
+        if (file.extraction && file.fileHeader.name === entryName) {
+          data = file.extraction;
+          break;
+        }
+      }
+      if (!data) {
+        for (const file of extracted.files) {
+          if (file.extraction && basename(file.fileHeader.name) === cachedPage.name) {
+            data = file.extraction;
+            break;
+          }
+        }
+      }
+      if (!data) throw new PageStreamingError(404, "Page not found");
       if (data.byteLength > MAX_CACHE_BYTES) {
         throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
       }
-      declaredTotal += data.byteLength;
-      if (declaredTotal > MAX_CACHE_BYTES) {
-        throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
-      }
-    }
-    const pages: CachedPage[] = [];
-    let extractedBytes = 0;
-    for (const [offset, name] of imageNames.entries()) {
-      const data = extractedPages.get(name);
-      if (!data) continue;
-      extractedBytes += data.byteLength;
-      if (extractedBytes > MAX_CACHE_BYTES) {
-        throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
-      }
-
-      const index = offset + 1;
-      const ext = extname(name).toLowerCase() || ".bin";
-      const fileName = `${String(index).padStart(5, "0")}${ext}`;
-      assertPixelCountGuard(data, fileName);
-      const outputPath = join(cacheDir, fileName);
+      assertPixelCountGuard(data, cachedPage.fileName);
       const tmpPath = `${outputPath}.tmp-${process.pid}`;
       await Bun.write(tmpPath, data);
       const beforePublish = getSourceSignature(sourcePath);
@@ -508,29 +642,10 @@ async function ensureCbrCache(bookId: number): Promise<{ cacheDir: string; meta:
           rmSync(tmpPath, { force: true });
         } catch { /* ignore */ }
       }
-      pages.push({
-        index,
-        name: basename(name),
-        fileName,
-        contentType: getPathContentType(fileName),
-      });
-    }
-    sweepPageCacheQuota();
-
-    if (pages.length === 0) {
-      throw new PageStreamingError(422, "CBR pages could not be extracted");
-    }
-
-    const meta: PageCacheMeta = {
-      source,
-      pageCount: pages.length,
-      pages,
-    };
-    await Bun.write(metaPath, `${JSON.stringify(meta)}\n`);
-    metaMemCache.set(cacheKey, { meta, signature: source });
-
-    return { cacheDir, meta };
-  });
+      sweepPageCacheQuota();
+      return { path: outputPath, contentType: cachedPage.contentType };
+    }),
+  );
 }
 
 function executable(candidates: string[], fallback: string): string {
@@ -812,10 +927,37 @@ export async function getPageFile(bookId: number, formatParam: string, page: num
     const cachedPage = meta.pages[pageNumber - 1];
     if (!cachedPage) throw new PageStreamingError(404, "Page not found");
 
-    return {
-      path: join(cacheDir, cachedPage.fileName),
-      contentType: cachedPage.contentType,
-    };
+    // The file may be gone (quota eviction): lazily regenerate the single
+    // page; if single-page extraction fails for a non-missing reason,
+    // invalidate and fall back to a full re-ensure.
+    const outputPath = join(cacheDir, cachedPage.fileName);
+    if (existsSync(outputPath)) {
+      return { path: outputPath, contentType: cachedPage.contentType };
+    }
+    const sourcePath = getSourcePath(bookId, format);
+    const source = getSourceSignature(sourcePath);
+    try {
+      return await extractCbrPage(bookId, cacheDir, meta, sourcePath, source, pageNumber);
+    } catch (error) {
+      if (error instanceof PageStreamingError && error.status === 404) throw error;
+      metaMemCache.delete(metaCacheKey(bookId, format));
+      const reensured = await ensureCbrCache(bookId);
+      const rePage = reensured.meta.pages[pageNumber - 1];
+      if (!rePage) throw new PageStreamingError(404, "Page not found");
+      const rePath = join(reensured.cacheDir, rePage.fileName);
+      if (existsSync(rePath)) {
+        return { path: rePath, contentType: rePage.contentType };
+      }
+      const reSourcePath = getSourcePath(bookId, format);
+      return extractCbrPage(
+        bookId,
+        reensured.cacheDir,
+        reensured.meta,
+        reSourcePath,
+        getSourceSignature(reSourcePath),
+        pageNumber,
+      );
+    }
   }
 
   if (format === "PDF") {

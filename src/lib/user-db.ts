@@ -86,9 +86,10 @@ function progressPkNames(database: Database): string[] {
     .map((c) => c.name);
 }
 
-// F04/F05: bring legacy progress tables forward without losing rows:
+// F04/F05/FUP1: bring legacy progress tables forward without losing rows:
 // - add library_id (default 'default') and furthest_percentage columns
-// - rebuild PK to (user_id, library_id, book_id) when needed
+// - rebuild PK to (user_id, library_id, book_id, format) when needed,
+//   keeping the most recently updated row on new-PK collisions
 function migrateProgressTable(database: Database): void {
   let cols = progressColumnNames(database);
   if (!cols.includes("library_id")) {
@@ -107,9 +108,15 @@ function migrateProgressTable(database: Database): void {
   }
   const pk = progressPkNames(database);
   const pkOk =
-    pk.length === 3 && pk[0] === "user_id" && pk[1] === "library_id" && pk[2] === "book_id";
+    pk.length === 4 &&
+    pk[0] === "user_id" &&
+    pk[1] === "library_id" &&
+    pk[2] === "book_id" &&
+    pk[3] === "format";
   if (pkOk) return;
-  // Rebuild table to include library_id in the PK, preserving rows.
+  // Rebuild table to include format in the PK, preserving rows. ORDER BY
+  // updated_at DESC with INSERT OR IGNORE keeps the most recent row when
+  // several legacy rows collapse onto one new PK.
   database.exec(`
     CREATE TABLE IF NOT EXISTS progress_new (
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -122,7 +129,7 @@ function migrateProgressTable(database: Database): void {
       finished INTEGER NOT NULL DEFAULT 0,
       started_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
-      PRIMARY KEY (user_id, library_id, book_id)
+      PRIMARY KEY (user_id, library_id, book_id, format)
     );
   `);
   const hasFurthest = cols.includes("furthest_percentage");
@@ -136,7 +143,7 @@ function migrateProgressTable(database: Database): void {
       (user_id, library_id, book_id, format, location, percentage, furthest_percentage, finished, started_at, updated_at)
     SELECT user_id, ${libraryExpr}, book_id, format, location, percentage,
            ${furthestExpr}, finished, started_at, updated_at
-    FROM progress;
+    FROM progress ORDER BY updated_at DESC;
   `);
   database.exec("DROP TABLE progress;");
   database.exec("ALTER TABLE progress_new RENAME TO progress;");
@@ -173,12 +180,15 @@ function getDb(): Database {
       finished INTEGER NOT NULL DEFAULT 0,
       started_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
-      PRIMARY KEY (user_id, library_id, book_id)
+      PRIMARY KEY (user_id, library_id, book_id, format)
     );
   `);
   migrateProgressTable(database);
   database.exec(
     `CREATE INDEX IF NOT EXISTS idx_progress_user_updated ON progress(user_id, updated_at DESC);`,
+  );
+  database.exec(
+    `CREATE INDEX IF NOT EXISTS idx_progress_user_library_updated ON progress(user_id, library_id, updated_at DESC);`,
   );
   database.exec(`
     CREATE TABLE IF NOT EXISTS sessions (
@@ -479,30 +489,83 @@ export function normalizeLibraryId(raw: unknown): string {
   return s ? s.slice(0, 200) : "default";
 }
 
-export function getProgress(userId: number, bookId: number, libraryId = "default"): ProgressRow | null {
+export function getProgress(
+  userId: number,
+  libraryId: string,
+  bookId: number,
+  format?: string,
+): ProgressRow | null {
   const lib = normalizeLibraryId(libraryId);
-  const row = getDb()
-    .query(`SELECT ${PROGRESS_COLUMNS} FROM progress WHERE user_id = ? AND library_id = ? AND book_id = ?`)
-    .get(userId, lib, bookId) as Parameters<typeof rowToProgress>[0] | null;
+  const database = getDb();
+  type Row = Parameters<typeof rowToProgress>[0];
+  if (format) {
+    const fmt = String(format).toUpperCase().slice(0, 10);
+    const row = database
+      .query(
+        `SELECT ${PROGRESS_COLUMNS} FROM progress WHERE user_id = ? AND library_id = ? AND book_id = ? AND format = ?`,
+      )
+      .get(userId, lib, bookId, fmt) as Row | null;
+    if (row) return rowToProgress(row);
+    // Back-compat (legacy migration path only): rows written before the
+    // library_id migration carry library_id 'default'.
+    if (lib === "default") {
+      const legacy = database
+        .query(
+          `SELECT ${PROGRESS_COLUMNS} FROM progress WHERE user_id = ? AND book_id = ? AND format = ? LIMIT 1`,
+        )
+        .get(userId, bookId, fmt) as Row | null;
+      return legacy ? rowToProgress(legacy) : null;
+    }
+    return null;
+  }
+  // Publication-level read: derive status across formats (finished wins,
+  // then furthest progress, then most recent) so shelf and reader resume agree.
+  const row = database
+    .query(
+      `SELECT ${PROGRESS_COLUMNS} FROM progress
+       WHERE user_id = ? AND library_id = ? AND book_id = ?
+       ORDER BY finished DESC, furthest_percentage DESC, updated_at DESC LIMIT 1`,
+    )
+    .get(userId, lib, bookId) as Row | null;
   if (row) return rowToProgress(row);
-  // Back-compat: rows written before the library_id migration.
+  // Back-compat (legacy migration path only).
   if (lib === "default") {
-    const legacy = getDb()
-      .query(`SELECT ${PROGRESS_COLUMNS} FROM progress WHERE user_id = ? AND book_id = ? LIMIT 1`)
-      .get(userId, bookId) as Parameters<typeof rowToProgress>[0] | null;
+    const legacy = database
+      .query(
+        `SELECT ${PROGRESS_COLUMNS} FROM progress
+         WHERE user_id = ? AND book_id = ?
+         ORDER BY finished DESC, furthest_percentage DESC, updated_at DESC LIMIT 1`,
+      )
+      .get(userId, bookId) as Row | null;
     return legacy ? rowToProgress(legacy) : null;
   }
   return null;
 }
 
-export function listProgress(userId: number, limit = 500): ProgressRow[] {
+export function listProgressFormats(
+  userId: number,
+  libraryId: string,
+  bookId: number,
+): ProgressRow[] {
+  const lib = normalizeLibraryId(libraryId);
+  const rows = getDb()
+    .query(
+      `SELECT ${PROGRESS_COLUMNS} FROM progress
+       WHERE user_id = ? AND library_id = ? AND book_id = ? ORDER BY updated_at DESC`,
+    )
+    .all(userId, lib, bookId) as Parameters<typeof rowToProgress>[0][];
+  return rows.map(rowToProgress);
+}
+
+export function listProgress(userId: number, libraryId: string, limit = 500): ProgressRow[] {
+  const lib = normalizeLibraryId(libraryId);
   const cappedLimit = Math.min(500, Math.max(1, Math.floor(limit) || 1));
   const rows = getDb()
     .query(
       `SELECT ${PROGRESS_COLUMNS} FROM progress
-       WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?`,
+       WHERE user_id = ? AND library_id = ? ORDER BY updated_at DESC LIMIT ?`,
     )
-    .all(userId, cappedLimit) as Parameters<typeof rowToProgress>[0][];
+    .all(userId, lib, cappedLimit) as Parameters<typeof rowToProgress>[0][];
   return rows.map(rowToProgress);
 }
 
@@ -511,17 +574,20 @@ export interface ProgressInput {
   location?: string | null;
   percentage?: number;
   finished?: boolean;
-  libraryId?: string;
 }
 
 export function upsertProgress(
   userId: number,
+  libraryId: string,
   bookId: number,
   input: ProgressInput,
 ): ProgressRow | null {
   const now = Date.now();
   const format = String(input.format || "").toUpperCase().slice(0, 10);
-  const libraryId = normalizeLibraryId((input as { libraryId?: unknown }).libraryId);
+  // Format is part of the PK: writes always target one format row. Callers
+  // must pass the reader's format explicitly.
+  if (!format) return null;
+  const lib = normalizeLibraryId(libraryId);
   // F03: drop locators that cannot belong to this format instead of storing
   // a value readers would mis-restore (e.g. a page number as an EPUB CFI).
   const rawLocation = input.location == null ? null : String(input.location).slice(0, 20000);
@@ -538,47 +604,86 @@ export function upsertProgress(
     .query(
       `INSERT INTO progress (user_id, library_id, book_id, format, location, percentage, furthest_percentage, finished, started_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(user_id, library_id, book_id) DO UPDATE SET
-         format = excluded.format,
+       ON CONFLICT(user_id, library_id, book_id, format) DO UPDATE SET
          location = excluded.location,
          percentage = excluded.percentage,
          furthest_percentage = MAX(progress.furthest_percentage, excluded.furthest_percentage),
          finished = MAX(progress.finished, excluded.finished),
          updated_at = excluded.updated_at`,
     )
-    .run(userId, libraryId, bookId, format, location, resume, resume, finished, now, now);
+    .run(userId, lib, bookId, format, location, resume, resume, finished, now, now);
 
-  return getProgress(userId, bookId, libraryId);
+  return getProgress(userId, lib, bookId, format);
 }
 
-export function deleteProgress(userId: number, bookId: number, libraryId = "default"): boolean {
+export function deleteProgress(
+  userId: number,
+  libraryId: string,
+  bookId: number,
+  format?: string,
+): boolean {
   const lib = normalizeLibraryId(libraryId);
-  const result = getDb()
+  const database = getDb();
+  if (format) {
+    const fmt = String(format).toUpperCase().slice(0, 10);
+    const result = database
+      .query("DELETE FROM progress WHERE user_id = ? AND library_id = ? AND book_id = ? AND format = ?")
+      .run(userId, lib, bookId, fmt);
+    return result.changes > 0;
+  }
+  const result = database
     .query("DELETE FROM progress WHERE user_id = ? AND library_id = ? AND book_id = ?")
     .run(userId, lib, bookId);
   if (result.changes > 0 || lib !== "default") return result.changes > 0;
-  // Back-compat: legacy rows without a library scope.
-  const legacy = getDb()
+  // Back-compat (legacy migration path only): legacy rows without a library scope.
+  const legacy = database
     .query("DELETE FROM progress WHERE user_id = ? AND book_id = ?")
     .run(userId, bookId);
   return legacy.changes > 0;
 }
 
-export function clearProgress(userId: number): number {
-  const result = getDb().query("DELETE FROM progress WHERE user_id = ?").run(userId);
+export function clearProgress(userId: number, libraryId: string): number {
+  const lib = normalizeLibraryId(libraryId);
+  // Back-compat (legacy migration path only): 'default' clears everything,
+  // matching the pre-scoping behavior. Real library scopes delete only rows
+  // in that library.
+  if (lib === "default") {
+    const result = getDb().query("DELETE FROM progress WHERE user_id = ?").run(userId);
+    return result.changes;
+  }
+  const result = getDb()
+    .query("DELETE FROM progress WHERE user_id = ? AND library_id = ?")
+    .run(userId, lib);
   return result.changes;
 }
 
-export function setFinished(userId: number, bookId: number, finished: boolean, libraryId = "default"): ProgressRow | null {
+export function setFinished(
+  userId: number,
+  libraryId: string,
+  bookId: number,
+  finished: boolean,
+  format?: string,
+): ProgressRow | null {
   const lib = normalizeLibraryId(libraryId);
-  const existing = getProgress(userId, bookId, lib);
+  const existing = getProgress(userId, lib, bookId, format);
   if (!existing) return null;
   const now = Date.now();
-  getDb()
-    .query(
-      `UPDATE progress SET finished = ?, percentage = ?, furthest_percentage = MAX(furthest_percentage, ?), updated_at = ?
-       WHERE user_id = ? AND library_id = ? AND book_id = ?`,
-    )
-    .run(finished ? 1 : 0, finished ? 100 : existing.percentage, finished ? 100 : existing.percentage, now, userId, lib, bookId);
-  return getProgress(userId, bookId, lib);
+  const database = getDb();
+  if (format) {
+    const fmt = String(format).toUpperCase().slice(0, 10);
+    database
+      .query(
+        `UPDATE progress SET finished = ?, percentage = ?, furthest_percentage = MAX(furthest_percentage, ?), updated_at = ?
+         WHERE user_id = ? AND library_id = ? AND book_id = ? AND format = ?`,
+      )
+      .run(finished ? 1 : 0, finished ? 100 : existing.percentage, finished ? 100 : existing.percentage, now, userId, lib, bookId, fmt);
+  } else {
+    database
+      .query(
+        `UPDATE progress SET finished = ?, percentage = ?, furthest_percentage = MAX(furthest_percentage, ?), updated_at = ?
+         WHERE user_id = ? AND library_id = ? AND book_id = ?`,
+      )
+      .run(finished ? 1 : 0, finished ? 100 : existing.percentage, finished ? 100 : existing.percentage, now, userId, lib, bookId);
+  }
+  return getProgress(userId, lib, bookId, format);
 }

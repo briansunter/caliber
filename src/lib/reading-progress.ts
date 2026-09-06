@@ -115,19 +115,93 @@ const SAVE_DEBOUNCE_MS = 1500;
 const pending = new Map<number, PendingSave>();
 const timers = new Map<number, ReturnType<typeof setTimeout>>();
 
-// F01: durable outbox for failed saves. Beacon/pagehide delivery is
-// queue-only (never treated as acked); entries stay queued until a PUT/POST
-// returns ok, with bounded retries so a dead server can't grow storage.
+// F01/FUP2/FUP3: durable outbox for failed saves. Beacon/pagehide delivery
+// is queue-only (never treated as acked); entries stay queued until a
+// PUT/POST returns ok. Every entry carries its own mutationId plus the
+// principal+library it belongs to, and the drain only replays entries that
+// match the current principal+library — a different signed-in user never
+// inherits another user's queued writes.
 const OUTBOX_KEY = "caliber-progress-outbox";
+const REJECTED_KEY = "caliber-progress-rejected";
 const OUTBOX_MAX_ENTRIES = 200;
-const OUTBOX_MAX_ATTEMPTS = 5;
 const RETRY_BASE_MS = 2000;
+const RETRY_MAX_MS = 60000;
 
-interface OutboxEntry {
+export interface OutboxEntry {
+  mutationId: string;
+  userId: number | null;
+  libraryId: string;
   bookId: number;
+  format: string;
   data: PendingSave;
   attempts: number;
   ts: number;
+}
+
+export interface RejectedProgressEntry extends OutboxEntry {
+  status: number;
+  rejectedAt: number;
+}
+
+export type RejectedProgressCallback = (entry: RejectedProgressEntry) => void;
+
+const rejectedCallbacks = new Set<RejectedProgressCallback>();
+
+export function onProgressRejected(cb: RejectedProgressCallback): () => void {
+  rejectedCallbacks.add(cb);
+  return () => {
+    rejectedCallbacks.delete(cb);
+  };
+}
+
+// Principal that owns newly enqueued entries. Seeded from /api/user/me and
+// refreshed by switchPrincipal; retryOutbox re-establishes it from the
+// server before every drain.
+let lastKnownUserId: number | null = null;
+
+export function setOutboxPrincipal(userId: number | null): void {
+  lastKnownUserId = typeof userId === "number" && Number.isInteger(userId) ? userId : null;
+}
+
+// Generation counter: switchPrincipal bumps it to abort in-flight drains so
+// a previous principal's drain cannot write after the switch.
+let outboxGeneration = 0;
+// Set on 401: stop aggressive retries, keep everything queued.
+let outboxSuspended = false;
+
+function newMutationId(): string {
+  try {
+    const c = (globalThis as unknown as { crypto?: { randomUUID?: () => string } }).crypto;
+    if (c && typeof c.randomUUID === "function") return c.randomUUID();
+  } catch {}
+  return `m-${Date.now().toString(36)}-${Math.floor(Math.random() * 2 ** 52).toString(36)}`;
+}
+
+function normalizeOutboxEntry(raw: unknown): OutboxEntry | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const e = raw as Record<string, unknown>;
+  if (typeof e.bookId !== "number" || !Number.isInteger(e.bookId)) return null;
+  const rawData = e.data as Record<string, unknown> | null | undefined;
+  if (!rawData || typeof rawData !== "object" || typeof rawData.format !== "string") return null;
+  const data: PendingSave = {
+    format: String(rawData.format),
+    location: rawData.location == null ? null : String(rawData.location),
+    percentage: typeof rawData.percentage === "number" && Number.isFinite(rawData.percentage)
+      ? rawData.percentage
+      : 0,
+    finished: rawData.finished === true,
+  };
+  return {
+    mutationId:
+      typeof e.mutationId === "string" && e.mutationId ? e.mutationId : newMutationId(),
+    userId: typeof e.userId === "number" && Number.isInteger(e.userId) ? e.userId : null,
+    libraryId: typeof e.libraryId === "string" && e.libraryId ? e.libraryId : "legacy",
+    bookId: e.bookId,
+    format: typeof e.format === "string" && e.format ? e.format : data.format,
+    data,
+    attempts: typeof e.attempts === "number" && e.attempts >= 0 ? Math.floor(e.attempts) : 0,
+    ts: typeof e.ts === "number" && Number.isFinite(e.ts) ? e.ts : 0,
+  };
 }
 
 function readOutbox(): OutboxEntry[] {
@@ -135,8 +209,14 @@ function readOutbox(): OutboxEntry[] {
     if (typeof localStorage === "undefined") return [];
     const raw = localStorage.getItem(OUTBOX_KEY);
     if (!raw) return [];
-    const parsed = JSON.parse(raw) as OutboxEntry[];
-    return Array.isArray(parsed) ? parsed : [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const entries: OutboxEntry[] = [];
+    for (const item of parsed) {
+      const entry = normalizeOutboxEntry(item);
+      if (entry) entries.push(entry);
+    }
+    return entries;
   } catch {
     return [];
   }
@@ -149,16 +229,85 @@ function writeOutbox(entries: OutboxEntry[]): void {
   } catch {}
 }
 
-export function enqueueProgressOutbox(bookId: number, data: PendingSave): void {
-  const entries = readOutbox().filter((e) => e.bookId !== bookId);
-  entries.push({ bookId, data, attempts: 0, ts: Date.now() });
+export function readRejectedProgress(): RejectedProgressEntry[] {
+  try {
+    if (typeof localStorage === "undefined") return [];
+    const raw = localStorage.getItem(REJECTED_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as RejectedProgressEntry[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function appendRejected(entries: RejectedProgressEntry[]): void {
+  try {
+    if (typeof localStorage === "undefined") return;
+    const merged = [...entries, ...readRejectedProgress()].slice(0, OUTBOX_MAX_ENTRIES);
+    localStorage.setItem(REJECTED_KEY, JSON.stringify(merged));
+  } catch {}
+}
+
+export function clearRejectedProgress(): void {
+  try {
+    if (typeof localStorage === "undefined") return;
+    localStorage.removeItem(REJECTED_KEY);
+  } catch {}
+}
+
+// Enqueue cap: never drop the newest entry. Victims are picked among the
+// older entries, highest attempt count (most retried) and oldest first.
+function pickEvictionIndex(entries: OutboxEntry[], newestIdx: number): number {
+  let best = -1;
+  for (let i = 0; i < entries.length; i++) {
+    if (i === newestIdx) continue;
+    if (best === -1) {
+      best = i;
+      continue;
+    }
+    const candidate = entries[i] as OutboxEntry;
+    const current = entries[best] as OutboxEntry;
+    if (
+      candidate.attempts !== current.attempts
+        ? candidate.attempts > current.attempts
+        : candidate.ts < current.ts
+    ) {
+      best = i;
+    }
+  }
+  return best === -1 ? 0 : best;
+}
+
+export function enqueueProgressOutbox(
+  bookId: number,
+  data: PendingSave,
+  opts?: { mutationId?: string },
+): string {
+  const mutationId = opts?.mutationId ?? newMutationId();
+  const entries = readOutbox().filter((e) => e.mutationId !== mutationId);
+  entries.push({
+    mutationId,
+    userId: lastKnownUserId,
+    libraryId: getLibraryScopeId(),
+    bookId,
+    format: data.format,
+    data,
+    attempts: 0,
+    ts: Date.now(),
+  });
+  while (entries.length > OUTBOX_MAX_ENTRIES) {
+    entries.splice(pickEvictionIndex(entries, entries.length - 1), 1);
+  }
   writeOutbox(entries);
+  return mutationId;
 }
 
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
 function scheduleOutboxRetry(delayMs = RETRY_BASE_MS): void {
   if (typeof window === "undefined") return;
+  if (outboxSuspended) return;
   if (retryTimer) return;
   retryTimer = setTimeout(() => {
     retryTimer = null;
@@ -166,11 +315,49 @@ function scheduleOutboxRetry(delayMs = RETRY_BASE_MS): void {
   }, delayMs);
 }
 
+export function scheduleProgressOutboxRetry(delayMs = RETRY_BASE_MS): void {
+  scheduleOutboxRetry(delayMs);
+}
+
 export async function retryOutbox(): Promise<void> {
-  const entries = readOutbox();
-  if (entries.length === 0) return;
-  const remaining: OutboxEntry[] = [];
-  for (const entry of entries) {
+  const generation = outboxGeneration;
+  const snapshot = readOutbox();
+  if (snapshot.length === 0) return;
+  // Establish the current principal from the server before replaying
+  // anything: without a principal no entry can match, so nothing drains.
+  let currentUserId: number | null = null;
+  try {
+    const me = await fetchJson<{ user: { id: number } | null }>("/api/user/me");
+    currentUserId = typeof me?.user?.id === "number" ? me.user.id : null;
+  } catch (error) {
+    // No signed-in principal (401): keep everything queued, no retries.
+    if (error instanceof Error && /401/.test(error.message)) return;
+    // Network failure before any attempt: keep everything, back off.
+    scheduleOutboxRetry(RETRY_BASE_MS);
+    return;
+  }
+  if (generation !== outboxGeneration) return;
+  if (currentUserId !== null) setOutboxPrincipal(currentUserId);
+  const currentLibrary = getLibraryScopeId();
+  // Gate: only replay entries belonging to the current principal+library.
+  // Foreign entries stay queued for their own principal/library.
+  if (currentUserId === null) return;
+  const eligible = snapshot.filter(
+    (e) => e.userId !== null && e.userId === currentUserId && e.libraryId === currentLibrary,
+  );
+  if (eligible.length === 0) return;
+
+  type Outcome =
+    | { kind: "acked" }
+    | { kind: "retry" }
+    | { kind: "rejected"; status: number }
+    | { kind: "suspended" };
+  const outcomes = new Map<string, Outcome>();
+  let suspended = false;
+  const queue = [...eligible].sort((a, b) => a.ts - b.ts);
+  for (const entry of queue) {
+    if (generation !== outboxGeneration) break; // principal switched: abort drain
+    if (suspended) break;
     try {
       const res = await fetch(`/api/user/progress/${entry.bookId}`, {
         method: "PUT",
@@ -178,20 +365,69 @@ export async function retryOutbox(): Promise<void> {
         body: JSON.stringify(entry.data),
         keepalive: true,
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      // Acked: drop entry (do not re-add).
-    } catch {
-      const attempts = entry.attempts + 1;
-      if (attempts < OUTBOX_MAX_ATTEMPTS) {
-        remaining.push({ ...entry, attempts });
+      if (res.ok) {
+        outcomes.set(entry.mutationId, { kind: "acked" });
+        continue;
       }
-      // Else drop: bounded retries.
+      if (res.status === 401) {
+        // Auth lost: suspend retries, keep queued, invalidate auth state.
+        outcomes.set(entry.mutationId, { kind: "suspended" });
+        suspended = true;
+        outboxSuspended = true;
+        void queryClient.invalidateQueries({ queryKey: ["user"] });
+        break;
+      }
+      if (res.status === 400 || res.status === 422) {
+        outcomes.set(entry.mutationId, { kind: "rejected", status: res.status });
+        continue;
+      }
+      outcomes.set(entry.mutationId, { kind: "retry" });
+      if (res.status === 429) break; // rate-limited: back off, keep queued
+    } catch {
+      // Network error / 5xx path handled below as retry (never deleted).
+      outcomes.set(entry.mutationId, { kind: "retry" });
     }
   }
-  writeOutbox(remaining);
+  const aborted = generation !== outboxGeneration;
+  // Merge with current storage instead of overwriting the pre-drain
+  // snapshot: remove only acked/rejected IDs, bump attempts only for
+  // attempted IDs, and keep newcomers that arrived mid-drain.
+  const fresh = readOutbox();
+  const now = Date.now();
+  const rejectedNow: RejectedProgressEntry[] = [];
+  const merged: OutboxEntry[] = [];
+  for (const e of fresh) {
+    const outcome = outcomes.get(e.mutationId);
+    if (outcome?.kind === "acked") continue;
+    if (outcome?.kind === "rejected") {
+      rejectedNow.push({ ...e, status: outcome.status, rejectedAt: now });
+      continue;
+    }
+    if (outcome?.kind === "retry") merged.push({ ...e, attempts: e.attempts + 1 });
+    else merged.push(e);
+  }
+  writeOutbox(merged);
+  if (rejectedNow.length > 0) {
+    appendRejected(rejectedNow);
+    for (const cb of [...rejectedCallbacks]) {
+      try {
+        for (const r of rejectedNow) cb(r);
+      } catch {}
+    }
+  }
+  if (aborted) return;
+  // Attempts never delete entries: the cap only slows the schedule down to
+  // the maximum backoff. Only 401 suspends and 400/422 rejects.
+  if (suspended || outboxSuspended) return;
+  const remaining = merged.filter(
+    (e) => e.userId !== null && e.userId === currentUserId && e.libraryId === currentLibrary,
+  );
   if (remaining.length > 0) {
-    scheduleOutboxRetry(Math.min(RETRY_BASE_MS * remaining.length, 30000));
-  } else {
+    const maxAttempts = remaining.reduce((m, e) => Math.max(m, e.attempts), 0);
+    scheduleOutboxRetry(
+      Math.min(RETRY_BASE_MS * 2 ** Math.min(maxAttempts, 5), RETRY_MAX_MS),
+    );
+  } else if (merged.length === 0) {
     void queryClient.invalidateQueries({ queryKey: ["reading-list"] });
   }
 }
@@ -200,8 +436,17 @@ if (typeof window !== "undefined") {
   window.addEventListener("online", () => {
     void retryOutbox();
   });
-  // Opportunistic drain on load (beacon-queued entries are not acked).
-  scheduleOutboxRetry(RETRY_BASE_MS);
+  // Seed the principal, then drain only entries that match the established
+  // principal+library (no blind auto-drain of foreign entries).
+  void (async () => {
+    try {
+      const me = await fetchJson<{ user: { id: number } | null }>("/api/user/me");
+      if (typeof me?.user?.id === "number") {
+        setOutboxPrincipal(me.user.id);
+      }
+    } catch {}
+    await retryOutbox();
+  })();
 }
 
 async function putProgress(bookId: number, data: PendingSave): Promise<boolean> {
@@ -236,6 +481,7 @@ function flush(bookId: number, useBeacon = false): void {
     clearTimeout(timer);
     timers.delete(bookId);
   }
+  const mutationId = newMutationId();
   const url = `/api/user/progress/${bookId}`;
   const payload = JSON.stringify(data);
   if (useBeacon && typeof navigator !== "undefined" && navigator.sendBeacon) {
@@ -245,7 +491,7 @@ function flush(bookId: number, useBeacon = false): void {
     try {
       const blob = new Blob([payload], { type: "application/json" });
       if (navigator.sendBeacon(url, blob)) {
-        enqueueProgressOutbox(bookId, data);
+        enqueueProgressOutbox(bookId, data, { mutationId });
         return;
       }
     } catch {}
@@ -259,11 +505,21 @@ function flush(bookId: number, useBeacon = false): void {
         pending.delete(bookId);
       }
       void queryClient.invalidateQueries({ queryKey: ["reading-list"] });
-      // A successful flush also drains any outbox entry for this book.
-      const rest = readOutbox().filter((e) => e.bookId !== bookId);
+      // Remove only the acknowledged mutation: this attempt plus any queued
+      // entry carrying the identical payload. Newer queued mutations for the
+      // same book (concurrent writes) are preserved.
+      const rest = readOutbox().filter(
+        (e) =>
+          e.mutationId !== mutationId &&
+          !(
+            e.bookId === bookId &&
+            e.format === data.format &&
+            JSON.stringify(e.data) === payload
+          ),
+      );
       writeOutbox(rest);
     } else {
-      enqueueProgressOutbox(bookId, data);
+      enqueueProgressOutbox(bookId, data, { mutationId });
       scheduleOutboxRetry();
     }
   });
@@ -285,10 +541,19 @@ export function flushBookProgress(bookId: number): void {
   flush(bookId);
 }
 
-// Drop all queued (not yet acknowledged) progress writes. Must be called on
-// account switch/logout so one user's pending outbox never replays under a
-// new user's cookie.
+// Drop all in-memory queued (not yet acknowledged) progress writes. Must be
+// called on account switch/logout so one user's in-flight timers and drains
+// never replay under a new principal's cookie. The persisted outbox is
+// intentionally NOT deleted: entries belong to possibly different
+// principals and stay queued until a gated drain replays only entries that
+// match the current principal+library.
 export function clearPendingProgressOutbox(): void {
+  if (retryTimer) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+  outboxGeneration += 1;
+  outboxSuspended = false;
   for (const timer of timers.values()) clearTimeout(timer);
   timers.clear();
   pending.clear();

@@ -18,6 +18,7 @@ import {
   getLibraryStats,
   getBookCount,
   getSnapshotRevision,
+  getSnapshotUpdated,
   getSnapshotStatus,
   acquireSnapshotLease,
   streamBooks,
@@ -35,10 +36,12 @@ import {
 } from "./lib/calibre-optimized";
 import {
   OPDS_ACQUISITION_TYPE,
+  OPDS_ENTRY_TYPE,
   OPDS_NAVIGATION_TYPE,
   OPENSEARCH_TYPE,
   getRequestPrefix,
   renderAcquisitionFeed,
+  renderBookCompleteEntry,
   renderCatalogFeed,
   renderNavigationFeed,
   renderOpenSearchDescription,
@@ -59,6 +62,7 @@ import {
   isValidUsername,
   getProgress,
   listProgress,
+  listProgressFormats,
   upsertProgress,
   deleteProgress,
   clearProgress,
@@ -89,6 +93,7 @@ import {
   authenticateRequest,
   authenticateWithPassword,
   createSessionToken,
+  isValidPassword,
   loginRateLimited,
   needsInitialSetup,
   PasswordError,
@@ -202,6 +207,25 @@ async function currentUser(req: Request): Promise<User | null> {
 
 function publicUser(user: User) {
   return { id: user.id, username: user.username };
+}
+
+// FUP1: server-authoritative library context for reading progress. The
+// library id is derived from the server's configured LIBRARY_PATH (or an
+// explicit CALIBER_LIBRARY_ID override) and NEVER taken from client input —
+// progress rows are always scoped to the library the server is serving.
+function resolveLibraryId(_req?: Request): string {
+  const override = process.env.CALIBER_LIBRARY_ID?.trim();
+  if (override) return override.slice(0, 200);
+  return `lib-${Bun.hash(getLibraryPath()).toString(36)}`;
+}
+
+// Optional ?format= query for per-format progress reads/deletes. Returns
+// undefined when absent, null when present-but-invalid.
+function parseFormatQuery(value: string | null): string | undefined | null {
+  if (value === null) return undefined;
+  const format = value.trim().toUpperCase();
+  if (!FORMAT_PATTERN.test(format)) return null;
+  return format;
 }
 
 // Auth administration (toggle, accounts) is a local-operator action.
@@ -451,11 +475,12 @@ function opdsPathPrefix(req: Request): string {
   return getRequestPrefix(req, TRUST_PROXY);
 }
 
-// F22: wall-clock instant for navigation/catalog feeds, truncated to the
-// minute so repeated renders of unchanged state produce stable XML (and a
-// deterministic ETag) within the feed cache TTL.
-function opdsNow(): string {
-  return new Date(Math.floor(Date.now() / 60000) * 60000).toISOString();
+// F22: catalog/nav feed instant is the published snapshot's mtime (stable
+// across renders of unchanged state, invalidated by the revision-scoped cache
+// keys on refresh). Only acquisition feeds use max(last_modified), via
+// acquisitionFeedUpdated() with this value as the empty-feed fallback.
+function opdsCatalogUpdated(): string {
+  return getSnapshotUpdated();
 }
 
 function buildPath(pathname: string, params: Record<string, string | number | null | undefined>) {
@@ -538,7 +563,7 @@ function opdsCatalogResponse(
         selfPath,
         title,
         id: new URL(selfPath, baseUrl).toString(),
-        updated: opdsNow(),
+        updated: opdsCatalogUpdated(),
         result,
         nextPath,
         entryHref,
@@ -580,7 +605,7 @@ function opdsAcquisitionResponse(
       selfPath,
       title,
       id: new URL(selfPath, baseUrl).toString(),
-      updated: opdsNow(),
+      updated: opdsCatalogUpdated(),
       result,
       nextPath,
     });
@@ -891,14 +916,22 @@ async function serveThumbById(req: Request, id: number): Promise<Response> {
   const thumbFile = Bun.file(thumbPath);
 
   if (!(await thumbFile.exists())) {
+    let resizeUnavailable = false;
     await runThumbJob(async () => {
       if (await thumbFile.exists()) return;
       const { mkdir } = await import("node:fs/promises");
       await mkdir(thumbDir, { recursive: true });
       const original = new Uint8Array(await coverFile.arrayBuffer());
       const resized = await tryResizeImage(original, THUMB_SIZES[size]);
-      await Bun.write(thumbPath, resized ?? original);
+      if (!resized) {
+        resizeUnavailable = true;
+        return;
+      }
+      await Bun.write(thumbPath, resized);
     });
+    if (resizeUnavailable && !(await thumbFile.exists())) {
+      return Response.json({ error: "thumbnail resize unavailable" }, { status: 501 });
+    }
   }
 
   if (!(await thumbFile.exists())) {
@@ -940,9 +973,10 @@ const streamEncoder = new TextEncoder();
 // ?size=small (default, 256px wide) or ?size=medium (512px wide). Thumbnails
 // are cached on disk as {id}-{size}-{sig}.jpg where sig is a revision key
 // over (library path, cover size, cover mtime), so a changed cover naturally
-// misses the old file. Resize uses Bun's built-in image API when present;
-// otherwise the original bytes are served with correct headers (Sharp-free
-// fallback). Generations run through a FIFO queue with max 2 concurrent jobs.
+// misses the old file. Resize uses Bun's built-in image pipeline when present;
+// when no pipeline is available the endpoint returns 501 so clients can
+// detect the degraded state (instead of silently serving full-size covers).
+// Generations run through a FIFO queue with max 2 concurrent jobs.
 const THUMB_SIZES = { small: 256, medium: 512 } as const;
 type ThumbSize = keyof typeof THUMB_SIZES;
 
@@ -969,20 +1003,58 @@ function runThumbJob<T>(job: () => Promise<T>): Promise<T> {
   });
 }
 
-// Resize via Bun's built-in image API when available; null means "unavailable,
-// caller falls back to the original bytes".
+// Bun's image pipeline is present in recent runtimes but absent from the
+// pinned @types/bun, so it is detected structurally: missing pieces mean
+// "unavailable" (the caller returns 501), never a crash.
+interface BunImageEncoder {
+  bytes(): Promise<Uint8Array>;
+}
+interface BunImageInstance {
+  resize(width: number): { jpeg(): BunImageEncoder };
+  jpeg(): BunImageEncoder;
+}
+interface BunWithImagePipeline {
+  Image?: new (input: Uint8Array) => BunImageInstance;
+}
+interface BunFileWithImagePipeline {
+  image?: () => Promise<BunImageInstance>;
+}
+
+// Resize via Bun's built-in image pipeline when available; null means
+// "unavailable, caller returns 501". Both pipeline shapes are
+// feature-detected: the in-memory `new Bun.Image(bytes)` constructor first,
+// then the file-backed `Bun.file(path).image()` fallback.
 async function tryResizeImage(
   bytes: Uint8Array,
   targetWidth: number,
 ): Promise<Uint8Array | null> {
-  const bunGlobal = Bun as unknown as Record<string, unknown>;
-  const resize = bunGlobal.resize;
-  if (typeof resize !== "function") return null;
   try {
-    const out = await (
-      resize as (input: Uint8Array, width: number) => Promise<Uint8Array> | Uint8Array
-    )(bytes, targetWidth);
-    return out ?? null;
+    const ImageCtor = (Bun as BunWithImagePipeline).Image;
+    if (typeof ImageCtor === "function") {
+      const encoded = new ImageCtor(bytes).resize(targetWidth).jpeg();
+      const out = await encoded.bytes();
+      if (out && out.byteLength > 0) return out;
+    }
+  } catch {
+    // Fall through to the file-backed pipeline.
+  }
+  try {
+    const probe = Bun.file("") as BunFileWithImagePipeline;
+    if (typeof probe.image !== "function") return null;
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const dir = mkdtempSync(join(tmpdir(), "caliber-thumb-"));
+    try {
+      const tmpPath = join(dir, "cover");
+      await Bun.write(tmpPath, bytes);
+      const fileImage = Bun.file(tmpPath) as BunFileWithImagePipeline;
+      const encoded = (await fileImage.image?.())?.resize(targetWidth).jpeg();
+      if (!encoded) return null;
+      const out = await encoded.bytes();
+      return out && out.byteLength > 0 ? out : null;
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   } catch {
     return null;
   }
@@ -1138,17 +1210,33 @@ const routes: RouteTable = {
 
         // When turning auth on with no accounts yet, the operator creates the
         // first account in the same request and is signed in immediately.
+        // Prepare-then-commit: the credential is validated with the shared
+        // isValidPassword (min + max) and prepared BEFORE authEnabled is
+        // persisted, so a weak/oversized password can never leave auth
+        // enabled with no usable account.
         const needsAccount = body.enabled && countUsersWithPassword() === 0;
         const username = typeof body.username === "string" ? body.username : "";
         const password = typeof body.password === "string" ? body.password : "";
         if (needsAccount && !isValidUsername(username)) {
           return Response.json({ error: "Invalid username" }, { status: 400 });
         }
-        if (needsAccount && password.length < MIN_PASSWORD_LENGTH) {
+        if (needsAccount && !isValidPassword(password)) {
           return Response.json(
             { error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` },
             { status: 400 },
           );
+        }
+
+        let preparedUser: User | null = null;
+        if (needsAccount) {
+          try {
+            preparedUser = await setPasswordForUser(username, password);
+          } catch (error) {
+            if (error instanceof PasswordError) {
+              return Response.json({ error: error.message }, { status: 400 });
+            }
+            throw error;
+          }
         }
 
         try {
@@ -1163,26 +1251,18 @@ const routes: RouteTable = {
           throw error;
         }
 
-        if (needsAccount) {
-          try {
-            const user = await setPasswordForUser(username, password);
-            purgeExpiredSessions();
-            const session = createSessionToken(user.id);
-            return Response.json(
-              { authEnabled: true, changed: true, user: publicUser(user) },
-              {
-                headers: {
-                  "Set-Cookie": sessionCookieHeader(session.token),
-                  "Cache-Control": "no-store",
-                },
+        if (preparedUser) {
+          purgeExpiredSessions();
+          const session = createSessionToken(preparedUser.id);
+          return Response.json(
+            { authEnabled: true, changed: true, user: publicUser(preparedUser) },
+            {
+              headers: {
+                "Set-Cookie": sessionCookieHeader(session.token),
+                "Cache-Control": "no-store",
               },
-            );
-          } catch (error) {
-            if (error instanceof PasswordError) {
-              return Response.json({ error: error.message }, { status: 400 });
-            }
-            throw error;
-          }
+            },
+          );
         }
 
         return Response.json(
@@ -1215,7 +1295,7 @@ const routes: RouteTable = {
         if (!isValidUsername(username)) {
           return Response.json({ error: "Invalid username" }, { status: 400 });
         }
-        if (password.length < MIN_PASSWORD_LENGTH) {
+        if (!isValidPassword(password)) {
           return Response.json(
             { error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` },
             { status: 400 },
@@ -1297,7 +1377,7 @@ const routes: RouteTable = {
         }
         const body = rawBody as { password?: unknown };
         const password = typeof body.password === "string" ? body.password : "";
-        if (password.length < MIN_PASSWORD_LENGTH) {
+        if (!isValidPassword(password)) {
           return Response.json(
             { error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` },
             { status: 400 },
@@ -1448,7 +1528,7 @@ const routes: RouteTable = {
           if (!isValidUsername(username)) {
             return Response.json({ error: "Invalid username" }, { status: 400 });
           }
-          if (password.length < MIN_PASSWORD_LENGTH) {
+          if (!isValidPassword(password)) {
             return Response.json(
               { error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` },
               { status: 400 },
@@ -1512,19 +1592,38 @@ const routes: RouteTable = {
       DELETE: async (req) => {
         const user = await currentUser(req);
         if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
-        return Response.json({ removed: clearProgress(user.id) });
+        return Response.json({ removed: clearProgress(user.id, resolveLibraryId(req)) });
       },
       GET: async (req) => {
         const user = await currentUser(req);
         if (!user) return Response.json({ items: [] });
         const url = new URL(req.url);
         const limit = parseBoundedInt(url.searchParams.get("limit"), 200, { min: 1, max: 500 });
-        const rows = listProgress(user.id, limit);
+        const libraryId = resolveLibraryId(req);
+        const rows = listProgress(user.id, libraryId, limit);
+        // Per-format rows collapse to one shelf item per book: finished
+        // wins, then furthest progress, then most recent. Enrichment reads
+        // the same server library, so foreign-library rows never resolve.
+        const bestByBook = new Map<number, (typeof rows)[number]>();
+        for (const row of rows) {
+          const prev = bestByBook.get(row.bookId);
+          if (
+            !prev ||
+            Number(row.finished) > Number(prev.finished) ||
+            (Number(row.finished) === Number(prev.finished) &&
+              (row.furthestPercentage > prev.furthestPercentage ||
+                (row.furthestPercentage === prev.furthestPercentage &&
+                  row.updatedAt > prev.updatedAt)))
+          ) {
+            bestByBook.set(row.bookId, row);
+          }
+        }
         // Batch enrichment: one WHERE id IN (...) lookup instead of one
         // getBookByIdOptimized round-trip per row.
-        const booksById = getBooksByIdsOptimized(rows.map((row) => row.bookId));
+        const scoped = [...bestByBook.values()];
+        const booksById = getBooksByIdsOptimized(scoped.map((row) => row.bookId));
         const items = [];
-        for (const row of rows) {
+        for (const row of scoped) {
           const book = booksById.get(row.bookId);
           if (!book) continue; // book removed from library — skip
           items.push({
@@ -1563,8 +1662,16 @@ const routes: RouteTable = {
             { headers: { "Cache-Control": "private, no-store" } },
           );
         }
+        const libraryId = resolveLibraryId(req);
+        const format = parseFormatQuery(new URL(req.url).searchParams.get("format"));
+        if (format === null) {
+          return Response.json({ error: "Invalid format" }, { status: 400 });
+        }
         return Response.json(
-          { progress: getProgress(user.id, bookId) },
+          {
+            progress: getProgress(user.id, libraryId, bookId, format),
+            formats: listProgressFormats(user.id, libraryId, bookId),
+          },
           { headers: { "Cache-Control": "private, no-store" } },
         );
       },
@@ -1597,7 +1704,7 @@ const routes: RouteTable = {
           return Response.json({ error: "Invalid book format" }, { status: 400 });
         }
 
-        const progress = upsertProgress(user.id, bookId, {
+        const progress = upsertProgress(user.id, resolveLibraryId(req), bookId, {
           format,
           location: typeof body.location === "string" ? body.location : null,
           percentage: typeof body.percentage === "number" ? body.percentage : 0,
@@ -1639,7 +1746,7 @@ const routes: RouteTable = {
           return Response.json({ error: "Invalid book format" }, { status: 400 });
         }
 
-        const progress = upsertProgress(user.id, bookId, {
+        const progress = upsertProgress(user.id, resolveLibraryId(req), bookId, {
           format,
           location: typeof body.location === "string" ? body.location : null,
           percentage: typeof body.percentage === "number" ? body.percentage : 0,
@@ -1657,8 +1764,12 @@ const routes: RouteTable = {
         }
         const user = await currentUser(req);
         if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
+        const format = parseFormatQuery(new URL(req.url).searchParams.get("format"));
+        if (format === null) {
+          return Response.json({ error: "Invalid format" }, { status: 400 });
+        }
         return Response.json(
-          { removed: deleteProgress(user.id, bookId) },
+          { removed: deleteProgress(user.id, resolveLibraryId(req), bookId, format) },
           { headers: { "Cache-Control": "private, no-store" } },
         );
       },
@@ -1670,7 +1781,7 @@ const routes: RouteTable = {
         try {
           const baseUrl = getPublicBaseUrl(req);
           const pathPrefix = opdsPathPrefix(req);
-          const updated = opdsNow();
+          const updated = opdsCatalogUpdated();
           const selfPath = getRequestPath(req);
 
           return getCachedTextResponse(
@@ -1943,7 +2054,7 @@ const routes: RouteTable = {
             selfPath,
             title,
             id: new URL(selfPath, baseUrl).toString(),
-            updated: opdsNow(),
+            updated: opdsCatalogUpdated(),
             result,
             nextPath,
           });
@@ -1984,7 +2095,7 @@ const routes: RouteTable = {
                 baseUrl,
                 pathPrefix,
                 selfPath,
-                updated: opdsNow(),
+                updated: opdsCatalogUpdated(),
                 book,
               });
             },
@@ -1998,8 +2109,47 @@ const routes: RouteTable = {
       },
     },
 
-    // F23: complete-entry alternate for a single book (subsection kept for
-    // compat in the entry itself).
+    // F23: compat alias for the single-book acquisition feed (see
+    // /opds/book/:id/complete for the bare entry document).
+    "/opds/book/:id/feed": {
+      GET: (req) => {
+        try {
+          const id = parseBookId(req.params.id ?? "");
+          if (id === null) {
+            return Response.json({ error: "Invalid book ID" }, { status: 400 });
+          }
+
+          const baseUrl = getPublicBaseUrl(req);
+          const pathPrefix = opdsPathPrefix(req);
+          const selfPath = getRequestPath(req);
+
+          return getCachedTextResponse(
+            `opds:book-feed:${baseUrl}:${pathPrefix}:${selfPath}`,
+            () => {
+              const book = getBookByIdOptimized(id);
+              if (!book) {
+                return Response.json({ error: "Book not found" }, { status: 404 });
+              }
+              return renderSingleBookFeed({
+                baseUrl,
+                pathPrefix,
+                selfPath,
+                updated: opdsCatalogUpdated(),
+                book,
+              });
+            },
+            req,
+            `${OPDS_ACQUISITION_TYPE}; charset=utf-8`,
+          );
+        } catch (error) {
+          console.error("Error rendering OPDS book feed:", error);
+          return Response.json({ error: "Failed to render OPDS book" }, { status: 500 });
+        }
+      },
+    },
+
+    // F23: complete-entry document for a single book: a bare <entry> served
+    // with `application/atom+xml;type=entry;profile=opds-catalog`.
     "/opds/book/:id/complete": {
       GET: (req) => {
         try {
@@ -2019,16 +2169,10 @@ const routes: RouteTable = {
               if (!book) {
                 return Response.json({ error: "Book not found" }, { status: 404 });
               }
-              return renderSingleBookFeed({
-                baseUrl,
-                pathPrefix,
-                selfPath,
-                updated: opdsNow(),
-                book,
-              });
+              return renderBookCompleteEntry({ baseUrl, pathPrefix, book });
             },
             req,
-            `${OPDS_ACQUISITION_TYPE}; charset=utf-8`,
+            `${OPDS_ENTRY_TYPE}; charset=utf-8`,
           );
         } catch (error) {
           console.error("Error rendering OPDS complete book:", error);

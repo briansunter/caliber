@@ -5,6 +5,7 @@ import JSZip from "jszip";
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { deflateSync } from "node:zlib";
 import { createServer } from "node:net";
 
 const TEST_TIMEOUT = 30_000;
@@ -294,7 +295,7 @@ function seedValidCoreBooks(db: Database) {
     INSERT INTO books
       (id, title, sort, timestamp, pubdate, series_index, author_sort, path, flags, uuid, has_cover, last_modified)
     VALUES
-      (1, 'Alpha & Beta', 'Alpha & Beta', '2024-01-02 00:00:00+00:00', '2023-01-01 00:00:00+00:00', 1.0, 'Author, Alice', 'Alpha Book', 1, '11111111-1111-1111-1111-111111111111', 0, '2024-01-02 00:00:00+00:00'),
+      (1, 'Alpha & Beta', 'Alpha & Beta', '2024-01-02 00:00:00+00:00', '2023-01-01 00:00:00+00:00', 1.0, 'Author, Alice', 'Alpha Book', 1, '11111111-1111-1111-1111-111111111111', 1, '2024-01-02 00:00:00+00:00'),
       (2, 'Gamma Search', 'Gamma Search', '2024-01-03 00:00:00+00:00', '2023-01-02 00:00:00+00:00', 1.0, 'Writer, Bob', 'Gamma Book', 1, '22222222-2222-2222-2222-222222222222', 0, '2024-01-03 00:00:00+00:00')
   `);
   db.run(`
@@ -390,7 +391,52 @@ async function seedValidCoreFiles() {
   await Bun.write(join(alphaDir, "Alpha Book.pdf"), createPdf());
   await createCbz(join(alphaDir, "Alpha Book.cbz"));
   await createCbr(join(alphaDir, "Alpha Book.cbr"));
+  // Large cover for the thumbnail resize test (book 1 declares has_cover).
+  // Written as PNG bytes under the conventional cover.jpg name: decoders
+  // sniff the magic, and the thumb endpoint always emits real JPEG.
+  await Bun.write(join(alphaDir, "cover.jpg"), createCoverPng(800, 600));
   await createEpub(join(gammaDir, "Gamma Book.epub"), "Gamma Search");
+}
+
+// Deterministic gradient PNG: big enough that a 256px JPEG thumbnail is
+// strictly smaller than the source, so the test can distinguish a real
+// resize from a full-bytes fallback.
+function createCoverPng(width: number, height: number): Uint8Array {
+  const raw = Buffer.alloc(width * height * 3);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const i = (y * width + x) * 3;
+      raw[i] = x % 256;
+      raw[i + 1] = y % 256;
+      raw[i + 2] = (x + y) % 256;
+    }
+  }
+  const scanlines = Buffer.alloc(height * (1 + width * 3));
+  for (let y = 0; y < height; y += 1) {
+    scanlines[y * (1 + width * 3)] = 0;
+    raw.copy(scanlines, y * (1 + width * 3) + 1, y * width * 3, (y + 1) * width * 3);
+  }
+  const chunk = (type: string, data: Uint8Array): Buffer => {
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(data.length);
+    const body = Buffer.concat([Buffer.from(type, "ascii"), Buffer.from(data)]);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE((Bun.hash.crc32(body) >>> 0) as number);
+    return Buffer.concat([length, body, crc]);
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8; // bit depth
+  header[9] = 2; // truecolor
+  return new Uint8Array(
+    Buffer.concat([
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+      chunk("IHDR", header),
+      chunk("IDAT", deflateSync(scanlines)),
+      chunk("IEND", Buffer.alloc(0)),
+    ]),
+  );
 }
 
 async function seedInvalidFiles() {
@@ -740,4 +786,35 @@ describe("format variant fixtures", () => {
     const cover = await fetch(`${baseUrl}/api/books/${SCENARIO_BOOK_IDS.missingCover}/cover`);
     expect(cover.status).toBe(404);
   });
+
+  test("cover thumbnails are really resized to the requested width", async () => {
+    const cover = await fetch(`${baseUrl}/api/books/1/cover`);
+    expect(cover.status).toBe(200);
+    const coverBytes = new Uint8Array(await cover.arrayBuffer());
+    expect(coverBytes.byteLength).toBeGreaterThan(0);
+
+    // Retry on 500: a request racing server warmup can hit the catch-all
+    // before the snapshot is fully published.
+    let thumb = await fetch(`${baseUrl}/api/books/1/thumb?size=small`);
+    for (let attempt = 0; attempt < 4 && thumb.status === 500; attempt += 1) {
+      await Bun.sleep(250);
+      thumb = await fetch(`${baseUrl}/api/books/1/thumb?size=small`);
+    }
+    expect(thumb.status).toBe(200);
+    expect(thumb.headers.get("content-type")).toContain("image/jpeg");
+    const thumbBytes = new Uint8Array(await thumb.arrayBuffer());
+    // A real 256px JPEG of the 800px cover is strictly smaller than the
+    // source; a full-bytes fallback would fail this assertion.
+    expect(thumbBytes.byteLength).toBeLessThan(coverBytes.byteLength);
+
+    // Decode via Bun's image pipeline (structurally detected: the pinned
+    // @types/bun has no Image type).
+    interface ThumbImage {
+      metadata(): Promise<{ width?: number; format?: string }>;
+    }
+    const ImageCtor = (Bun as { Image?: new (input: Uint8Array) => ThumbImage }).Image;
+    expect(ImageCtor).toBeDefined();
+    const metadata = await new ImageCtor!(thumbBytes).metadata();
+    expect(metadata.width).toBeLessThanOrEqual(256);
+    expect(metadata.format).toBe("jpeg");  });
 });

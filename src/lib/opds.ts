@@ -9,6 +9,7 @@ import { stripHtmlTags } from "./utils";
 
 export const OPDS_NAVIGATION_TYPE = "application/atom+xml;profile=opds-catalog;kind=navigation";
 export const OPDS_ACQUISITION_TYPE = "application/atom+xml;profile=opds-catalog;kind=acquisition";
+export const OPDS_ENTRY_TYPE = "application/atom+xml;type=entry;profile=opds-catalog";
 export const OPENSEARCH_TYPE = "application/opensearchdescription+xml";
 
 type OpdsBook = BookListItem | BookWithDetails;
@@ -95,7 +96,20 @@ export function getRequestPrefix(req: Request, trustProxy: boolean): string {
     const forwarded = req.headers.get("X-Forwarded-Prefix");
     if (forwarded?.trim()) return normalizePathPrefix(forwarded.split(",")[0]?.trim());
   }
-  return normalizePathPrefix(process.env.BASE_PATH ?? process.env.CALIBER_BASE_PATH);
+  const configured = normalizePathPrefix(process.env.BASE_PATH ?? process.env.CALIBER_BASE_PATH);
+  if (configured) return configured;
+  // Derive from CALIBER_BASE_URL when it mounts Caliber under a sub-path
+  // (e.g. https://host/prefix); origin-only values normalize to "".
+  const baseUrl = process.env.CALIBER_BASE_URL?.trim();
+  if (baseUrl) {
+    try {
+      const derived = normalizePathPrefix(new URL(baseUrl).pathname);
+      if (derived) return derived;
+    } catch {
+      // Invalid base URL: no prefix.
+    }
+  }
+  return "";
 }
 
 export function toOpdsDate(value: string | null | undefined): string {
@@ -300,7 +314,11 @@ ${readLink}`.trimEnd();
     .join("\n");
 }
 
-function renderBookEntry(book: OpdsBook, baseUrl: string, prefix: string | null | undefined = ""): string {
+function renderBookEntryContents(
+  book: OpdsBook,
+  baseUrl: string,
+  prefix: string | null | undefined = "",
+): string {
   const dto = ensureOpdsBookDto(book);
   const updated = bookUpdated(dto);
   const detailHref = absoluteUrl(baseUrl, `/opds/book/${dto.id}`, prefix);
@@ -320,9 +338,7 @@ function renderBookEntry(book: OpdsBook, baseUrl: string, prefix: string | null 
   const categories = bookCategories(dto);
   const metadata = bookMetadata(dto);
 
-  return `
-  <entry>
-    <title>${xml(dto.title)}</title>
+  return `    <title>${xml(dto.title)}</title>
     <id>${xml(uuid)}</id>
     <updated>${xml(updated)}</updated>
 ${bookAuthors(dto)}
@@ -332,10 +348,16 @@ ${metadata}${categories ? `${categories}\n` : ""}    <summary type="text">${xml(
       OPDS_ACQUISITION_TYPE,
     )}" title="Book details"/>
     <link rel="alternate" href="${xml(completeHref)}" type="${xml(
-      OPDS_ACQUISITION_TYPE,
+      OPDS_ENTRY_TYPE,
     )}" title="Complete entry"/>
 ${coverLinks}
-${formatLinks(dto, baseUrl, prefix)}
+${formatLinks(dto, baseUrl, prefix)}`;
+}
+
+function renderBookEntry(book: OpdsBook, baseUrl: string, prefix: string | null | undefined = ""): string {
+  return `
+  <entry>
+${renderBookEntryContents(book, baseUrl, prefix)}
   </entry>`;
 }
 
@@ -424,6 +446,23 @@ export function renderSingleBookFeed(options: SingleBookFeedOptions): string {
   )}"/>
 ${renderBookEntry(book, baseUrl, prefix)}
 </feed>`;
+}
+
+export interface CompleteEntryOptions {
+  baseUrl: string;
+  pathPrefix?: string;
+  book: BookWithDetails;
+}
+
+// OPDS complete entry: a bare <entry> document (not a <feed>) served with
+// `application/atom+xml;type=entry;profile=opds-catalog`, as referenced by
+// the acquisition "Complete entry" alternate link.
+export function renderBookCompleteEntry(options: CompleteEntryOptions): string {
+  const prefix = options.pathPrefix ?? "";
+  return `${XML_DECLARATION}
+<entry xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog" xmlns:dcterms="http://purl.org/dc/terms/">
+${renderBookEntryContents(options.book, options.baseUrl, prefix)}
+</entry>`;
 }
 
 export function renderOpenSearchDescription(baseUrl: string, prefix: string | null | undefined = ""): string {

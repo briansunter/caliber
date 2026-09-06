@@ -1,4 +1,5 @@
 import { memo, useEffect, useState, useCallback, useRef } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 
 import { useWindowVirtualizer } from "@tanstack/react-virtual";
 import { useFlattenedBooks, type SortConfig } from "@/hooks/useBooksInfinite";
@@ -55,10 +56,13 @@ export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, so
   const {
     books, totalCount, retainedCount, windowTruncated, hasNextPage, fetchNextPage,
     isFetchingNextPage, isFetchNextPageError, isLoading, isError, error, errorStage,
-    isPlaceholder, emptyReason, isAuthExpired, isOffline, refetch,
+    isPlaceholder, emptyReason, isAuthExpired, isOffline, refetch, queryKey,
   } = useFlattenedBooks(searchQuery, sortConfig, tagIds);
+  const queryClient = useQueryClient();
 
-  const containerRef = useRef<HTMLDivElement>(null);
+  // FUP8: callback-ref container so the ResizeObserver re-attaches when the
+  // node mounts/changes (plain useRef + once-on-mount misses remounts).
+  const [containerEl, setContainerEl] = useState<HTMLDivElement | null>(null);
   const [containerWidth, setContainerWidth] = useState(() => {
     if (typeof window === "undefined") return 1232;
     return Math.min(window.innerWidth - 48, 1280 - 48);
@@ -71,18 +75,29 @@ export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, so
 
   // Measure the container (not the window) so grid sizing tracks the real
   // layout width, including sidebars and padding.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional - observe once on mount
   useEffect(() => {
-    const el = containerRef.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver((entries) => {
-      const width = entries[0]?.contentRect.width ?? el.clientWidth;
+    const el = containerEl;
+    if (!el) return;
+    const apply = (width: number) => {
       if (width > 0) setContainerWidth(width);
-    });
-    ro.observe(el);
-    setContainerWidth(el.clientWidth || containerWidth);
-    return () => ro.disconnect();
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    };
+    apply(el.clientWidth);
+    let ro: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver((entries) => {
+        apply(entries[0]?.contentRect.width ?? el.clientWidth);
+      });
+      ro.observe(el);
+    }
+    // Window-resize fallback (kept): covers environments where ResizeObserver
+    // misses a layout change.
+    const onResize = () => apply(el.clientWidth);
+    window.addEventListener("resize", onResize);
+    return () => {
+      ro?.disconnect();
+      window.removeEventListener("resize", onResize);
+    };
+  }, [containerEl]);
 
   useEffect(() => {
     const cols = Math.max(2, Math.floor((containerWidth + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP)));
@@ -95,6 +110,9 @@ export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, so
 
   // Sticky search + table header reserve ~120px; scrollMargin keeps the
   // restored/focused row from sliding under them.
+  // FUP8 TanStack contract: keep scrollMargin on the virtualizer AND do NOT
+  // manually offset rows — rows use translateY(virtualRow.start) verbatim and
+  // the virtualizer applies the margin internally.
   const virtualizer = useWindowVirtualizer({
     count: rowCount,
     estimateSize: useCallback(() => cardHeight, [cardHeight]),
@@ -160,11 +178,21 @@ export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, so
 
   // Anchor restore: fetch the required window first, then scroll. The retry
   // chain is cancelled on unmount or when search/sort/tags change.
+  // FUP8: deps include books.length/hasNextPage readiness; the loop re-reads
+  // the latest books from the queryClient cache after each fetchNextPage
+  // (never the captured array, which goes stale across awaits).
   const restoreKey = `${searchQuery}|${sortConfig.field}|${sortConfig.order}|${(tagIds ?? []).join(",")}`;
-  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional - restore once per query identity
+  // biome-ignore lint/correctness/useExhaustiveDependencies: restore intentionally reads fresh books via queryClient after each fetch; captured books/fetchNextPage would go stale across awaits.
   useEffect(() => {
     let cancelled = false;
     let raf = 0;
+    const readFreshBooks = (): typeof books => {
+      try {
+        const data = queryClient.getQueryData<{ pages: { items: typeof books }[] }>(queryKey);
+        if (data?.pages) return data.pages.flatMap((p) => p.items);
+      } catch {}
+      return books;
+    };
     const run = async () => {
       let anchorId: number | null = null;
       let anchorOffset = 0;
@@ -174,22 +202,32 @@ export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, so
         if (saved && typeof saved.id === "number") anchorId = saved.id;
         if (saved && typeof saved.offset === "number") anchorOffset = saved.offset;
       } catch { anchorId = null; }
-      if (anchorId === null || books.length === 0) return;
+      let fresh = readFreshBooks();
+      if (anchorId === null || fresh.length === 0) return;
       const wanted = anchorId;
       // Fetch forward until the anchor id is in the retained window.
       let guard = 0;
-      while (!cancelled && guard < 10 && hasNextPage && !books.some((b) => b.id === wanted)) {
+      let latestHasNext = hasNextPage;
+      while (!cancelled && guard < 10 && latestHasNext && !fresh.some((b) => b.id === wanted)) {
         guard++;
-        try { await fetchNextPage(); } catch { break; }
+        try {
+          const result = await fetchNextPage();
+          latestHasNext = (result.data?.pages.length ?? 0) > 0 ? (result.hasNextPage ?? latestHasNext) : latestHasNext;
+        } catch { break; }
+        fresh = readFreshBooks();
+        if (fresh.some((b) => b.id === wanted)) break;
       }
       if (cancelled) return;
-      const idx = books.findIndex((b) => b.id === wanted);
+      fresh = readFreshBooks();
+      const idx = fresh.findIndex((b) => b.id === wanted);
       if (idx >= 0) {
         const row = Math.floor(idx / columns);
         const off = anchorOffset;
         raf = requestAnimationFrame(() => {
           if (cancelled) return;
           try {
+            // Single offset adjust only: scrollToIndex already accounts for
+            // scrollMargin; apply the saved intra-row offset once.
             virtualizer.scrollToIndex(row, { align: "start" });
             if (off > 0) window.scrollBy({ top: off });
           } catch {}
@@ -199,7 +237,8 @@ export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, so
     };
     void run();
     return () => { cancelled = true; cancelAnimationFrame(raf); };
-  }, [restoreKey]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [restoreKey, books.length, hasNextPage, columns, queryClient, queryKey]);
 
   if (isLoading) {
     return (
@@ -282,7 +321,7 @@ export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, so
     : `${books.length.toLocaleString()} book${books.length !== 1 ? "s" : ""}`;
 
   return (
-    <div ref={containerRef}>
+    <div ref={setContainerEl}>
       {refreshBanner}
       <div style={{ height: `${totalSize}px`, position: "relative" }}>
         {virtualItems.map((virtualRow) => {

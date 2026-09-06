@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { fetchJson } from "./http";
-import { clearPendingProgressOutbox } from "./reading-progress";
+import { clearPendingProgressOutbox, scheduleProgressOutboxRetry, setOutboxPrincipal } from "./reading-progress";
 
 export interface PublicUser {
   id: number;
@@ -36,8 +36,12 @@ export interface Credentials {
 }
 
 function switchPrincipal(qc: ReturnType<typeof useQueryClient>, user: PublicUser | null, authRequired: boolean) {
-  // Never replay the previous principal's queued progress writes.
+  // Never replay the previous principal's queued progress writes: cancel
+  // retry timers, abort in-flight drains via the generation counter, and drop
+  // in-memory pending saves. Other users' persisted outbox entries stay
+  // queued (they only drain when their own principal+library matches).
   clearPendingProgressOutbox();
+  setOutboxPrincipal(user ? user.id : null);
   // Drop principal-scoped caches; book/shelf keys are scoped by user id +
   // library id so stale cross-account data cannot be served.
   qc.removeQueries({ queryKey: ["books"] });
@@ -51,6 +55,9 @@ function switchPrincipal(qc: ReturnType<typeof useQueryClient>, user: PublicUser
     qc.setQueryData(USER_KEY, { user: null, authRequired, needsSetup: false });
   }
   qc.invalidateQueries({ queryKey: ["reading-list"] });
+  // Drain only after the new principal is established; the gated drain sends
+  // just entries matching this principal+library and keeps the rest queued.
+  if (user) scheduleProgressOutboxRetry(500);
 }
 
 function applySession(qc: ReturnType<typeof useQueryClient>, user: PublicUser) {

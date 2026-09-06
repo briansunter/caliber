@@ -4,9 +4,11 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   renameSync,
   realpathSync,
   rmdirSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -32,6 +34,11 @@ const DB_SOURCE_SIGNATURE_PATH = join(WORK_DIR, "metadata.source.json");
 // new generation so two processes never rename competing snapshots.
 const SNAPSHOT_LOCK_DIR = join(WORK_DIR, "snapshot.lock");
 
+// FTS index schema version, stored in caliber_fts_meta. Bump to force a
+// rebuild when the FTS definition changes (v3 adds the book_list_projection
+// rating materialization + the timestamp/series_index expression indexes).
+export const FTS_SCHEMA_VERSION = "3";
+
 // --- Snapshot generations (F15) -------------------------------------------
 // Every published snapshot is a generation: { id, path, revision }. New
 // generations are built in a tmp file and atomically renamed over
@@ -43,6 +50,8 @@ export interface SnapshotGeneration {
   id: number;
   path: string;
   revision: number;
+  /** FTS definition version the published snapshot was built with. */
+  ftsVersion: string;
 }
 
 let generationCounter = 0;
@@ -50,6 +59,7 @@ let activeGeneration: SnapshotGeneration = {
   id: 0,
   path: WRITABLE_DB_PATH,
   revision: 0,
+  ftsVersion: FTS_SCHEMA_VERSION,
 };
 const generationLeases = new Map<number, number>();
 const snapshotState: { refreshing: boolean; failed: string | null } = {
@@ -91,6 +101,17 @@ export function acquireSnapshotLease(): () => void {
 /** Monotonic revision of the published snapshot; used for cache keys. */
 export function getSnapshotRevision(): number {
   return activeGeneration.revision;
+}
+
+/** ISO instant the published snapshot was written. Nav/catalog feeds use this
+ * as their updated timestamp so repeated renders of unchanged state produce
+ * stable XML; only acquisition feeds use max(last_modified). */
+export function getSnapshotUpdated(): string {
+  try {
+    return statSync(activeGeneration.path).mtime.toISOString();
+  } catch {
+    return new Date(0).toISOString();
+  }
 }
 
 /** Status surface for the config/health endpoints. */
@@ -171,13 +192,11 @@ function copyDbToWritable(): void {
   }
 
   mkdirSync(WORK_DIR, { recursive: true });
-  for (const suffix of ["-wal", "-shm"]) {
-    const p = WRITABLE_DB_PATH + suffix;
-    if (existsSync(p)) unlinkSync(p);
-  }
 
-  // Build the new generation in a tmp file, then atomically rename/publish it
-  // over WRITABLE_DB_PATH so readers never see a half-written snapshot.
+  // Build the new generation in a tmp file: serialize a consistent snapshot
+  // of the source, then build indexes/FTS/projection IN THE TMP GENERATION
+  // before publishing, so readers only ever see a complete context
+  // {db path, revision, fts version} at WRITABLE_DB_PATH.
   const nextId = generationCounter + 1;
   const temporaryPath = `${WRITABLE_DB_PATH}.gen-${nextId}.tmp-${process.pid}`;
   // SQLite can have committed changes in the source WAL. serialize() asks
@@ -196,6 +215,36 @@ function copyDbToWritable(): void {
       throw new Error(`Unsupported Calibre database; missing ${missingTables.join(", ")}`);
     }
     writeFileSync(temporaryPath, sourceDb.serialize());
+  } finally {
+    sourceDb.close();
+  }
+
+  try {
+    const tmpDb = new Database(temporaryPath);
+    try {
+      try {
+        tmpDb.exec("PRAGMA journal_mode = DELETE;");
+      } catch {
+        // Ignore if this fails; the pool sets its own pragmas on open.
+      }
+      setupSnapshotDb(tmpDb);
+    } finally {
+      tmpDb.close();
+    }
+
+    for (const suffix of ["-wal", "-shm"]) {
+      const p = WRITABLE_DB_PATH + suffix;
+      if (existsSync(p)) unlinkSync(p);
+    }
+
+    // Retain the previous generation until leases drain: rename it aside
+    // instead of overwriting it, then unlink the superseded file only when
+    // no pool checkouts or generation leases can still read it. Refresh is
+    // already deferred while leases/checkouts are held, so publish normally
+    // finds none; the guard covers cross-process readers.
+    if (existsSync(WRITABLE_DB_PATH)) {
+      renameSync(WRITABLE_DB_PATH, `${WRITABLE_DB_PATH}.prev-${activeGeneration.id}`);
+    }
     try {
       renameSync(temporaryPath, WRITABLE_DB_PATH);
     } catch (error) {
@@ -204,9 +253,9 @@ function copyDbToWritable(): void {
       unlinkSync(WRITABLE_DB_PATH);
       renameSync(temporaryPath, WRITABLE_DB_PATH);
     }
-  } finally {
-    sourceDb.close();
+  } catch (error) {
     if (existsSync(temporaryPath)) unlinkSync(temporaryPath);
+    throw error;
   }
 
   const signature = getDatabaseSignature(DB_PATH);
@@ -220,10 +269,33 @@ function copyDbToWritable(): void {
     id: nextId,
     path: WRITABLE_DB_PATH,
     revision: activeGeneration.revision + 1,
+    ftsVersion: FTS_SCHEMA_VERSION,
   };
+  pruneOldGenerations();
   console.error(
     `📋 Copied database snapshot to ${WRITABLE_DB_PATH} (generation ${nextId}, revision ${activeGeneration.revision})`,
   );
+}
+
+// Unlink superseded generation files, but never while pool checkouts or
+// generation leases (e.g. active exports/streams) might still read them;
+// survivors are pruned on the next publish.
+function pruneOldGenerations(): void {
+  if (activeCheckouts > 0 || activeLeaseCount() > 0) return;
+  let entries: string[];
+  try {
+    entries = readdirSync(WORK_DIR);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith(`${DB_NAME}.prev-`)) continue;
+    try {
+      unlinkSync(join(WORK_DIR, entry));
+    } catch {
+      // ignore: already gone or locked by another process
+    }
+  }
 }
 
 // Connection pool for concurrent requests
@@ -257,9 +329,11 @@ function swapDatabaseFile(): void {
   snapshotState.refreshing = true;
   snapshotState.failed = null;
   try {
+    // Indexes/FTS/projection are built in the tmp generation inside
+    // copyDbToWritable, before the generation is published — the pool is
+    // closed first so no checkout can observe the swap mid-publish.
     closePool();
     copyDbToWritable();
-    runFtsSetup();
     notifyDbRefreshed();
   } catch (error) {
     snapshotState.failed = error instanceof Error ? error.message : String(error);
@@ -301,10 +375,24 @@ export function reconfigureLibraryDatabase(): void {
   swapDatabaseFile();
 }
 
-// Ensure writable DB exists and is up-to-date with the source Calibre DB
+// Ensure writable DB exists and is up-to-date with the source Calibre DB.
+// Startup path: this process is the single owner of the snapshot at boot (no
+// pool checkouts or generation leases exist yet), so the copy runs under the
+// cross-process snapshot lock with the pool closed. Index/FTS/projection
+// setup runs inside the tmp generation during the copy (see
+// copyDbToWritable); initFTS runs runFtsSetup() after the copy to verify the
+// published snapshot.
 function ensureWritableDb(): void {
   if (!existsSync(WRITABLE_DB_PATH)) {
-    copyDbToWritable();
+    if (!acquireSnapshotLock()) {
+      throw new Error("Another Caliber process is building the library snapshot; retry shortly");
+    }
+    try {
+      closePool();
+      copyDbToWritable();
+    } finally {
+      releaseSnapshotLock();
+    }
     return;
   }
 
@@ -316,7 +404,15 @@ function ensureWritableDb(): void {
       snapshot.sourcePath !== resolve(DB_PATH) ||
       !isSameSignature(snapshot.signature, sourceSignature)
     ) {
-      copyDbToWritable();
+      // Another process may be publishing; let the periodic tick retry rather
+      // than contending on the lock here.
+      if (!acquireSnapshotLock()) return;
+      try {
+        closePool();
+        copyDbToWritable();
+      } finally {
+        releaseSnapshotLock();
+      }
     }
   } catch {
     // If stat fails, leave existing copy in place
@@ -363,64 +459,65 @@ function releaseDb(): void {
   }
 }
 
-// FTS index schema version, stored in caliber_fts_meta. Bump to force a
-// rebuild when the FTS definition changes.
-export const FTS_SCHEMA_VERSION = "2";
+function setupSnapshotDb(db: Database): void {
+  const sourceSignature = getDatabaseSignature(DB_PATH);
+  const sourceSignatureValue = JSON.stringify(sourceSignature);
 
-function runFtsSetup(): void {
-  const db = getDb();
+  // Expression indexes for keyset pagination. Each index matches the
+  // normalized sort expression in BOOK_SORT_EXPRESSIONS exactly (same
+  // function calls, same argument order, modulo alias/whitespace which
+  // SQLite normalizes) so SQLite can seek instead of sorting. Aliases
+  // (b./p.) are stripped here — expression indexes must reference bare
+  // columns of the indexed table.
+  //
+  // EXPLAIN QUERY PLAN verification (per sort, ASC):
+  //   title:        SEARCH b USING INDEX idx_books_sort_key
+  //   author:       SEARCH b USING INDEX idx_books_author_sort_key
+  //   added:        SEARCH b USING INDEX idx_books_timestamp_matching
+  //   rating:       SEARCH b USING INDEX idx_book_list_projection_rating
+  //                 (via JOIN book_list_projection p ON p.book = b.id)
+  //   series_index: SEARCH b USING INDEX idx_books_series_index_key
+  // The explicit `key >= ?` seek bound plus the
+  // `(key > ? OR (key = ? AND id > ?))` tie-break both resolve against
+  // these indexes; without the bound SQLite falls back to SCAN.
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_books_sort_key ON books(COALESCE(NULLIF(lower(sort), ''), lower(title)), id);`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_books_author_sort_key ON books(COALESCE(lower(author_sort), ''), id);`,
+  );
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_books_timestamp_key ON books(timestamp, id);`);
+  // Matches BOOK_SORT_EXPRESSIONS.added (`COALESCE(b.timestamp, '')`) with the
+  // alias stripped, so the added-sort page query seeks instead of sorting.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_books_timestamp_matching ON books(COALESCE(timestamp,''), id);`);
+  // Matches BOOK_SORT_EXPRESSIONS.series_index (`COALESCE(b.series_index, 1)`)
+  // with the alias stripped (covering index: key + rowid tie-break).
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_books_series_index_key ON books(COALESCE(series_index,1), id);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_books_ratings_link_book ON books_ratings_link(book);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_ratings_value ON ratings(rating, id);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_data_format ON data(format);`);
 
-  try {
-    const sourceSignature = getDatabaseSignature(DB_PATH);
-    const sourceSignatureValue = JSON.stringify(sourceSignature);
+  // Link-table indexes
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_books_authors_link_book ON books_authors_link(book);`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_books_tags_link_book ON books_tags_link(book);`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_books_series_link_book ON books_series_link(book);`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_books_publishers_link_book ON books_publishers_link(book);`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_books_series_link_series ON books_series_link(series);`,
+  );
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_books_tags_link_tag ON books_tags_link(tag);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_authors_name ON authors(name);`);
 
-    // Expression indexes for keyset pagination. Each index matches the
-    // normalized sort expression in BOOK_SORT_EXPRESSIONS exactly (same
-    // function calls, same argument order) so SQLite can seek instead of
-    // sorting. Aliases (b./r.) are stripped here — expression indexes must
-    // reference bare columns of the indexed table.
-    //
-    // EXPLAIN QUERY PLAN verification (per sort, ASC):
-    //   title:  SEARCH book_page USING INDEX idx_books_sort_key
-    //   author: SEARCH book_page USING INDEX idx_books_author_sort_key
-    //   added:  SEARCH book_page USING INDEX idx_books_timestamp_key
-    //   rating: SEARCH book_page USING INDEX idx_books_ratings_link_book,
-    //           then SEARCH r USING INDEX idx_ratings_value
-    // The explicit `sort_key >= ?` seek bound plus the
-    // `(key > ? OR (key = ? AND id > ?))` tie-break both resolve against
-    // these indexes; without the bound SQLite falls back to SCAN.
-    db.exec(
-      `CREATE INDEX IF NOT EXISTS idx_books_sort_key ON books(COALESCE(NULLIF(lower(sort), ''), lower(title)), id);`,
-    );
-    db.exec(
-      `CREATE INDEX IF NOT EXISTS idx_books_author_sort_key ON books(COALESCE(lower(author_sort), ''), id);`,
-    );
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_books_timestamp_key ON books(timestamp, id);`);
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_books_ratings_link_book ON books_ratings_link(book);`);
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_ratings_value ON ratings(rating, id);`);
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_data_format ON data(format);`);
-
-    // Link-table indexes
-    db.exec(
-      `CREATE INDEX IF NOT EXISTS idx_books_authors_link_book ON books_authors_link(book);`,
-    );
-    db.exec(
-      `CREATE INDEX IF NOT EXISTS idx_books_tags_link_book ON books_tags_link(book);`,
-    );
-    db.exec(
-      `CREATE INDEX IF NOT EXISTS idx_books_series_link_book ON books_series_link(book);`,
-    );
-    db.exec(
-      `CREATE INDEX IF NOT EXISTS idx_books_publishers_link_book ON books_publishers_link(book);`,
-    );
-    db.exec(
-      `CREATE INDEX IF NOT EXISTS idx_books_series_link_series ON books_series_link(series);`,
-    );
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_books_tags_link_tag ON books_tags_link(tag);`);
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_authors_name ON authors(name);`);
-
-    // Create FTS5 virtual table for full-text search
-    db.exec(`
+  // Create FTS5 virtual table for full-text search
+  db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS books_fts USING fts5(
         title,
         author_sort,
@@ -428,88 +525,132 @@ function runFtsSetup(): void {
         content_rowid='id'
       );
     `);
-    db.exec(`
+  db.exec(`
       CREATE TABLE IF NOT EXISTS caliber_fts_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
     `);
 
-    const bookCount = db.query("SELECT COUNT(*) as count FROM books").get() as { count: number };
-    const ftsCount = db.query("SELECT COUNT(*) as count FROM books_fts").get() as {
-      count: number;
-    };
-    const metaRows = db
-      .query("SELECT key, value FROM caliber_fts_meta WHERE key IN ('source_signature', 'fts_schema_version')")
-      .all() as Array<{ key: string; value: string }>;
-    const metaByKey = new Map(metaRows.map((row) => [row.key, row.value]));
-    const schemaVersion = metaByKey.get("fts_schema_version");
+  const bookCount = db.query("SELECT COUNT(*) as count FROM books").get() as { count: number };
+  const ftsCount = db.query("SELECT COUNT(*) as count FROM books_fts").get() as {
+    count: number;
+  };
+  const metaRows = db
+    .query("SELECT key, value FROM caliber_fts_meta WHERE key IN ('source_signature', 'fts_schema_version')")
+    .all() as Array<{ key: string; value: string }>;
+  const metaByKey = new Map(metaRows.map((row) => [row.key, row.value]));
+  const schemaVersion = metaByKey.get("fts_schema_version");
 
-    // MATCH probes verify the FTS index actually answers queries, not just
-    // that the row COUNT(*) looks right (a corrupt/truncated FTS table can
-    // still report a plausible count).
-    function ftsProbesPass(): boolean {
-      try {
-        // Probe 1: an unlikely token must parse and return zero rows. If the
-        // FTS table is corrupt this throws ("no such table" /
-        // "database disk image is malformed").
-        const probe = db
+  // MATCH probes verify the FTS index actually answers queries, not just
+  // that the row COUNT(*) looks right (a corrupt/truncated FTS table can
+  // still report a plausible count).
+  function ftsProbesPass(): boolean {
+    try {
+      // Probe 1: an unlikely token must parse and return zero rows. If the
+      // FTS table is corrupt this throws ("no such table" /
+      // "database disk image is malformed").
+      const probe = db
+        .query(`SELECT rowid FROM books_fts WHERE books_fts MATCH ? LIMIT 1`)
+        .all('"caliber_fts_probe_xyzzy_unlikely"') as unknown[];
+      if (probe.length !== 0) return false;
+      // Probe 2: a known title token must match at least one row (skipped
+      // for empty libraries).
+      const titleRow = db.query("SELECT title FROM books LIMIT 1").get() as
+        | { title: string }
+        | undefined;
+      const token = titleRow?.title.toLowerCase().match(/[a-z0-9]{2,}/)?.[0];
+      if (token) {
+        const escaped = token.replace(/"/g, '""');
+        const hits = db
           .query(`SELECT rowid FROM books_fts WHERE books_fts MATCH ? LIMIT 1`)
-          .all('"caliber_fts_probe_xyzzy_unlikely"') as unknown[];
-        if (probe.length !== 0) return false;
-        // Probe 2: a known title token must match at least one row (skipped
-        // for empty libraries).
-        const titleRow = db.query("SELECT title FROM books LIMIT 1").get() as
-          | { title: string }
-          | undefined;
-        const token = titleRow?.title.toLowerCase().match(/[a-z0-9]{2,}/)?.[0];
-        if (token) {
-          const escaped = token.replace(/"/g, '""');
-          const hits = db
-            .query(`SELECT rowid FROM books_fts WHERE books_fts MATCH ? LIMIT 1`)
-            .all(`"${escaped}"*`) as unknown[];
-          if (hits.length === 0) return false;
-        }
-        return true;
-      } catch {
-        return false;
+          .all(`"${escaped}"*`) as unknown[];
+        if (hits.length === 0) return false;
       }
+      return true;
+    } catch {
+      return false;
     }
+  }
 
-    if (
-      schemaVersion !== FTS_SCHEMA_VERSION ||
-      metaByKey.get("source_signature") !== sourceSignatureValue ||
-      ftsCount.count !== bookCount.count ||
-      !ftsProbesPass()
-    ) {
-      console.error("🔍 Building FTS index...");
-      // Publish atomically: rebuild + meta updates in one transaction so a
-      // crash never leaves a half-built index advertised as current.
-      db.exec("BEGIN IMMEDIATE;");
+  if (
+    schemaVersion !== FTS_SCHEMA_VERSION ||
+    metaByKey.get("source_signature") !== sourceSignatureValue ||
+    ftsCount.count !== bookCount.count ||
+    !ftsProbesPass()
+  ) {
+    console.error("🔍 Building FTS index...");
+    // Publish atomically: rebuild + meta updates in one transaction so a
+    // crash never leaves a half-built index advertised as current.
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+      db.exec(`INSERT INTO books_fts(books_fts) VALUES('rebuild');`);
+      db.query(
+        "INSERT OR REPLACE INTO caliber_fts_meta (key, value) VALUES ('source_signature', ?)",
+      ).run(sourceSignatureValue);
+      db.query("INSERT OR REPLACE INTO caliber_fts_meta (key, value) VALUES ('fts_schema_version', ?)").run(
+        FTS_SCHEMA_VERSION,
+      );
+      db.exec("COMMIT;");
+    } catch (error) {
       try {
-        db.exec(`INSERT INTO books_fts(books_fts) VALUES('rebuild');`);
-        db.query(
-          "INSERT OR REPLACE INTO caliber_fts_meta (key, value) VALUES ('source_signature', ?)",
-        ).run(sourceSignatureValue);
-        db.query("INSERT OR REPLACE INTO caliber_fts_meta (key, value) VALUES ('fts_schema_version', ?)").run(
-          FTS_SCHEMA_VERSION,
-        );
-        db.exec("COMMIT;");
-      } catch (error) {
-        try {
-          db.exec("ROLLBACK;");
-        } catch {
-          // ignore rollback failure
-        }
-        throw error;
+        db.exec("ROLLBACK;");
+      } catch {
+        // ignore rollback failure
       }
-      if (!ftsProbesPass()) {
-        throw new Error("FTS index rebuild failed verification probes");
-      }
+      throw error;
     }
+    if (!ftsProbesPass()) {
+      throw new Error("FTS index rebuild failed verification probes");
+    }
+  }
 
-    const total = db.query("SELECT COUNT(*) as count FROM books_fts").get() as { count: number };
-    console.error(`🔍 FTS index ready (${total.count} books)`);
+  // Rating projection: materialized normalized rating (unrated → 0) so the
+  // rating page query orders a single indexed column instead of joining
+  // books_ratings_link/ratings at page time. Built here — inside the tmp
+  // generation before publish on refresh — so every published snapshot
+  // carries a complete projection. Rebuilt transactionally whenever the row
+  // count drifts from the book count (fresh copies always rebuild).
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS book_list_projection (book INTEGER PRIMARY KEY, rating INTEGER NOT NULL DEFAULT 0);`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_book_list_projection_rating ON book_list_projection(rating, book);`,
+  );
+  const projectionCount = db.query("SELECT COUNT(*) as count FROM book_list_projection").get() as {
+    count: number;
+  };
+  if (projectionCount.count !== bookCount.count) {
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+      db.exec(`DELETE FROM book_list_projection;`);
+      db.exec(`INSERT INTO book_list_projection (book, rating)
+        SELECT b.id, COALESCE(r.rating, 0)
+        FROM books b
+        LEFT JOIN books_ratings_link brl ON b.id = brl.book
+        LEFT JOIN ratings r ON brl.rating = r.id;`);
+      db.exec("COMMIT;");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK;");
+      } catch {
+        // ignore rollback failure
+      }
+      throw error;
+    }
+  }
+
+  const total = db.query("SELECT COUNT(*) as count FROM books_fts").get() as { count: number };
+  console.error(`🔍 FTS index ready (${total.count} books)`);
+}
+
+// Pool-backed wrapper: check out a connection, run the snapshot setup on the
+// published snapshot, and release. Used for post-copy verification at startup
+// and whenever the published snapshot needs an in-place refresh.
+function runFtsSetup(): void {
+  const db = getDb();
+  try {
+    setupSnapshotDb(db);
   } finally {
     releaseDb();
   }
@@ -820,7 +961,10 @@ const BOOK_SORT_EXPRESSIONS = {
   title: `COALESCE(NULLIF(lower(b.sort), ''), lower(b.title))`,
   author: `COALESCE(lower(b.author_sort), '')`,
   added: `COALESCE(b.timestamp, '')`,
-  rating: `COALESCE(r.rating, 0)`,
+  // Rating orders the materialized book_list_projection (joined as `p` in the
+  // rating page query); unrated books are stored as 0, preserving the old
+  // COALESCE(r.rating, 0) semantics. Indexed by idx_book_list_projection_rating.
+  rating: `p.rating`,
   series_index: `COALESCE(b.series_index, 1)`,
 } as const;
 
@@ -883,16 +1027,19 @@ function appendBookCursorWhere(
   const seekOp = sortOrder === "asc" ? ">=" : "<=";
   const expr = buildCursorSortExpression(sortBy);
 
-  if (sortBy === "rating" || sortBy === "series_index") {
+  if (sortBy === "rating") {
     if (typeof cursorData.sort !== "number" || !Number.isFinite(cursorData.sort)) {
-      throw new CursorError(
-        sortBy === "rating"
-          ? "Cursor sort value does not match rating sort"
-          : "Cursor sort value does not match series_index sort",
-      );
+      throw new CursorError("Cursor sort value does not match rating sort");
     }
-    const ratingVal = cursorData.sort;
-    params.push(ratingVal, ratingVal, ratingVal, cursorData.id);
+    params.push(cursorData.sort, cursorData.sort, cursorData.sort, cursorData.id);
+    return `${bookWhere} AND ${expr} ${seekOp} ? AND (${expr} ${sortOp} ? OR (${expr} = ? AND b.id ${sortOp} ?))`;
+  }
+
+  if (sortBy === "series_index") {
+    if (typeof cursorData.sort !== "number" || !Number.isFinite(cursorData.sort)) {
+      throw new CursorError("Cursor sort value does not match series_index sort");
+    }
+    params.push(cursorData.sort, cursorData.sort, cursorData.sort, cursorData.id);
     return `${bookWhere} AND ${expr} ${seekOp} ? AND (${expr} ${sortOp} ? OR (${expr} = ? AND b.id ${sortOp} ?))`;
   }
 
@@ -946,16 +1093,17 @@ function listBooksWithWhere(
     }
     let pageQuery: string;
     if (needsRatingInCte) {
-      // Include rating join inside the page query so ORDER BY and WHERE can
-      // reference it (expression index idx_ratings_value covers the seek).
+      // Rating orders the materialized projection (unrated = 0): the JOIN
+      // against book_list_projection AS p seeks idx_book_list_projection_rating
+      // for both the ORDER BY and the cursor predicate (BOOK_SORT_EXPRESSIONS.rating
+      // is `p.rating`, matching the index key exactly).
       pageQuery = `
-        SELECT b.id, COALESCE(r.rating, 0) AS rating_val,
-               COALESCE(r.rating, 0) AS cursor_sort
+        SELECT b.id, p.rating AS rating_val,
+               p.rating AS cursor_sort
         FROM books b
-        LEFT JOIN books_ratings_link brl ON b.id = brl.book
-        LEFT JOIN ratings r ON brl.rating = r.id
+        JOIN book_list_projection p ON p.book = b.id
         ${bookWhere}
-        ORDER BY COALESCE(r.rating, 0) ${dir}, b.id ${dir}
+        ORDER BY p.rating ${dir}, b.id ${dir}
         LIMIT ${limit + 1}
       `;
     } else {

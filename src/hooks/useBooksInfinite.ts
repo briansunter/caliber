@@ -1,5 +1,5 @@
 import { useInfiniteQuery, useQuery, keepPreviousData } from "@tanstack/react-query";
-import { useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import type { BookListItem, BookWithDetails, CursorPaginatedResult } from "@/lib/calibre-optimized";
 import { fetchJson, HttpError } from "@/lib/http";
 
@@ -202,7 +202,18 @@ export function useSearchInfinite(
   });
 }
 
-// Shared hook: flattens pages and exposes fetch controls
+// Shared hook: flattens pages and exposes fetch controls.
+//
+// FUP8 backward-pagination contract (documented, do NOT claim otherwise):
+// - The server is forward-only: it emits only nextCursor, never prevCursor.
+//   There is NO server backward fetch, so fetchPreviousPage is a no-op that
+//   returns undefined until the server adds prevCursor support.
+// - The client keeps all loaded pages in the TanStack cache up to maxPages
+//   (no manual eviction besides TanStack's maxPages window). windowTruncated
+//   is derived from cached data length vs totalCount once the window is full.
+// - keepFirstPageAnchor retains the first page's items in a separate ref
+//   (firstPageDataRef) and prepends them if maxPages eviction drops them, so
+//   "back to top" and anchor restore always have a stable window.
 export function useFlattenedBooks(
   searchQuery: string,
   sortConfig: SortConfig,
@@ -213,10 +224,44 @@ export function useFlattenedBooks(
   const booksQuery = useBooksInfinite(sortConfig, tagIds, !isSearching, options);
   const searchQueryHook = useSearchInfinite(searchQuery, sortConfig, tagIds, isSearching, options);
   const query = isSearching ? searchQueryHook : booksQuery;
+  const keepFirstPageAnchor = options.keepFirstPageAnchor ?? true;
 
-  const books = useMemo(() => {
+  // FUP8: retain the first page separately so maxPages eviction never loses
+  // the top anchor. Stored in a ref (not state) to avoid extra renders; the
+  // books memo below prepends it when eviction is detected.
+  const firstPageDataRef = useRef<BookListItem[] | null>(null);
+  const firstPageSeen = query.data?.pages[0]?.items;
+  useEffect(() => {
+    if (firstPageSeen && firstPageSeen.length > 0 && !firstPageDataRef.current) {
+      firstPageDataRef.current = firstPageSeen;
+    }
+  }, [firstPageSeen]);
+
+  const activeQueryKey = useMemo(
+    () =>
+      isSearching
+        ? (["books", "search", "infinite", searchQuery, sortConfig.field, sortConfig.order, tagIds, ...scopeSuffix({ userId: options.userId, libraryId: options.libraryId })] as const)
+        : (["books", "infinite", sortConfig.field, sortConfig.order, tagIds, ...scopeSuffix({ userId: options.userId, libraryId: options.libraryId })] as const),
+    [isSearching, searchQuery, sortConfig.field, sortConfig.order, tagIds, options.userId, options.libraryId],
+  );
+
+  const rawBooks = useMemo(() => {
     return query.data?.pages.flatMap((page) => page.items) ?? [];
   }, [query.data]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: pages.length is the eviction signal; rawBooks identity alone does not change when maxPages drops leading pages.
+  const books = useMemo(() => {
+    // FUP8: if TanStack maxPages eviction dropped the leading window, prepend
+    // the separately-retained first page (deduped by id).
+    if (!keepFirstPageAnchor) return rawBooks;
+    const anchor = firstPageDataRef.current;
+    if (!anchor || anchor.length === 0 || rawBooks.length === 0) return rawBooks;
+    if (rawBooks[0]?.id === anchor[0]?.id) return rawBooks;
+    const seen = new Set(rawBooks.map((b) => b.id));
+    const missing = anchor.filter((b) => !seen.has(b.id));
+    if (missing.length === 0) return rawBooks;
+    return [...missing, ...rawBooks];
+  }, [rawBooks, keepFirstPageAnchor, query.data?.pages.length]);
 
   const totalCount = useMemo(() => {
     const pages = query.data?.pages;
@@ -229,8 +274,15 @@ export function useFlattenedBooks(
 
   const retainedCount = books.length;
   const maxPages = isSearching ? (options.maxPages ?? 20) : (options.maxPages ?? 50);
+  // FUP8: windowTruncated reflects maxPages eviction — cached data length
+  // (retainedCount from queryClient data) is below totalCount while the page
+  // window is already full.
   const windowTruncated =
     totalCount !== null && retainedCount < totalCount && (query.data?.pages.length ?? 0) >= maxPages;
+
+  // FUP8: backward fetch is NOT supported (forward-only server). No-op until
+  // the server emits prevCursor — never claim it fetches.
+  const fetchPreviousPageNoop = useCallback(async () => undefined as unknown as Awaited<ReturnType<typeof query.fetchPreviousPage>>, []);
 
   const hasData = retainedCount > 0;
   const errorStage = errorStageOf(query.error, hasData, query.isFetchingNextPage || query.isFetchNextPageError);
@@ -253,11 +305,13 @@ export function useFlattenedBooks(
     retainedCount,
     windowTruncated,
     maxPages,
-    keepFirstPageAnchor: options.keepFirstPageAnchor ?? true,
+    keepFirstPageAnchor,
+    queryKey: activeQueryKey,
     hasNextPage: query.hasNextPage ?? false,
-    hasPreviousPage: query.hasPreviousPage ?? false,
+    // Backward paging unsupported: always false until server prevCursor lands.
+    hasPreviousPage: false as boolean,
     fetchNextPage: query.fetchNextPage,
-    fetchPreviousPage: query.fetchPreviousPage,
+    fetchPreviousPage: fetchPreviousPageNoop,
     isFetchingNextPage: query.isFetchingNextPage,
     isFetchingPreviousPage: query.isFetchingPreviousPage,
     isFetchNextPageError: query.isFetchNextPageError,
