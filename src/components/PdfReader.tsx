@@ -15,7 +15,7 @@ import {
 import { stored } from "@/lib/utils";
 import { useReaderSettings } from "@/lib/reader-settings";
 import { useFullscreen } from "@/lib/use-fullscreen";
-import { flushBookProgress, fetchBookProgress, saveBookProgress } from "@/lib/reading-progress";
+import { flushBookProgress, fetchBookProgress, saveBookProgress, progressPosKey, readScopedPos, getLibraryScopeId } from "@/lib/reading-progress";
 import {
   getNextReaderLoadMode,
   prefetchOrder,
@@ -102,13 +102,13 @@ export function PdfReader({
   const settings = useReaderSettings();
   const { isFullscreen, supported: fullscreenSupported, toggle: toggleFullscreen } = useFullscreen();
 
-  const posKey = `caliber-pos-${bookId}-pdf`;
-  const zoomKey = `caliber-zoom-${bookId}-pdf`;
+  const posKey = progressPosKey(bookId, "pdf");
+  const zoomKey = `caliber-zoom-${getLibraryScopeId()}-${bookId}-pdf`;
 
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loadMode, setLoadMode] = useState<ReaderLoadMode>(initialLoadMode);
-  const [currentPage, setCurrentPage] = useState(() => stored(posKey, { page: 1 }).page as number);
+  const [currentPage, setCurrentPage] = useState(() => readScopedPos<{ page: number }>(bookId, "pdf", { page: 1 }).page as number);
   const [totalPages, setTotalPages] = useState(0);
   const [showUI, setShowUI] = useState(true);
   const [zoom, setZoom] = useState(() => stored(zoomKey, { zoom: 1 }).zoom as number);
@@ -339,6 +339,7 @@ export function PdfReader({
   // Load PDF document. Stream mode lets PDF.js request byte ranges; full mode fetches once.
   useEffect(() => {
     let cancelled = false;
+    const abort = new AbortController();
     let loadingTask: pdfjsLib.PDFDocumentLoadingTask | null = null;
 
     async function loadPdf() {
@@ -347,7 +348,7 @@ export function PdfReader({
       setTotalPages(0);
 
       if (renderTaskRef.current) {
-        renderTaskRef.current.cancel();
+        try { renderTaskRef.current.cancel(); } catch {}
         renderTaskRef.current = null;
       }
 
@@ -360,10 +361,10 @@ export function PdfReader({
 
       try {
         if (loadMode === "full") {
-          const response = await fetch(url);
+          const response = await fetch(url, { signal: abort.signal });
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           const data = await response.arrayBuffer();
-          if (cancelled) return;
+          if (cancelled || abort.signal.aborted) return;
           loadingTask = pdfjsLib.getDocument({ data });
         } else {
           loadingTask = pdfjsLib.getDocument({
@@ -377,7 +378,7 @@ export function PdfReader({
 
         const pdf = await loadingTask.promise;
         if (cancelled) {
-          await pdf.destroy();
+          await pdf.destroy().catch(() => {});
           return;
         }
 
@@ -385,7 +386,7 @@ export function PdfReader({
         setTotalPages(pdf.numPages);
         setIsLoading(false);
       } catch (error) {
-        if (cancelled) return;
+        if (cancelled || abort.signal.aborted) return;
 
         if (loadMode === "stream") {
           setLoadMode("full");
@@ -397,10 +398,11 @@ export function PdfReader({
       }
     }
 
-    void loadPdf();
+    void loadPdf().catch(() => {});
 
     return () => {
       cancelled = true;
+      abort.abort();
       if (loadingTask) {
         try {
           loadingTask.destroy();
@@ -413,6 +415,8 @@ export function PdfReader({
   const totalPagesRef = useRef(totalPages);
   const serverRestoredRef = useRef(false);
   const restoreSettledRef = useRef(false);
+  // F06: track the page actually swapped onto the canvas, not the requested one.
+  const displayedPageRef = useRef(currentPage);
 
   useEffect(() => {
     currentPageRef.current = currentPage;
@@ -441,7 +445,10 @@ export function PdfReader({
 
     const effectiveWidth = containerWidth > 0 ? containerWidth : container.clientWidth;
 
-    pdf.getPage(currentPage).then(async (page) => {
+    // F06: terminal catch so a rejected getPage never becomes unhandled.
+    void pdf
+      .getPage(currentPage)
+      .then(async (page) => {
       if (renderTokenRef.current !== token) return;
 
       const unscaledViewport = page.getViewport({ scale: 1 });
@@ -479,14 +486,20 @@ export function PdfReader({
           pageLayer.style.height = `${viewport.height}px`;
           annotationLayer.style.setProperty("--scale-factor", String(viewport.scale));
           canvas.getContext("2d")?.drawImage(offscreen, 0, 0);
-          // Release the offscreen backing store immediately. Safari counts
-          // detached canvases against the tab budget until GC runs, so leaving
-          // them around is what eventually crashes the renderer.
+          // F06: release the offscreen backing store in a finally-equivalent
+          // path — both success and cancellation free the canvas.
           offscreen.width = 0;
           offscreen.height = 0;
+          displayedPageRef.current = currentPage;
           setRendering(false);
         })
-        .catch(() => {}); // Ignore cancellation
+        .catch(() => {
+          // Release even on cancellation/failure.
+          try {
+            offscreen.width = 0;
+            offscreen.height = 0;
+          } catch {}
+        }); // Ignore cancellation
 
       try {
         // Wait for the canvas swap so the layer renders against the new
@@ -516,9 +529,10 @@ export function PdfReader({
       } catch {
         annotationLayer.innerHTML = "";
       }
-    });
+      })
+      .catch(() => {});
 
-    // Save position
+    // Save position (displayed page, not merely requested).
     try {
       localStorage.setItem(posKey, JSON.stringify({ page: currentPage, ts: Date.now() }));
     } catch {}
@@ -526,11 +540,12 @@ export function PdfReader({
     // until the initial restore attempt settles so a slow/failed fetch can't
     // let this device's older page clobber newer server progress.
     if (totalPages > 0 && restoreSettledRef.current) {
+      const shown = displayedPageRef.current || currentPage;
       saveBookProgress(bookId, {
         format: "PDF",
-        location: String(currentPage),
-        percentage: (currentPage / totalPages) * 100,
-        finished: currentPage >= totalPages,
+        location: String(shown),
+        percentage: (shown / totalPages) * 100,
+        finished: shown >= totalPages,
       });
     }
     // Save zoom
@@ -551,6 +566,8 @@ export function PdfReader({
   ]);
 
   // Restore the signed-in user's server-side page once, after the doc loads.
+  // F03: ignore locators from a different format; fall back to local state
+  // with no reload loop.
   useEffect(() => {
     if (serverRestoredRef.current || isLoading || totalPages === 0) return;
     let cancelled = false;
@@ -569,7 +586,7 @@ export function PdfReader({
       // Catch-up save: a page turned while the gate was closed never entered
       // the debounced pending map; queue one canonical save for current state.
       if (!cancelled && totalPagesRef.current > 0) {
-        const page = currentPageRef.current;
+        const page = displayedPageRef.current || currentPageRef.current;
         const total = totalPagesRef.current;
         saveBookProgress(bookId, {
           format: "PDF",
@@ -579,11 +596,15 @@ export function PdfReader({
         });
       }
       if (cancelled || !record?.location) return;
+      if (record.format && record.format.toUpperCase() !== "PDF") return;
       const restored = Number.parseInt(record.location, 10);
       if (Number.isFinite(restored) && restored >= 1 && restored <= totalPages) {
         setCurrentPage(restored);
       }
-    })();
+    })().catch(() => {
+      serverRestoredRef.current = true;
+      restoreSettledRef.current = true;
+    });
 
     return () => {
       cancelled = true;

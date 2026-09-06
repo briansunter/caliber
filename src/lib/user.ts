@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { fetchJson } from "./http";
+import { clearPendingProgressOutbox } from "./reading-progress";
 
 export interface PublicUser {
   id: number;
@@ -25,6 +26,7 @@ export function useCurrentUser() {
     authRequired: query.data?.authRequired === true,
     needsSetup: query.data?.needsSetup === true,
     isLoading: query.isLoading,
+    isAuthExpired: query.error instanceof Error && /401/.test(query.error.message),
   };
 }
 
@@ -33,9 +35,26 @@ export interface Credentials {
   password: string;
 }
 
-function applySession(qc: ReturnType<typeof useQueryClient>, user: PublicUser) {
-  qc.setQueryData(USER_KEY, { user, authRequired: true, needsSetup: false });
+function switchPrincipal(qc: ReturnType<typeof useQueryClient>, user: PublicUser | null, authRequired: boolean) {
+  // Never replay the previous principal's queued progress writes.
+  clearPendingProgressOutbox();
+  // Drop principal-scoped caches; book/shelf keys are scoped by user id +
+  // library id so stale cross-account data cannot be served.
+  qc.removeQueries({ queryKey: ["books"] });
+  qc.removeQueries({ queryKey: ["stats"] });
+  qc.removeQueries({ queryKey: ["tags"] });
+  qc.removeQueries({ queryKey: ["reading-list"] });
+  qc.removeQueries({ queryKey: ["book"] });
+  if (user) {
+    qc.setQueryData(USER_KEY, { user, authRequired, needsSetup: false });
+  } else {
+    qc.setQueryData(USER_KEY, { user: null, authRequired, needsSetup: false });
+  }
   qc.invalidateQueries({ queryKey: ["reading-list"] });
+}
+
+function applySession(qc: ReturnType<typeof useQueryClient>, user: PublicUser) {
+  switchPrincipal(qc, user, true);
 }
 
 export function useAuthLogin() {
@@ -74,8 +93,7 @@ export function useLogin() {
         body: JSON.stringify({ username }),
       }),
     onSuccess: (data) => {
-      qc.setQueryData(USER_KEY, { user: data.user, authRequired: false, needsSetup: false });
-      qc.invalidateQueries({ queryKey: ["reading-list"] });
+      switchPrincipal(qc, data.user, false);
     },
   });
 }
@@ -85,6 +103,8 @@ export function useLogout() {
   return useMutation({
     mutationFn: () => fetchJson<{ ok: boolean }>("/api/user/logout", { method: "POST" }),
     onSuccess: () => {
+      // Clear the previous principal's outbox and principal-scoped caches.
+      switchPrincipal(qc, null, true);
       // Re-fetch rather than assume: with auth enabled the login screen
       // should return; without it the app stays open with no profile.
       qc.invalidateQueries({ queryKey: USER_KEY });

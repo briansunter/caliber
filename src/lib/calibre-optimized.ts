@@ -6,6 +6,7 @@ import {
   readFileSync,
   renameSync,
   realpathSync,
+  rmdirSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -27,6 +28,115 @@ let DB_PATH = join(LIBRARY_PATH, DB_NAME);
 const WORK_DIR = CONFIG_DIR_PATH;
 const WRITABLE_DB_PATH = join(WORK_DIR, "metadata.db");
 const DB_SOURCE_SIGNATURE_PATH = join(WORK_DIR, "metadata.source.json");
+// Cross-process snapshot lock: held (mkdir exclusive) only while publishing a
+// new generation so two processes never rename competing snapshots.
+const SNAPSHOT_LOCK_DIR = join(WORK_DIR, "snapshot.lock");
+
+// --- Snapshot generations (F15) -------------------------------------------
+// Every published snapshot is a generation: { id, path, revision }. New
+// generations are built in a tmp file and atomically renamed over
+// WRITABLE_DB_PATH, then published by bumping the pointer below. Readers hold
+// a lease (refcount) on the generation they started with so a refresh never
+// swaps the file under an active export; refresh is deferred while leases or
+// pool checkouts are held.
+export interface SnapshotGeneration {
+  id: number;
+  path: string;
+  revision: number;
+}
+
+let generationCounter = 0;
+let activeGeneration: SnapshotGeneration = {
+  id: 0,
+  path: WRITABLE_DB_PATH,
+  revision: 0,
+};
+const generationLeases = new Map<number, number>();
+const snapshotState: { refreshing: boolean; failed: string | null } = {
+  refreshing: false,
+  failed: null,
+};
+
+function activeLeaseCount(): number {
+  let total = 0;
+  for (const count of generationLeases.values()) total += count;
+  return total;
+}
+
+/** Hold the current generation for the duration of an export/stream. */
+export function acquireSnapshotLease(): () => void {
+  const id = activeGeneration.id;
+  generationLeases.set(id, (generationLeases.get(id) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const remaining = (generationLeases.get(id) ?? 1) - 1;
+    if (remaining <= 0) generationLeases.delete(id);
+    else generationLeases.set(id, remaining);
+    if (remaining <= 0 && activeCheckouts === 0 && refreshPending) {
+      refreshPending = false;
+      try {
+        runRefresh();
+      } catch (error) {
+        console.error(
+          "🔄 Deferred database refresh failed:",
+          error instanceof Error ? error.message : error,
+        );
+      }
+    }
+  };
+}
+
+/** Monotonic revision of the published snapshot; used for cache keys. */
+export function getSnapshotRevision(): number {
+  return activeGeneration.revision;
+}
+
+/** Status surface for the config/health endpoints. */
+export function getSnapshotStatus(): {
+  generation: number;
+  revision: number;
+  stale: boolean;
+  refreshing: boolean;
+  failed: string | null;
+} {
+  let stale = refreshPending || snapshotState.refreshing;
+  try {
+    const snapshot = readSnapshotMetadata();
+    const sig = getDatabaseSignature(DB_PATH);
+    stale =
+      stale || !snapshot || snapshot.sourcePath !== resolve(DB_PATH) || !isSameSignature(snapshot.signature, sig);
+  } catch {
+    // If stat fails we cannot prove freshness; report not-stale.
+  }
+  return {
+    generation: activeGeneration.id,
+    revision: activeGeneration.revision,
+    stale,
+    refreshing: snapshotState.refreshing,
+    failed: snapshotState.failed,
+  };
+}
+
+/** Cross-process lock via exclusive mkdir. Returns true if lock acquired. */
+export function acquireSnapshotLock(): boolean {
+  try {
+    mkdirSync(SNAPSHOT_LOCK_DIR);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+}
+
+export function releaseSnapshotLock(): void {
+  try {
+    rmdirSync(SNAPSHOT_LOCK_DIR);
+  } catch {
+    // ignore: lock already gone
+  }
+}
 
 interface SnapshotMetadata {
   sourcePath: string;
@@ -66,10 +176,13 @@ function copyDbToWritable(): void {
     if (existsSync(p)) unlinkSync(p);
   }
 
+  // Build the new generation in a tmp file, then atomically rename/publish it
+  // over WRITABLE_DB_PATH so readers never see a half-written snapshot.
+  const nextId = generationCounter + 1;
+  const temporaryPath = `${WRITABLE_DB_PATH}.gen-${nextId}.tmp-${process.pid}`;
   // SQLite can have committed changes in the source WAL. serialize() asks
   // SQLite for a consistent snapshot instead of copying only metadata.db.
   const sourceDb = new Database(DB_PATH, { readonly: true });
-  const temporaryPath = `${WRITABLE_DB_PATH}.tmp-${process.pid}`;
   try {
     const tables = new Set(
       (sourceDb.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map(
@@ -101,7 +214,16 @@ function copyDbToWritable(): void {
     DB_SOURCE_SIGNATURE_PATH,
     `${JSON.stringify({ sourcePath: resolve(DB_PATH), signature })}\n`,
   );
-  console.error(`📋 Copied database snapshot to ${WRITABLE_DB_PATH}`);
+  // Publish: bump the generation pointer only after the rename succeeded.
+  generationCounter = nextId;
+  activeGeneration = {
+    id: nextId,
+    path: WRITABLE_DB_PATH,
+    revision: activeGeneration.revision + 1,
+  };
+  console.error(
+    `📋 Copied database snapshot to ${WRITABLE_DB_PATH} (generation ${nextId}, revision ${activeGeneration.revision})`,
+  );
 }
 
 // Connection pool for concurrent requests
@@ -127,10 +249,25 @@ function notifyDbRefreshed(): void {
 }
 
 function swapDatabaseFile(): void {
-  closePool();
-  copyDbToWritable();
-  runFtsSetup();
-  notifyDbRefreshed();
+  if (!acquireSnapshotLock()) {
+    // Another process is publishing; mark stale and retry on the next tick.
+    refreshPending = true;
+    return;
+  }
+  snapshotState.refreshing = true;
+  snapshotState.failed = null;
+  try {
+    closePool();
+    copyDbToWritable();
+    runFtsSetup();
+    notifyDbRefreshed();
+  } catch (error) {
+    snapshotState.failed = error instanceof Error ? error.message : String(error);
+    throw error;
+  } finally {
+    snapshotState.refreshing = false;
+    releaseSnapshotLock();
+  }
 }
 
 function closePool(): void {
@@ -145,7 +282,9 @@ function closePool(): void {
 }
 
 function runRefresh(): void {
-  if (activeCheckouts > 0) {
+  // Defer while pool checkouts or generation leases (e.g. active exports)
+  // are held; the last release re-triggers the refresh.
+  if (activeCheckouts > 0 || activeLeaseCount() > 0) {
     refreshPending = true;
     return;
   }
@@ -155,7 +294,7 @@ function runRefresh(): void {
 /** Switch to a validated library selection without restarting the server. */
 export function reconfigureLibraryDatabase(): void {
   DB_PATH = join(LIBRARY_PATH, DB_NAME);
-  if (activeCheckouts > 0) {
+  if (activeCheckouts > 0 || activeLeaseCount() > 0) {
     refreshPending = true;
     return;
   }
@@ -224,6 +363,10 @@ function releaseDb(): void {
   }
 }
 
+// FTS index schema version, stored in caliber_fts_meta. Bump to force a
+// rebuild when the FTS definition changes.
+export const FTS_SCHEMA_VERSION = "2";
+
 function runFtsSetup(): void {
   const db = getDb();
 
@@ -231,15 +374,30 @@ function runFtsSetup(): void {
     const sourceSignature = getDatabaseSignature(DB_PATH);
     const sourceSignatureValue = JSON.stringify(sourceSignature);
 
-    // Expression indexes for keyset pagination (match LOWER() calls in WHERE clauses)
+    // Expression indexes for keyset pagination. Each index matches the
+    // normalized sort expression in BOOK_SORT_EXPRESSIONS exactly (same
+    // function calls, same argument order) so SQLite can seek instead of
+    // sorting. Aliases (b./r.) are stripped here — expression indexes must
+    // reference bare columns of the indexed table.
+    //
+    // EXPLAIN QUERY PLAN verification (per sort, ASC):
+    //   title:  SEARCH book_page USING INDEX idx_books_sort_key
+    //   author: SEARCH book_page USING INDEX idx_books_author_sort_key
+    //   added:  SEARCH book_page USING INDEX idx_books_timestamp_key
+    //   rating: SEARCH book_page USING INDEX idx_books_ratings_link_book,
+    //           then SEARCH r USING INDEX idx_ratings_value
+    // The explicit `sort_key >= ?` seek bound plus the
+    // `(key > ? OR (key = ? AND id > ?))` tie-break both resolve against
+    // these indexes; without the bound SQLite falls back to SCAN.
     db.exec(
-      `CREATE INDEX IF NOT EXISTS idx_books_sort_lower ON books(lower(sort), id);`,
+      `CREATE INDEX IF NOT EXISTS idx_books_sort_key ON books(COALESCE(NULLIF(lower(sort), ''), lower(title)), id);`,
     );
     db.exec(
-      `CREATE INDEX IF NOT EXISTS idx_books_author_sort_lower ON books(lower(author_sort), id);`,
+      `CREATE INDEX IF NOT EXISTS idx_books_author_sort_key ON books(COALESCE(lower(author_sort), ''), id);`,
     );
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_books_timestamp ON books(timestamp, id);`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_books_timestamp_key ON books(timestamp, id);`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_books_ratings_link_book ON books_ratings_link(book);`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_ratings_value ON ratings(rating, id);`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_data_format ON data(format);`);
 
     // Link-table indexes
@@ -281,16 +439,73 @@ function runFtsSetup(): void {
     const ftsCount = db.query("SELECT COUNT(*) as count FROM books_fts").get() as {
       count: number;
     };
-    const meta = db
-      .query("SELECT value FROM caliber_fts_meta WHERE key = 'source_signature'")
-      .get() as { value: string } | null;
+    const metaRows = db
+      .query("SELECT key, value FROM caliber_fts_meta WHERE key IN ('source_signature', 'fts_schema_version')")
+      .all() as Array<{ key: string; value: string }>;
+    const metaByKey = new Map(metaRows.map((row) => [row.key, row.value]));
+    const schemaVersion = metaByKey.get("fts_schema_version");
 
-    if (meta?.value !== sourceSignatureValue || ftsCount.count !== bookCount.count) {
+    // MATCH probes verify the FTS index actually answers queries, not just
+    // that the row COUNT(*) looks right (a corrupt/truncated FTS table can
+    // still report a plausible count).
+    function ftsProbesPass(): boolean {
+      try {
+        // Probe 1: an unlikely token must parse and return zero rows. If the
+        // FTS table is corrupt this throws ("no such table" /
+        // "database disk image is malformed").
+        const probe = db
+          .query(`SELECT rowid FROM books_fts WHERE books_fts MATCH ? LIMIT 1`)
+          .all('"caliber_fts_probe_xyzzy_unlikely"') as unknown[];
+        if (probe.length !== 0) return false;
+        // Probe 2: a known title token must match at least one row (skipped
+        // for empty libraries).
+        const titleRow = db.query("SELECT title FROM books LIMIT 1").get() as
+          | { title: string }
+          | undefined;
+        const token = titleRow?.title.toLowerCase().match(/[a-z0-9]{2,}/)?.[0];
+        if (token) {
+          const escaped = token.replace(/"/g, '""');
+          const hits = db
+            .query(`SELECT rowid FROM books_fts WHERE books_fts MATCH ? LIMIT 1`)
+            .all(`"${escaped}"*`) as unknown[];
+          if (hits.length === 0) return false;
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    if (
+      schemaVersion !== FTS_SCHEMA_VERSION ||
+      metaByKey.get("source_signature") !== sourceSignatureValue ||
+      ftsCount.count !== bookCount.count ||
+      !ftsProbesPass()
+    ) {
       console.error("🔍 Building FTS index...");
-      db.exec(`INSERT INTO books_fts(books_fts) VALUES('rebuild');`);
-      db.query(
-        "INSERT OR REPLACE INTO caliber_fts_meta (key, value) VALUES ('source_signature', ?)",
-      ).run(sourceSignatureValue);
+      // Publish atomically: rebuild + meta updates in one transaction so a
+      // crash never leaves a half-built index advertised as current.
+      db.exec("BEGIN IMMEDIATE;");
+      try {
+        db.exec(`INSERT INTO books_fts(books_fts) VALUES('rebuild');`);
+        db.query(
+          "INSERT OR REPLACE INTO caliber_fts_meta (key, value) VALUES ('source_signature', ?)",
+        ).run(sourceSignatureValue);
+        db.query("INSERT OR REPLACE INTO caliber_fts_meta (key, value) VALUES ('fts_schema_version', ?)").run(
+          FTS_SCHEMA_VERSION,
+        );
+        db.exec("COMMIT;");
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK;");
+        } catch {
+          // ignore rollback failure
+        }
+        throw error;
+      }
+      if (!ftsProbesPass()) {
+        throw new Error("FTS index rebuild failed verification probes");
+      }
     }
 
     const total = db.query("SELECT COUNT(*) as count FROM books_fts").get() as { count: number };
@@ -374,6 +589,7 @@ export interface BookListItem {
   isbn?: string;
   uuid?: string;
   path?: string;
+  last_modified?: string | null;
 }
 
 export interface BookWithDetails extends BookListItem {
@@ -423,6 +639,7 @@ interface BookRow {
   isbn: string;
   uuid: string;
   path: string;
+  last_modified: string | null;
   authors: string | null;
   tags: string | null;
   formats: string | null;
@@ -468,6 +685,9 @@ function parseBookRow(row: BookRow): BookListItem {
     pubdate: row.pubdate,
     timestamp: row.timestamp,
     rating: row.rating,
+    // F21: list queries select uuid so acquisition entries can use urn:uuid.
+    uuid: row.uuid || undefined,
+    last_modified: row.last_modified ?? null,
   };
 }
 
@@ -552,11 +772,14 @@ function isSafeLibraryPath(filePath: string): boolean {
 interface ListOptions {
   cursor?: string;
   limit?: number;
-  sortBy?: "title" | "author" | "added" | "rating";
+  sortBy?: "title" | "author" | "added" | "rating" | "series_index";
   sortOrder?: "asc" | "desc";
   // Tag IDs to filter by (OR logic: a book matches if it has ANY of these tags).
   // Combined with any search/FTS clause via AND.
   tagIds?: number[];
+  // F23: when true, exclude metadata-only books (no rows in data) at the
+  // query level. Used by OPDS acquisition feeds.
+  requireFormats?: boolean;
 }
 
 // Build a `b.id IN (...)` clause for OR-logic tag filtering, or "" if none valid.
@@ -578,7 +801,7 @@ function buildTagFilterClause(
   };
 }
 
-const SORT_FIELDS = ["title", "author", "added", "rating"] as const;
+const SORT_FIELDS = ["title", "author", "added", "rating", "series_index"] as const;
 
 type SortField = (typeof SORT_FIELDS)[number];
 
@@ -589,20 +812,34 @@ function normalizeSortBy(sortBy: ListOptions["sortBy"]): SortField {
   return "title";
 }
 
+// Normalized sort-key expressions, defined once. buildCursorSortExpression,
+// buildBookOrderBy, and appendBookCursorWhere must all use these exact
+// strings (plus the matching expression indexes in runFtsSetup) so ORDER BY,
+// cursor predicates, and index seeks agree byte-for-byte.
+const BOOK_SORT_EXPRESSIONS = {
+  title: `COALESCE(NULLIF(lower(b.sort), ''), lower(b.title))`,
+  author: `COALESCE(lower(b.author_sort), '')`,
+  added: `COALESCE(b.timestamp, '')`,
+  rating: `COALESCE(r.rating, 0)`,
+  series_index: `COALESCE(b.series_index, 1)`,
+} as const;
+
 // SQL expression computing the cursor sort key; must match buildBookOrderBy
 // and the cursor predicates in appendBookCursorWhere exactly.
 function buildCursorSortExpression(sortBy: SortField): string {
   switch (sortBy) {
     case "title":
-      return `COALESCE(NULLIF(lower(b.sort), ''), lower(b.title))`;
+      return BOOK_SORT_EXPRESSIONS.title;
     case "author":
-      return `COALESCE(lower(b.author_sort), '')`;
+      return BOOK_SORT_EXPRESSIONS.author;
     case "added":
-      return `COALESCE(b.timestamp, '')`;
+      return BOOK_SORT_EXPRESSIONS.added;
     case "rating":
-      return `COALESCE(r.rating, 0)`;
+      return BOOK_SORT_EXPRESSIONS.rating;
+    case "series_index":
+      return BOOK_SORT_EXPRESSIONS.series_index;
     default:
-      return `COALESCE(NULLIF(lower(b.sort), ''), lower(b.title))`;
+      return BOOK_SORT_EXPRESSIONS.title;
   }
 }
 
@@ -611,18 +848,17 @@ function buildBookOrderBy(
   sortOrder: NonNullable<ListOptions["sortOrder"]>,
 ): string {
   const dir = sortOrder.toUpperCase();
-  switch (sortBy) {
-    case "title":
-      return `ORDER BY COALESCE(NULLIF(lower(b.sort), ''), lower(b.title)) ${dir}, b.id ${dir}`;
-    case "author":
-      return `ORDER BY COALESCE(lower(b.author_sort), '') ${dir}, b.id ${dir}`;
-    case "added":
-      return `ORDER BY COALESCE(b.timestamp, '') ${dir}, b.id ${dir}`;
-    case "rating":
-      return `ORDER BY COALESCE(r.rating, 0) ${dir}, b.id ${dir}`;
-    default:
-      return `ORDER BY COALESCE(NULLIF(lower(b.sort), ''), lower(b.title)) ASC, b.id ASC`;
-  }
+  const expr =
+    sortBy === "author"
+      ? BOOK_SORT_EXPRESSIONS.author
+      : sortBy === "added"
+        ? BOOK_SORT_EXPRESSIONS.added
+        : sortBy === "rating"
+          ? BOOK_SORT_EXPRESSIONS.rating
+          : sortBy === "series_index"
+            ? BOOK_SORT_EXPRESSIONS.series_index
+            : BOOK_SORT_EXPRESSIONS.title;
+  return `ORDER BY ${expr} ${dir}, b.id ${dir}`;
 }
 
 function appendBookCursorWhere(
@@ -640,37 +876,37 @@ function appendBookCursorWhere(
   const sortBy = normalizeSortBy(options.sortBy);
   const sortOrder = options.sortOrder || "asc";
   const sortOp = sortOrder === "asc" ? ">" : "<";
+  // Explicit seek bound (sargable range edge) paired with the OR tie-break
+  // below: `key >= ? AND (key > ? OR (key = ? AND id > ?))` for ASC
+  // (`<=`/`<` for DESC). The bound lets SQLite range-seek on the matching
+  // expression index; the OR disjunct preserves exact keyset semantics.
+  const seekOp = sortOrder === "asc" ? ">=" : "<=";
+  const expr = buildCursorSortExpression(sortBy);
 
-  if (sortBy === "title") {
-    if (typeof cursorData.sort !== "string") {
-      throw new CursorError("Cursor sort value does not match title sort");
+  if (sortBy === "rating" || sortBy === "series_index") {
+    if (typeof cursorData.sort !== "number" || !Number.isFinite(cursorData.sort)) {
+      throw new CursorError(
+        sortBy === "rating"
+          ? "Cursor sort value does not match rating sort"
+          : "Cursor sort value does not match series_index sort",
+      );
     }
-    params.push(cursorData.sort, cursorData.sort, cursorData.id);
-    return `${bookWhere} AND (COALESCE(NULLIF(lower(b.sort), ''), lower(b.title)) ${sortOp} ? OR (COALESCE(NULLIF(lower(b.sort), ''), lower(b.title)) = ? AND b.id ${sortOp} ?))`;
+    const ratingVal = cursorData.sort;
+    params.push(ratingVal, ratingVal, ratingVal, cursorData.id);
+    return `${bookWhere} AND ${expr} ${seekOp} ? AND (${expr} ${sortOp} ? OR (${expr} = ? AND b.id ${sortOp} ?))`;
   }
 
-  if (sortBy === "author") {
-    if (typeof cursorData.sort !== "string") {
-      throw new CursorError("Cursor sort value does not match author sort");
-    }
-    params.push(cursorData.sort, cursorData.sort, cursorData.id);
-    return `${bookWhere} AND (COALESCE(lower(b.author_sort), '') ${sortOp} ? OR (COALESCE(lower(b.author_sort), '') = ? AND b.id ${sortOp} ?))`;
+  const expectedError =
+    sortBy === "author"
+      ? "Cursor sort value does not match author sort"
+      : sortBy === "added"
+        ? "Cursor sort value does not match added sort"
+        : "Cursor sort value does not match title sort";
+  if (typeof cursorData.sort !== "string") {
+    throw new CursorError(expectedError);
   }
-
-  if (sortBy === "added") {
-    if (typeof cursorData.sort !== "string") {
-      throw new CursorError("Cursor sort value does not match added sort");
-    }
-    params.push(cursorData.sort, cursorData.sort, cursorData.id);
-    return `${bookWhere} AND (COALESCE(b.timestamp, '') ${sortOp} ? OR (COALESCE(b.timestamp, '') = ? AND b.id ${sortOp} ?))`;
-  }
-
-  if (typeof cursorData.sort !== "number" || !Number.isFinite(cursorData.sort)) {
-    throw new CursorError("Cursor sort value does not match rating sort");
-  }
-  const ratingVal = cursorData.sort;
-  params.push(ratingVal, ratingVal, cursorData.id);
-  return `${bookWhere} AND (COALESCE(r.rating, 0) ${sortOp} ? OR (COALESCE(r.rating, 0) = ? AND b.id ${sortOp} ?))`;
+  params.push(cursorData.sort, cursorData.sort, cursorData.sort, cursorData.id);
+  return `${bookWhere} AND ${expr} ${seekOp} ? AND (${expr} ${sortOp} ? OR (${expr} = ? AND b.id ${sortOp} ?))`;
 }
 
 function listBooksWithWhere(
@@ -686,91 +922,156 @@ function listBooksWithWhere(
     const dir = sortOrder.toUpperCase();
     const params = [...initialParams];
     const needsRatingInCte = sortBy === "rating";
-    // OR-logic tag filter is part of the base predicate (inside the book_page CTE's
-    // WHERE), so it composes with search/FTS via AND and is covered by idx_books_tags_link_tag.
+    // OR-logic tag filter is part of the base predicate (inside the page
+    // query's WHERE), so it composes with search/FTS via AND and is covered
+    // by idx_books_tags_link_tag.
     const tagFilter = buildTagFilterClause(options.tagIds);
     const baseWhere =
       tagFilter.clause.length > 0 ? `${initialWhere} AND ${tagFilter.clause}` : initialWhere;
     if (tagFilter.ids.length > 0) params.push(...tagFilter.ids);
-    const bookWhere = appendBookCursorWhere(baseWhere, params, options);
+    // F23: exclude metadata-only books (no formats) at the query level.
+    const formatsWhere = options.requireFormats
+      ? `${baseWhere} AND EXISTS (SELECT 1 FROM data d WHERE d.book = b.id)`
+      : baseWhere;
+    const bookWhere = appendBookCursorWhere(formatsWhere, params, options);
     const bookOrderBy = buildBookOrderBy(sortBy, sortOrder);
 
-    let query: string;
-
+    // Phase 1: fetch just the page of IDs (+ cursor sort keys). No fan-out
+    // joins here, so the keyset seek stays O(log n) regardless of how many
+    // authors/tags/formats each book has.
+    interface PageRow {
+      id: number;
+      cursor_sort: string | number;
+      rating_val?: number | null;
+    }
+    let pageQuery: string;
     if (needsRatingInCte) {
-      // Include rating join inside the CTE so ORDER BY and WHERE can reference it
-      query = `
-        WITH book_page AS (
-          SELECT b.id, b.title, b.sort, b.author_sort, b.series_index, b.has_cover, b.pubdate, b.timestamp,
-                 COALESCE(r.rating, 0) AS rating_val,
-                 COALESCE(r.rating, 0) AS cursor_sort
-          FROM books b
-          LEFT JOIN books_ratings_link brl ON b.id = brl.book
-          LEFT JOIN ratings r ON brl.rating = r.id
-          ${bookWhere}
-          ORDER BY COALESCE(r.rating, 0) ${dir}, b.id ${dir}
-          LIMIT ${limit + 1}
-        )
-        SELECT
-          b.id, b.title, b.sort, b.author_sort, b.series_index, b.has_cover, b.pubdate, b.timestamp,
-          b.cursor_sort,
-          s.name as series,
-          b.rating_val as rating,
-          json_group_array(DISTINCT a.name) FILTER (WHERE a.name IS NOT NULL) as authors,
-          json_group_array(DISTINCT t.name) FILTER (WHERE t.name IS NOT NULL) as tags,
-          json_group_array(DISTINCT d.format) FILTER (WHERE d.format IS NOT NULL) as formats
-        FROM book_page b
-        LEFT JOIN books_authors_link bal ON b.id = bal.book
-        LEFT JOIN authors a ON bal.author = a.id
-        LEFT JOIN books_series_link bsl ON b.id = bsl.book
-        LEFT JOIN series s ON bsl.series = s.id
-        LEFT JOIN books_tags_link btl ON b.id = btl.book
-        LEFT JOIN tags t ON btl.tag = t.id
-        LEFT JOIN data d ON b.id = d.book
-        GROUP BY b.id
-        ORDER BY b.rating_val ${dir}, b.id ${dir}
-      `;
-    } else {
-      query = `
-        WITH book_page AS (
-          SELECT b.id, b.title, b.sort, b.author_sort, b.series_index, b.has_cover, b.pubdate, b.timestamp,
-                 ${buildCursorSortExpression(sortBy)} AS cursor_sort
-          FROM books b
-          ${bookWhere}
-          ${bookOrderBy}
-          LIMIT ${limit + 1}
-        )
-        SELECT
-          b.id, b.title, b.sort, b.author_sort, b.series_index, b.has_cover, b.pubdate, b.timestamp,
-          b.cursor_sort,
-          s.name as series,
-          r.rating,
-          json_group_array(DISTINCT a.name) FILTER (WHERE a.name IS NOT NULL) as authors,
-          json_group_array(DISTINCT t.name) FILTER (WHERE t.name IS NOT NULL) as tags,
-          json_group_array(DISTINCT d.format) FILTER (WHERE d.format IS NOT NULL) as formats
-        FROM book_page b
-        LEFT JOIN books_authors_link bal ON b.id = bal.book
-        LEFT JOIN authors a ON bal.author = a.id
-        LEFT JOIN books_series_link bsl ON b.id = bsl.book
-        LEFT JOIN series s ON bsl.series = s.id
-        LEFT JOIN books_tags_link btl ON b.id = btl.book
-        LEFT JOIN tags t ON btl.tag = t.id
-        LEFT JOIN data d ON b.id = d.book
+      // Include rating join inside the page query so ORDER BY and WHERE can
+      // reference it (expression index idx_ratings_value covers the seek).
+      pageQuery = `
+        SELECT b.id, COALESCE(r.rating, 0) AS rating_val,
+               COALESCE(r.rating, 0) AS cursor_sort
+        FROM books b
         LEFT JOIN books_ratings_link brl ON b.id = brl.book
         LEFT JOIN ratings r ON brl.rating = r.id
-        GROUP BY b.id
+        ${bookWhere}
+        ORDER BY COALESCE(r.rating, 0) ${dir}, b.id ${dir}
+        LIMIT ${limit + 1}
+      `;
+    } else {
+      pageQuery = `
+        SELECT b.id, ${buildCursorSortExpression(sortBy)} AS cursor_sort
+        FROM books b
+        ${bookWhere}
         ${bookOrderBy}
+        LIMIT ${limit + 1}
       `;
     }
 
-    const rows = db.query(query).all(...params) as BookRow[];
+    const pageRows = db.query(pageQuery).all(...params) as PageRow[];
+    const hasMore = pageRows.length > limit;
+    const page = pageRows.slice(0, limit);
+    if (page.length === 0) {
+      return { items: [], nextCursor: null, hasMore };
+    }
+    const ids = page.map((row) => row.id);
+    const placeholders = ids.map(() => "?").join(",");
 
-    const hasMore = rows.length > limit;
-    const rawItems = rows.slice(0, limit);
-    const items = rawItems.map(parseBookRow);
+    // Phase 2: base columns + series/rating for exactly this page.
+    interface BaseRow {
+      id: number;
+      title: string;
+      sort: string | null;
+      author_sort: string | null;
+      series_index: number;
+      has_cover: number;
+      pubdate: string;
+      timestamp: string;
+      last_modified: string | null;
+      uuid: string;
+      series: string | null;
+      rating: number | null;
+    }
+    const baseRows = db
+      .query(
+        `SELECT b.id, b.title, b.sort, b.author_sort, b.series_index, b.has_cover,
+                b.pubdate, b.timestamp, b.last_modified, b.uuid, s.name as series, r.rating
+         FROM books b
+         LEFT JOIN books_series_link bsl ON b.id = bsl.book
+         LEFT JOIN series s ON bsl.series = s.id
+         LEFT JOIN books_ratings_link brl ON b.id = brl.book
+         LEFT JOIN ratings r ON brl.rating = r.id
+         WHERE b.id IN (${placeholders})`,
+      )
+      .all(...ids) as BaseRow[];
+    const baseById = new Map<number, BaseRow>();
+    for (const row of baseRows) baseById.set(row.id, row);
 
-    const lastRawRow = hasMore ? rawItems[rawItems.length - 1] : undefined;
-    const nextCursor = lastRawRow ? encodeCursor(lastRawRow, sortBy) : null;
+    // Phase 3: one aggregate query per multi-valued facet (authors, tags,
+    // formats) over the page's IDs — avoids the fan-out of joining all link
+    // tables in a single GROUP BY.
+    function loadFacet(sql: string): Map<number, string[]> {
+      const rows = db.query(sql).all(...ids) as Array<{ book: number; name: string }>;
+      const byId = new Map<number, string[]>();
+      for (const row of rows) {
+        if (row.name == null) continue;
+        const label = String(row.name).trim();
+        if (!label) continue;
+        const list = byId.get(row.book);
+        if (list) {
+          if (!list.includes(label)) list.push(label);
+        } else {
+          byId.set(row.book, [label]);
+        }
+      }
+      return byId;
+    }
+    const authorsById = loadFacet(
+      `SELECT bal.book as book, a.name as name FROM books_authors_link bal JOIN authors a ON bal.author = a.id WHERE bal.book IN (${placeholders})`,
+    );
+    const tagsById = loadFacet(
+      `SELECT btl.book as book, t.name as name FROM books_tags_link btl JOIN tags t ON btl.tag = t.id WHERE btl.book IN (${placeholders})`,
+    );
+    const formatsById = loadFacet(
+      `SELECT d.book as book, d.format as name FROM data d WHERE d.book IN (${placeholders})`,
+    );
+
+    const ratingById = new Map<number, number | null>();
+    for (const row of page) {
+      if (typeof row.rating_val === "number") ratingById.set(row.id, row.rating_val);
+    }
+
+    const items: BookListItem[] = [];
+    for (const row of page) {
+      const base = baseById.get(row.id);
+      if (!base) continue;
+      items.push({
+        id: base.id,
+        title: base.title,
+        sort: base.sort,
+        author_sort: base.author_sort,
+        authors: authorsById.get(base.id) ?? [],
+        series: base.series,
+        series_index: base.series_index,
+        tags: tagsById.get(base.id) ?? [],
+        formats: formatsById.get(base.id) ?? [],
+        has_cover: Boolean(base.has_cover),
+        pubdate: base.pubdate,
+        timestamp: base.timestamp,
+        rating: ratingById.get(base.id) ?? base.rating,
+        uuid: base.uuid || undefined,
+        last_modified: base.last_modified ?? null,
+      });
+    }
+
+    const lastPageRow = hasMore ? page[page.length - 1] : undefined;
+    const nextCursor =
+      lastPageRow && items.length > 0
+        ? encodeCursor(
+            { ...baseById.get(lastPageRow.id), id: lastPageRow.id, cursor_sort: lastPageRow.cursor_sort } as BookRow,
+            sortBy,
+          )
+        : null;
 
     return {
       items,
@@ -840,8 +1141,9 @@ export function listBooksBySeriesCursor(
   seriesId: number,
   options: ListOptions = {},
 ): CursorPaginatedResult<BookListItem> {
+  // F25: series feeds default to series_index order (ORDER BY series_index, id).
   return listBooksWithWhere(
-    options,
+    { sortOrder: "asc", ...options, sortBy: options.sortBy ?? "series_index" },
     "WHERE b.id IN (SELECT book FROM books_series_link WHERE series = ?)",
     [seriesId],
   );
@@ -885,6 +1187,7 @@ export function getBookByIdOptimized(id: number): BookWithDetails | null {
           b.has_cover,
           b.pubdate,
           b.timestamp,
+          b.last_modified,
           isbn_identifier.val as isbn,
           b.uuid,
           b.path
@@ -903,6 +1206,7 @@ export function getBookByIdOptimized(id: number): BookWithDetails | null {
         b.has_cover,
         b.pubdate,
         b.timestamp,
+        b.last_modified,
         b.isbn,
         b.uuid,
         b.path,
@@ -934,6 +1238,87 @@ export function getBookByIdOptimized(id: number): BookWithDetails | null {
     if (!row) return null;
 
     return parseBookDetailsRow(row);
+  } finally {
+    releaseDb();
+  }
+}
+
+// Batched book-details lookup: single WHERE id IN (...) base query plus one
+// aggregate query per multi-valued facet, instead of one getBookByIdOptimized
+// round-trip per row. Returns a map of found books by id.
+export function getBooksByIdsOptimized(ids: number[]): Map<number, BookWithDetails> {
+  const seen = new Set<number>();
+  for (const id of ids) {
+    if (Number.isSafeInteger(id) && id > 0) seen.add(id);
+    if (seen.size >= 500) break;
+  }
+  const unique = Array.from(seen);
+  const found = new Map<number, BookWithDetails>();
+  if (unique.length === 0) return found;
+
+  const db = getDb();
+  try {
+    const placeholders = unique.map(() => "?").join(",");
+    const baseRows = db
+      .query(
+        `SELECT
+           b.id, b.title, b.sort, b.author_sort, b.series_index, b.has_cover,
+           b.pubdate, b.timestamp, b.last_modified,
+           isbn_identifier.val as isbn, b.uuid, b.path,
+           s.name as series, r.rating, p.name as publisher, c.text as comments
+         FROM books b
+         LEFT JOIN identifiers isbn_identifier
+           ON b.id = isbn_identifier.book
+           AND isbn_identifier.type = 'isbn'
+         LEFT JOIN books_series_link bsl ON b.id = bsl.book
+         LEFT JOIN series s ON bsl.series = s.id
+         LEFT JOIN books_ratings_link brl ON b.id = brl.book
+         LEFT JOIN ratings r ON brl.rating = r.id
+         LEFT JOIN books_publishers_link bpl ON b.id = bpl.book
+         LEFT JOIN publishers p ON bpl.publisher = p.id
+         LEFT JOIN comments c ON b.id = c.book
+         WHERE b.id IN (${placeholders})`,
+      )
+      .all(...unique) as BookRow[];
+
+    const facet = (sql: string): Map<number, string[]> => {
+      const rows = db.query(sql).all(...unique) as Array<{ book: number; name: string }>;
+      const byId = new Map<number, string[]>();
+      for (const row of rows) {
+        if (row.name == null) continue;
+        const label = String(row.name).trim();
+        if (!label) continue;
+        const list = byId.get(row.book);
+        if (list) {
+          if (!list.includes(label)) list.push(label);
+        } else {
+          byId.set(row.book, [label]);
+        }
+      }
+      return byId;
+    };
+    const authorsById = facet(
+      `SELECT bal.book as book, a.name as name FROM books_authors_link bal JOIN authors a ON bal.author = a.id WHERE bal.book IN (${placeholders})`,
+    );
+    const tagsById = facet(
+      `SELECT btl.book as book, t.name as name FROM books_tags_link btl JOIN tags t ON btl.tag = t.id WHERE btl.book IN (${placeholders})`,
+    );
+    const formatsById = facet(
+      `SELECT d.book as book, d.format as name FROM data d WHERE d.book IN (${placeholders})`,
+    );
+
+    for (const row of baseRows) {
+      found.set(
+        row.id,
+        parseBookDetailsRow({
+          ...row,
+          authors: JSON.stringify(authorsById.get(row.id) ?? []),
+          tags: JSON.stringify(tagsById.get(row.id) ?? []),
+          formats: JSON.stringify(formatsById.get(row.id) ?? []),
+        }),
+      );
+    }
+    return found;
   } finally {
     releaseDb();
   }

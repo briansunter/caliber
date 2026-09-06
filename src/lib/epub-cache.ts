@@ -1,8 +1,8 @@
 import JSZip from "jszip";
-import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { dirname, join, normalize, sep } from "node:path";
-import { CONFIG_DIR_PATH } from "./config";
-import { getBookFormatPath } from "./calibre-optimized";
+import { CONFIG_DIR_PATH, LIBRARY_PATH } from "./config";
+import { getBookFormatPath, getLibraryPath, getSnapshotRevision } from "./calibre-optimized";
 import { type SourceSignature, getSourceSignature, isSameSignature } from "./file-signature";
 
 const EPUB_CACHE_DIR = join(CONFIG_DIR_PATH, "epub-cache");
@@ -10,6 +10,74 @@ const CACHE_META_FILE = ".caliber-epub-cache.json";
 const MAX_OPEN_EPUBS = 3;
 const MAX_EPUB_BYTES = 256 * 1024 * 1024;
 const MAX_EPUB_ENTRY_BYTES = 32 * 1024 * 1024;
+const MAX_EPUB_CACHE_BYTES = 1024 * 1024 * 1024;
+
+const activeEpubLeases = new Set<string>();
+
+export function acquireEpubLease(cacheDir: string): () => void {
+  activeEpubLeases.add(cacheDir);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    activeEpubLeases.delete(cacheDir);
+  };
+}
+
+function epubCacheSizeBytes(): number {
+  let total = 0;
+  try {
+    for (const book of readdirSync(EPUB_CACHE_DIR, { withFileTypes: true })) {
+      if (!book.isDirectory()) continue;
+      const dir = join(EPUB_CACHE_DIR, book.name);
+      try {
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+          if (!entry.isFile()) continue;
+          try {
+            total += statSync(join(dir, entry.name)).size;
+          } catch { /* ignore */ }
+        }
+      } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+  return total;
+}
+
+export function sweepEpubCacheQuota(): void {
+  try {
+    if (epubCacheSizeBytes() <= MAX_EPUB_CACHE_BYTES) return;
+    const dirs = readdirSync(EPUB_CACHE_DIR, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => {
+        const dir = join(EPUB_CACHE_DIR, e.name);
+        let mtime = 0;
+        try {
+          mtime = statSync(dir).mtimeMs;
+        } catch { /* ignore */ }
+        return { dir, mtime };
+      })
+      .sort((a, b) => a.mtime - b.mtime);
+    for (const { dir } of dirs) {
+      if (epubCacheSizeBytes() <= MAX_EPUB_CACHE_BYTES) break;
+      if (activeEpubLeases.has(dir)) continue;
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+}
+
+export function epubSingleFlightKey(bookId: number, op: string, entryPath: string): string {
+  let library = "";
+  let rev = 0;
+  try {
+    library = getLibraryPath();
+  } catch { /* ignore */ }
+  try {
+    rev = getSnapshotRevision();
+  } catch { /* ignore */ }
+  return `${library}|${bookId}|${rev}|${op}|${entryPath}`;
+}
 
 export class EpubCacheError extends Error {
   constructor(
@@ -40,8 +108,9 @@ async function readCacheSignature(cacheDir: string): Promise<SourceSignature | n
 }
 
 function rememberOpenEpub(epubPath: string, cached: CachedZip): void {
-  openEpubs.delete(epubPath);
-  openEpubs.set(epubPath, cached);
+  const key = openCacheKey(epubPath);
+  openEpubs.delete(key);
+  openEpubs.set(key, cached);
 
   while (openEpubs.size > MAX_OPEN_EPUBS) {
     const oldestKey = openEpubs.keys().next().value;
@@ -50,14 +119,21 @@ function rememberOpenEpub(epubPath: string, cached: CachedZip): void {
   }
 }
 
+function openCacheKey(epubPath: string): string {
+  // F04: key the open-epub LRU by library + path so library switches can't
+  // reuse another library's open archive for the same book id.
+  return `${LIBRARY_PATH}::${epubPath}`;
+}
+
 async function getOpenEpub(epubPath: string, signature: SourceSignature): Promise<JSZip> {
-  const cached = openEpubs.get(epubPath);
+  const key = openCacheKey(epubPath);
+  const cached = openEpubs.get(key);
   if (cached && isSameSignature(cached.signature, signature)) {
     rememberOpenEpub(epubPath, cached);
     return cached.zip;
   }
 
-  openEpubs.delete(epubPath);
+  openEpubs.delete(key);
 
   try {
     if (statSync(epubPath).size > MAX_EPUB_BYTES) {
@@ -112,7 +188,7 @@ async function ensureEpubCache(bookId: number): Promise<{
 
   const cacheDir = join(EPUB_CACHE_DIR, String(bookId));
 
-  const signature = await runSingleFlight(`epub:${bookId}`, async () => {
+  const signature = await runSingleFlight(`${LIBRARY_PATH}::epub:${bookId}`, async () => {
     const current = getSourceSignature(epubPath);
     const cachedSignature = await readCacheSignature(cacheDir);
     if (!isSameSignature(cachedSignature, current)) {
@@ -137,28 +213,62 @@ async function extractEpubEntry(
   if (!target) return null;
   if (existsSync(target)) return target;
 
-  const zip = await getOpenEpub(epubPath, signature);
-  const entry = zip.files[entryPath];
-  if (!entry || entry.dir) return null;
+  const releaseLease = acquireEpubLease(cacheDir);
+  try {
+    return await runSingleFlight(epubSingleFlightKey(0, "extractEpubEntry", `${epubPath}:${entryPath}`), async () => {
+      // Recheck after acquiring the singleflight slot: another worker may
+      // have published while we waited.
+      if (existsSync(target)) return target;
+      // Never publish entries for a stale generation: if the source changed
+      // while we waited, abort instead of writing under the old signature.
+      const fresh = getSourceSignature(epubPath);
+      if (!isSameSignature(fresh, signature)) return null;
 
-  const uncompressedSize = (entry as { _data?: { uncompressedSize?: number } })._data
-    ?.uncompressedSize;
-  if (uncompressedSize && uncompressedSize > MAX_EPUB_ENTRY_BYTES) {
-    throw new EpubCacheError("EPUB resource is too large", 413, "entry_too_large");
-  }
+      const zip = await getOpenEpub(epubPath, signature);
+      const entry = zip.files[entryPath];
+      if (!entry || entry.dir) return null;
 
-  mkdirSync(dirname(target), { recursive: true });
-  const data = await entry.async("uint8array");
-  if (data.byteLength > MAX_EPUB_ENTRY_BYTES) {
-    throw new EpubCacheError("EPUB resource is too large", 413, "entry_too_large");
-  }
-  await Bun.write(target, data);
-  const existingSignature = await readCacheSignature(cacheDir);
-  if (!isSameSignature(existingSignature, signature)) {
-    await Bun.write(join(cacheDir, CACHE_META_FILE), `${JSON.stringify(signature)}\n`);
-  }
+      // Per-entry uncompressed cap BEFORE retaining/extracting bytes: check
+      // the central-directory size plus the running total is implicit here
+      // (single entry), abort before entry.async allocates.
+      const uncompressedSize = (entry as { _data?: { uncompressedSize?: number } })._data
+        ?.uncompressedSize;
+      if (typeof uncompressedSize === "number" && uncompressedSize > MAX_EPUB_ENTRY_BYTES) {
+        throw new EpubCacheError("EPUB resource is too large", 413, "entry_too_large");
+      }
 
-  return target;
+      mkdirSync(dirname(target), { recursive: true });
+      const data = await entry.async("uint8array");
+      if (data.byteLength > MAX_EPUB_ENTRY_BYTES) {
+        throw new EpubCacheError("EPUB resource is too large", 413, "entry_too_large");
+      }
+      // Write to tmp.$pid then rename so readers never see a half-written file.
+      const tmpPath = `${target}.tmp-${process.pid}`;
+      await Bun.write(tmpPath, data);
+      // Recheck generation before publish: never publish a stale generation.
+      const beforePublish = getSourceSignature(epubPath);
+      if (!isSameSignature(beforePublish, signature)) {
+        try { rmSync(tmpPath, { force: true }); } catch { /* ignore */ }
+        return null;
+      }
+      try {
+        renameSync(tmpPath, target);
+      } catch {
+        // Cross-device or racing rename fallback: rewrite atomically.
+        await Bun.write(target, data);
+        try { rmSync(tmpPath, { force: true }); } catch { /* ignore */ }
+      }
+      const existingSignature = await readCacheSignature(cacheDir);
+      if (!isSameSignature(existingSignature, signature)) {
+        await Bun.write(join(cacheDir, CACHE_META_FILE), `${JSON.stringify(signature)}\n`);
+      }
+      sweepEpubCacheQuota();
+
+      return target;
+    });
+  } finally {
+    releaseLease();
+  }
 }
 
 export async function getEpubEntryPath(bookId: number, entryPath: string): Promise<string | null> {

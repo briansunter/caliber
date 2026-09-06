@@ -1,26 +1,148 @@
 import JSZip from "jszip";
 import { createExtractorFromData } from "node-unrar-js/esm";
-import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { basename, extname, join } from "node:path";
-import { CONFIG_DIR_PATH } from "./config";
-import { getBookFormatPath } from "./calibre-optimized";
+import { CONFIG_DIR_PATH, LIBRARY_PATH } from "./config";
+import { getBookFormatPath, getLibraryPath, getSnapshotRevision } from "./calibre-optimized";
 import { getPathContentType } from "./book-files";
 import { runSingleFlight } from "./epub-cache";
 import { type SourceSignature, getSourceSignature, isSameSignature } from "./file-signature";
 
 const PAGE_CACHE_DIR = join(CONFIG_DIR_PATH, "page-cache");
 const CACHE_META_FILE = ".caliber-page-cache.json";
-const IMAGE_EXTENSIONS = new Set([".avif", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"]);
+// SVG pages are disallowed: inline SVG served as image/svg+xml can execute
+// embedded scripts in the reader's origin. SVG entries are skipped (and
+// logged) instead of extracted.
+const IMAGE_EXTENSIONS = new Set([".avif", ".gif", ".jpeg", ".jpg", ".png", ".webp"]);
+const SKIPPED_SVG_EXTENSION = ".svg";
 const MAX_ARCHIVE_BYTES = 512 * 1024 * 1024;
 const MAX_PAGE_COUNT = 10_000;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024;
+const MAX_IMAGE_PIXELS = 40_000_000;
 const COMMAND_TIMEOUT_MS = 30_000;
+
+// Global job semaphore: max 3 concurrent PDF renders, max 2 archive extracts.
+class JobSemaphore {
+  private running = 0;
+  private readonly queue: Array<() => void> = [];
+
+  constructor(private readonly max: number) {}
+
+  async run<T>(task: () => Promise<T>): Promise<T> {
+    if (this.running >= this.max) {
+      await new Promise<void>((resolve) => this.queue.push(resolve));
+    }
+    this.running += 1;
+    try {
+      return await task();
+    } finally {
+      this.running -= 1;
+      const next = this.queue.shift();
+      if (next) next();
+    }
+  }
+}
+
+export const pdfRenderSemaphore = new JobSemaphore(3);
+export const archiveExtractSemaphore = new JobSemaphore(2);
+
+const activePageLeases = new Set<string>();
+
+export function acquirePageLease(path: string): () => void {
+  activePageLeases.add(path);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    activePageLeases.delete(path);
+  };
+}
+
+export function pageSingleFlightKey(bookId: number, op: string, page: string): string {
+  let library = "";
+  let rev = 0;
+  try {
+    library = getLibraryPath();
+  } catch { /* ignore */ }
+  try {
+    rev = getSnapshotRevision();
+  } catch { /* ignore */ }
+  return `${library}|${bookId}|${rev}|${op}|${page}`;
+}
+
+/** Pixel-count guard via PNG IHDR header without a full decode. */
+export function assertPixelCountGuard(data: Uint8Array, fileName: string): void {
+  if (extname(fileName).toLowerCase() !== ".png" || data.byteLength < 33) return;
+  if (
+    data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47 &&
+    data[12] === 0x49 && data[13] === 0x48 && data[14] === 0x44 && data[15] === 0x52
+  ) {
+    const w = (((data[16] ?? 0) * 2 ** 24 + (data[17] ?? 0) * 2 ** 16 + (data[18] ?? 0) * 2 ** 8 + (data[19] ?? 0)) >>> 0);
+    const h = (((data[20] ?? 0) * 2 ** 24 + (data[21] ?? 0) * 2 ** 16 + (data[22] ?? 0) * 2 ** 8 + (data[23] ?? 0)) >>> 0);
+    if (Number.isFinite(w) && Number.isFinite(h) && w * h > MAX_IMAGE_PIXELS) {
+      throw new PageStreamingError(413, "Page image exceeds the pixel-count limit");
+    }
+  }
+}
+
+function entryUncompressedSize(entry: unknown): number | null {
+  const size = (entry as { _data?: { uncompressedSize?: number } })._data?.uncompressedSize;
+  return typeof size === "number" && Number.isFinite(size) ? size : null;
+}
+
+export function sweepPageCacheQuota(): void {
+  try {
+    const books = readdirSync(PAGE_CACHE_DIR, { withFileTypes: true });
+    const files: Array<{ path: string; mtime: number }> = [];
+    let total = 0;
+    for (const book of books) {
+      if (!book.isDirectory()) continue;
+      const bookDir = join(PAGE_CACHE_DIR, book.name);
+      let formats: Array<{ isDirectory(): boolean; name: string }>;
+      try {
+        formats = readdirSync(bookDir, { withFileTypes: true }) as unknown as Array<{ isDirectory(): boolean; name: string }>;
+      } catch { continue; }
+      for (const fmt of formats) {
+        if (!fmt.isDirectory()) continue;
+        const dir = join(bookDir, fmt.name);
+        let entries: string[];
+        try {
+          entries = readdirSync(dir);
+        } catch { continue; }
+        for (const entry of entries) {
+          if (entry === CACHE_META_FILE) continue;
+          const p = join(dir, entry);
+          if (activePageLeases.has(p)) continue;
+          try {
+            const st = statSync(p);
+            total += st.size;
+            files.push({ path: p, mtime: st.mtimeMs });
+          } catch { /* ignore */ }
+        }
+      }
+    }
+    if (total <= MAX_CACHE_BYTES) return;
+    files.sort((a, b) => a.mtime - b.mtime);
+    for (const { path } of files) {
+      if (total <= MAX_CACHE_BYTES) break;
+      if (activePageLeases.has(path)) continue;
+      try {
+        total -= statSync(path).size;
+      } catch { /* ignore */ }
+      try {
+        rmSync(path, { force: true });
+      } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+}
 
 interface CachedPage {
   index: number;
   name: string;
   fileName: string;
   contentType: string;
+  /** Full archive entry path for lazy on-demand extraction (CBZ). */
+  sourceName?: string;
 }
 
 interface PageCacheMeta {
@@ -66,7 +188,9 @@ interface MetaMemEntry {
 const metaMemCache = new Map<string, MetaMemEntry>();
 
 function metaCacheKey(bookId: number, format: string): string {
-  return `${bookId}/${format.toUpperCase()}`;
+  // F04: scope the in-memory + singleflight key by library so switching
+  // libraries never serves another library's validated meta.
+  return `${LIBRARY_PATH}::${bookId}/${format.toUpperCase()}`;
 }
 
 async function readJson<T>(path: string): Promise<T | null> {
@@ -142,6 +266,12 @@ async function ensureCbzCache(bookId: number): Promise<{ cacheDir: string; meta:
     mkdirSync(cacheDir, { recursive: true });
 
     const zip = await JSZip.loadAsync(await Bun.file(sourcePath).arrayBuffer());
+    const skippedSvg = Object.values(zip.files).filter(
+      (entry) => !entry.dir && extname(entry.name).toLowerCase() === SKIPPED_SVG_EXTENSION,
+    ).length;
+    if (skippedSvg > 0) {
+      console.warn(`[page-streaming] skipped ${skippedSvg} SVG page(s) in CBZ source`);
+    }
     const imageEntries = Object.values(zip.files)
       .filter((entry) => !entry.dir && IMAGE_EXTENSIONS.has(extname(entry.name).toLowerCase()))
       .sort((a, b) => sortPageNames(a.name, b.name));
@@ -154,23 +284,31 @@ async function ensureCbzCache(bookId: number): Promise<{ cacheDir: string; meta:
     }
 
     const pages: CachedPage[] = [];
-    let extractedBytes = 0;
+    // Cumulative cap check BEFORE retaining any bytes: sum central-directory
+    // uncompressed sizes first and abort before entry.async allocates.
+    let declaredTotal = 0;
+    for (const entry of imageEntries) {
+      const declared = entryUncompressedSize(entry);
+      if (declared !== null) {
+        if (declared > MAX_CACHE_BYTES) {
+          throw new PageStreamingError(413, "CBZ expands beyond the reader cache limit");
+        }
+        declaredTotal += declared;
+        if (declaredTotal > MAX_CACHE_BYTES) {
+          throw new PageStreamingError(413, "CBZ expands beyond the reader cache limit");
+        }
+      }
+    }
     for (const [offset, entry] of imageEntries.entries()) {
       const index = offset + 1;
       const ext = extname(entry.name).toLowerCase() || ".bin";
       const fileName = `${String(index).padStart(5, "0")}${ext}`;
-      const outputPath = join(cacheDir, fileName);
-      const data = await entry.async("uint8array");
-      extractedBytes += data.byteLength;
-      if (extractedBytes > MAX_CACHE_BYTES) {
-        throw new PageStreamingError(413, "CBZ expands beyond the reader cache limit");
-      }
-      await Bun.write(outputPath, data);
       pages.push({
         index,
         name: basename(entry.name),
         fileName,
         contentType: getPathContentType(fileName),
+        sourceName: entry.name,
       });
     }
 
@@ -184,6 +322,72 @@ async function ensureCbzCache(bookId: number): Promise<{ cacheDir: string; meta:
 
     return { cacheDir, meta };
   });
+}
+
+/**
+ * Lazily extract a single CBZ page on demand. The manifest lists entry names
+ * without extracting all bytes; bytes are materialized per page under the
+ * archive semaphore with pre-retain caps, pixel guard, and atomic publish.
+ */
+async function extractCbzPage(
+  bookId: number,
+  cacheDir: string,
+  meta: PageCacheMeta,
+  sourcePath: string,
+  source: SourceSignature,
+  pageNumber: number,
+): Promise<PageFile> {
+  const cachedPage = meta.pages[pageNumber - 1];
+  if (!cachedPage) throw new PageStreamingError(404, "Page not found");
+  const outputPath = join(cacheDir, cachedPage.fileName);
+  if (existsSync(outputPath)) {
+    return { path: outputPath, contentType: cachedPage.contentType };
+  }
+  return runSingleFlight(pageSingleFlightKey(bookId, "cbz", String(pageNumber)), () =>
+    archiveExtractSemaphore.run(async () => {
+      if (existsSync(outputPath)) {
+        return { path: outputPath, contentType: cachedPage.contentType };
+      }
+      // Never publish for a stale generation.
+      const fresh = getSourceSignature(sourcePath);
+      if (!isSameSignature(fresh, source)) {
+        throw new PageStreamingError(409, "Reader source changed during extraction");
+      }
+      const zip = await JSZip.loadAsync(await Bun.file(sourcePath).arrayBuffer());
+      const entryName = cachedPage.sourceName
+        ?? Object.values(zip.files).find((e) => basename(e.name) === cachedPage.name)?.name;
+      const entry = entryName ? zip.files[entryName] : undefined;
+      if (!entry || entry.dir) throw new PageStreamingError(404, "Page not found");
+      const declared = entryUncompressedSize(entry);
+      if (declared !== null && declared > MAX_CACHE_BYTES) {
+        throw new PageStreamingError(413, "CBZ expands beyond the reader cache limit");
+      }
+      const data = await entry.async("uint8array");
+      if (data.byteLength > MAX_CACHE_BYTES) {
+        throw new PageStreamingError(413, "CBZ expands beyond the reader cache limit");
+      }
+      assertPixelCountGuard(data, cachedPage.fileName);
+      const tmpPath = `${outputPath}.tmp-${process.pid}`;
+      await Bun.write(tmpPath, data);
+      const beforePublish = getSourceSignature(sourcePath);
+      if (!isSameSignature(beforePublish, source)) {
+        try {
+          rmSync(tmpPath, { force: true });
+        } catch { /* ignore */ }
+        throw new PageStreamingError(409, "Reader source changed during extraction");
+      }
+      try {
+        renameSync(tmpPath, outputPath);
+      } catch {
+        await Bun.write(outputPath, data);
+        try {
+          rmSync(tmpPath, { force: true });
+        } catch { /* ignore */ }
+      }
+      sweepPageCacheQuota();
+      return { path: outputPath, contentType: cachedPage.contentType };
+    }),
+  );
 }
 
 async function getUnrarWasmBinary(): Promise<ArrayBuffer> {
@@ -227,7 +431,15 @@ async function ensureCbrCache(bookId: number): Promise<{ cacheDir: string; meta:
       wasmBinary: await getUnrarWasmBinary(),
     });
     const list = extractor.getFileList();
-    const imageNames = [...list.fileHeaders]
+    // fileHeaders is a one-shot generator: materialize once and reuse.
+    const fileHeaders = [...list.fileHeaders];
+    const skippedSvg = fileHeaders.filter(
+      (header) => !header.flags.directory && extname(header.name).toLowerCase() === SKIPPED_SVG_EXTENSION,
+    ).length;
+    if (skippedSvg > 0) {
+      console.warn(`[page-streaming] skipped ${skippedSvg} SVG page(s) in CBR source`);
+    }
+    const imageNames = fileHeaders
       .filter((header) => !header.flags.directory && IMAGE_EXTENSIONS.has(extname(header.name).toLowerCase()))
       .map((header) => header.name)
       .sort(sortPageNames);
@@ -240,7 +452,9 @@ async function ensureCbrCache(bookId: number): Promise<{ cacheDir: string; meta:
     }
 
     const imageNameSet = new Set(imageNames);
-    const extracted = extractor.extract({ files: (header) => imageNameSet.has(header.name) });
+    const extracted = await archiveExtractSemaphore.run(async () =>
+      extractor.extract({ files: (header) => imageNameSet.has(header.name) }),
+    );
     const extractedPages = new Map<string, Uint8Array>();
     for (const file of extracted.files) {
       if (file.extraction) {
@@ -248,6 +462,20 @@ async function ensureCbrCache(bookId: number): Promise<{ cacheDir: string; meta:
       }
     }
 
+    // Per-entry + cumulative cap checks BEFORE retaining: bound the total
+    // before writing any file.
+    let declaredTotal = 0;
+    for (const name of imageNames) {
+      const data = extractedPages.get(name);
+      if (!data) continue;
+      if (data.byteLength > MAX_CACHE_BYTES) {
+        throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
+      }
+      declaredTotal += data.byteLength;
+      if (declaredTotal > MAX_CACHE_BYTES) {
+        throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
+      }
+    }
     const pages: CachedPage[] = [];
     let extractedBytes = 0;
     for (const [offset, name] of imageNames.entries()) {
@@ -261,7 +489,25 @@ async function ensureCbrCache(bookId: number): Promise<{ cacheDir: string; meta:
       const index = offset + 1;
       const ext = extname(name).toLowerCase() || ".bin";
       const fileName = `${String(index).padStart(5, "0")}${ext}`;
-      await Bun.write(join(cacheDir, fileName), data);
+      assertPixelCountGuard(data, fileName);
+      const outputPath = join(cacheDir, fileName);
+      const tmpPath = `${outputPath}.tmp-${process.pid}`;
+      await Bun.write(tmpPath, data);
+      const beforePublish = getSourceSignature(sourcePath);
+      if (!isSameSignature(beforePublish, source)) {
+        try {
+          rmSync(tmpPath, { force: true });
+        } catch { /* ignore */ }
+        throw new PageStreamingError(409, "Reader source changed during extraction");
+      }
+      try {
+        renameSync(tmpPath, outputPath);
+      } catch {
+        await Bun.write(outputPath, data);
+        try {
+          rmSync(tmpPath, { force: true });
+        } catch { /* ignore */ }
+      }
       pages.push({
         index,
         name: basename(name),
@@ -269,6 +515,7 @@ async function ensureCbrCache(bookId: number): Promise<{ cacheDir: string; meta:
         contentType: getPathContentType(fileName),
       });
     }
+    sweepPageCacheQuota();
 
     if (pages.length === 0) {
       throw new PageStreamingError(422, "CBR pages could not be extracted");
@@ -411,30 +658,84 @@ async function ensurePdfCache(bookId: number): Promise<{ cacheDir: string; sourc
 }
 
 async function getPdfPageFile(bookId: number, page: number): Promise<PageFile> {
-  const { cacheDir, sourcePath, pageCount } = await ensurePdfCache(bookId);
+  const { cacheDir, sourcePath, source, pageCount } = await ensurePdfCache(bookId);
   const pageNumber = normalizePageNumber(page, pageCount);
   const outputPrefix = join(cacheDir, String(pageNumber).padStart(5, "0"));
   const outputPath = `${outputPrefix}.png`;
 
-  if (!existsSync(outputPath)) {
-    await runCommand(PDFTOPPM_BIN, [
-      "-f",
-      String(pageNumber),
-      "-l",
-      String(pageNumber),
-      "-singlefile",
-      "-png",
-      "-r",
-      "150",
-      sourcePath,
-      outputPrefix,
-    ]);
+  if (existsSync(outputPath)) {
+    return {
+      path: outputPath,
+      contentType: "image/png",
+    };
   }
 
-  return {
-    path: outputPath,
-    contentType: "image/png",
-  };
+  // Per-key singleflight: library|book|rev|op|page shares one render.
+  return runSingleFlight(pageSingleFlightKey(bookId, "pdf", String(pageNumber)), () =>
+    pdfRenderSemaphore.run(async () => {
+      if (existsSync(outputPath)) {
+        return { path: outputPath, contentType: "image/png" };
+      }
+      const fresh = getSourceSignature(sourcePath);
+      if (!isSameSignature(fresh, source)) {
+        throw new PageStreamingError(409, "Reader source changed during rendering");
+      }
+      // Render to tmp.$pid prefix then rename so readers never see partial PNGs.
+      const tmpPrefix = `${outputPrefix}.tmp-${process.pid}`;
+      const tmpPath = `${tmpPrefix}.png`;
+      try {
+        rmSync(tmpPath, { force: true });
+      } catch { /* ignore */ }
+      await runCommand(PDFTOPPM_BIN, [
+        "-f",
+        String(pageNumber),
+        "-l",
+        String(pageNumber),
+        "-singlefile",
+        "-png",
+        "-r",
+        "150",
+        sourcePath,
+        tmpPrefix,
+      ]);
+      // Recheck generation before publish: never publish a stale generation.
+      const beforePublish = getSourceSignature(sourcePath);
+      if (!isSameSignature(beforePublish, source)) {
+        try {
+          rmSync(tmpPath, { force: true });
+        } catch { /* ignore */ }
+        throw new PageStreamingError(409, "Reader source changed during rendering");
+      }
+      if (!existsSync(tmpPath)) {
+        throw new PageStreamingError(500, "Page extraction failed");
+      }
+      try {
+        const rendered = await Bun.file(tmpPath).arrayBuffer();
+        assertPixelCountGuard(new Uint8Array(rendered), outputPath);
+      } catch (error) {
+        if (error instanceof PageStreamingError) {
+          try {
+            rmSync(tmpPath, { force: true });
+          } catch { /* ignore */ }
+          throw error;
+        }
+      }
+      try {
+        renameSync(tmpPath, outputPath);
+      } catch {
+        await Bun.write(outputPath, await Bun.file(tmpPath).arrayBuffer());
+        try {
+          rmSync(tmpPath, { force: true });
+        } catch { /* ignore */ }
+      }
+      sweepPageCacheQuota();
+
+      return {
+        path: outputPath,
+        contentType: "image/png",
+      };
+    }),
+  );
 }
 
 function unsupportedFormat(format: string): never {
@@ -500,11 +801,9 @@ export async function getPageFile(bookId: number, formatParam: string, page: num
     const pageNumber = normalizePageNumber(page, meta.pageCount);
     const cachedPage = meta.pages[pageNumber - 1];
     if (!cachedPage) throw new PageStreamingError(404, "Page not found");
-
-    return {
-      path: join(cacheDir, cachedPage.fileName),
-      contentType: cachedPage.contentType,
-    };
+    const sourcePath = getSourcePath(bookId, format);
+    const source = getSourceSignature(sourcePath);
+    return extractCbzPage(bookId, cacheDir, meta, sourcePath, source, pageNumber);
   }
 
   if (format === "CBR") {

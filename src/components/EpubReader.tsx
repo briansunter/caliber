@@ -16,10 +16,14 @@ import {
   Wifi,
   Maximize,
   Minimize,
+  ChevronLeft,
+  ChevronRight,
+  Hand,
+  BookOpen,
 } from "lucide-react";
 import { stored } from "@/lib/utils";
 import { useFullscreen } from "@/lib/use-fullscreen";
-import { flushBookProgress, fetchBookProgress, saveBookProgress } from "@/lib/reading-progress";
+import { flushBookProgress, fetchBookProgress, saveBookProgress, progressPosKey, readScopedPos } from "@/lib/reading-progress";
 import {
   getNextReaderLoadMode,
   type ReaderLoadMode,
@@ -109,8 +113,11 @@ function isZipArchive(data: ArrayBuffer): boolean {
   return bytes[0] === 0x50 && bytes[1] === 0x4b;
 }
 
-async function fetchFileBytes(url: string, range?: string): Promise<ArrayBuffer> {
-  const response = await fetch(url, range ? { headers: { Range: range } } : undefined);
+async function fetchFileBytes(url: string, range?: string, signal?: AbortSignal): Promise<ArrayBuffer> {
+  const response = await fetch(url, {
+    ...(range ? { headers: { Range: range } } : {}),
+    ...(signal ? { signal } : {}),
+  });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.arrayBuffer();
 }
@@ -292,7 +299,67 @@ export function EpubReader({
   const [theme, setTheme] = useState<ReaderTheme>(() =>
     stored("caliber-reader-theme", "light" as ReaderTheme),
   );
+  // Touch/click navigation zones: narrow 15% edges turn pages, the center
+  // 70% is interactive book content. In "read" mode a center tap toggles the
+  // toolbars; in "interact" mode the center is fully pass-through so links
+  // and selections inside the book always work.
+  type TouchMode = "read" | "interact";
+  const [touchMode, setTouchMode] = useState<TouchMode>(() =>
+    stored("caliber-touch-mode", "read" as TouchMode),
+  );
   const [isTouchDevice] = useState(() => window.matchMedia("(hover: none)").matches);
+  const [settingsReturnFocus, setSettingsReturnFocus] = useState<HTMLElement | null>(null);
+  const settingsDialogRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("caliber-touch-mode", JSON.stringify(touchMode));
+    } catch {}
+  }, [touchMode]);
+
+  const openSettings = useCallback(() => {
+    setSettingsReturnFocus(document.activeElement as HTMLElement | null);
+    setShowToc(false);
+    setShowSettings(true);
+  }, []);
+
+  const closeSettings = useCallback(() => {
+    setShowSettings(false);
+    // Return focus to the opener for screen-reader continuity.
+    settingsReturnFocus?.focus?.();
+  }, [settingsReturnFocus]);
+
+  // Focus trap + Esc handling for the settings dialog primitive.
+  useEffect(() => {
+    if (!showSettings) return;
+    const dialog = settingsDialogRef.current;
+    dialog?.querySelector<HTMLElement>("button")?.focus();
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        closeSettings();
+        return;
+      }
+      if (e.key !== "Tab" || !dialog) return;
+      const focusables = dialog.querySelectorAll<HTMLElement>(
+        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+      );
+      const items = Array.from(focusables).filter((el) => !el.hasAttribute("disabled"));
+      if (items.length === 0) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (!first || !last) return;
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => document.removeEventListener("keydown", onKeyDown, true);
+  }, [showSettings, closeSettings]);
   const { isFullscreen, supported: fullscreenSupported, toggle: toggleFullscreen } = useFullscreen();
   const fontSizeRef = useRef(fontSize);
   const themeRef = useRef(theme);
@@ -300,7 +367,7 @@ export function EpubReader({
   const showTocRef = useRef(showToc);
   const onBackRef = useRef(onBack);
 
-  const posKey = `caliber-pos-${bookId}-epub`;
+  const posKey = progressPosKey(bookId, "epub");
 
   const toggleUI = useCallback(() => {
     setShowUI((p) => !p);
@@ -353,6 +420,7 @@ export function EpubReader({
   useEffect(() => {
     if (!viewerRef.current) return;
     let cancelled = false;
+    const abort = new AbortController();
     let keyHandler: ((e: KeyboardEvent) => void) | null = null;
     let contentHandlers: Array<[string, (e: Event) => void]> = [];
 
@@ -367,7 +435,8 @@ export function EpubReader({
       try {
         let book: Book;
         if (loadMode === "stream") {
-          const prefix = await fetchFileBytes(fullUrl, "bytes=0-2047");
+          const prefix = await fetchFileBytes(fullUrl, "bytes=0-2047", abort.signal);
+          if (abort.signal.aborted || cancelled) return;
           if (!isZipArchive(prefix)) {
             const html = await loadHtmlFallback(fullUrl, prefix);
             if (!html) throw new Error("Invalid EPUB archive");
@@ -379,11 +448,14 @@ export function EpubReader({
             return;
           }
 
-          const container = await fetch(streamEntryUrl(streamUrl, "META-INF/container.xml"));
+          const container = await fetch(streamEntryUrl(streamUrl, "META-INF/container.xml"), {
+            signal: abort.signal,
+          });
           if (!container.ok) throw new Error(await errorText(container));
           book = ePub(streamUrl, { openAs: "directory" });
         } else {
-          const data = await fetchFileBytes(fullUrl);
+          const data = await fetchFileBytes(fullUrl, undefined, abort.signal);
+          if (abort.signal.aborted || cancelled) return;
           if (!isZipArchive(data)) {
             const html = decodeMaybeHtml(data);
             if (!html) throw new Error("Invalid EPUB archive");
@@ -449,7 +521,9 @@ export function EpubReader({
         });
 
         // Restore position: prefer the signed-in user's server progress, then
-        // fall back to this device's localStorage.
+        // fall back to this device's localStorage. F03: a locator from a
+        // different format is ignored (local default, no reload loop).
+        // F04: scoped key first, legacy key as fallback.
         let savedCfi: string | null = null;
         let timerId: ReturnType<typeof setTimeout> | null = null;
         const serverProgress = await Promise.race([
@@ -460,12 +534,26 @@ export function EpubReader({
         ]);
         if (timerId) clearTimeout(timerId);
         restoreSettledRef.current = true;
-        if (serverProgress?.location) savedCfi = serverProgress.location;
+        if (
+          serverProgress?.location &&
+          (!serverProgress.format || serverProgress.format.toUpperCase() === "EPUB")
+        ) {
+          savedCfi = serverProgress.location;
+        }
         if (!savedCfi) {
           try {
-            const s = localStorage.getItem(posKey);
-            if (s) savedCfi = JSON.parse(s).cfi;
+            const scoped = readScopedPos<{ cfi?: string }>(bookId, "epub", {});
+            if (scoped?.cfi) savedCfi = scoped.cfi;
+            else {
+              const s = localStorage.getItem(posKey);
+              if (s) savedCfi = JSON.parse(s).cfi;
+            }
           } catch {}
+        }
+        // F03: validate CFI shape before restoring; garbage never reaches display().
+        if (savedCfi && !savedCfi.startsWith("epubcfi(")) {
+          // Allow localStorage's raw CFI variants but drop numeric page strings.
+          if (/^\d+$/.test(savedCfi.trim())) savedCfi = null;
         }
 
         await rendition.display(savedCfi || undefined);
@@ -501,8 +589,9 @@ export function EpubReader({
           .catch(() => {});
 
         const navigateFromPointer = (clientX: number, viewportWidth: number) => {
-          if (clientX < viewportWidth * 0.3) rendition.prev();
-          else if (clientX > viewportWidth * 0.7) rendition.next();
+          // Narrow 15% edge zones turn pages; the center 70% is interactive.
+          if (clientX < viewportWidth * 0.15) rendition.prev();
+          else if (clientX > viewportWidth * 0.85) rendition.next();
           else toggleUI();
         };
 
@@ -587,7 +676,7 @@ export function EpubReader({
         rendition.on("keyup", keyHandler);
         document.addEventListener("keyup", keyHandler);
       } catch (error) {
-        if (cancelled) return;
+        if (cancelled || abort.signal.aborted) return;
 
         if (loadMode === "stream") {
           setLoadMode("full");
@@ -599,10 +688,11 @@ export function EpubReader({
       }
     }
 
-    void openBook();
+    void openBook().catch(() => {});
 
     return () => {
       cancelled = true;
+      abort.abort();
       if (keyHandler) document.removeEventListener("keyup", keyHandler);
       flushBookProgress(bookId);
       const r = renditionRef.current;
@@ -694,15 +784,17 @@ export function EpubReader({
         </div>
       )}
 
-      {/* Header */}
+      {/* Header overlay: position fixed so immersive mode never reserves
+          flex space or shifts the page layout. */}
       <div
-        className="shrink-0 z-[108] transition-transform duration-200"
+        className="fixed top-0 left-0 right-0 z-[108] transition-transform duration-200"
         style={{
           transform: showUI ? "translateY(0)" : "translateY(-100%)",
           background: barBg,
           backdropFilter: "blur(12px)",
           borderBottom: `1px solid ${subtle}`,
           paddingTop: "env(safe-area-inset-top, 0px)",
+          pointerEvents: showUI ? "auto" : "none",
         }}
       >
         <div className="flex items-center justify-between px-3 h-12">
@@ -763,8 +855,25 @@ export function EpubReader({
             </button>
             <button
               type="button"
-              onClick={() => setShowSettings((s) => !s)}
+              onClick={() => setTouchMode((m) => (m === "read" ? "interact" : "read"))}
+              className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs active:opacity-60"
+              style={{ color: fg }}
+              aria-label={touchMode === "read" ? "Reading mode: tap center toggles toolbars" : "Interact mode: center passes through to book content"}
+              aria-pressed={touchMode === "interact"}
+              title={touchMode === "read" ? "Switch to Interact mode" : "Switch to Read mode"}
+            >
+              {touchMode === "read" ? (
+                <BookOpen className="h-4 w-4" />
+              ) : (
+                <Hand className="h-4 w-4" />
+              )}
+              <span className="hidden sm:inline">{touchMode === "read" ? "Read" : "Interact"}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => (showSettings ? closeSettings() : openSettings())}
               aria-label="Reader settings"
+              aria-haspopup="dialog"
               title="Reader settings"
               className="p-2 -mr-1 rounded-lg active:opacity-60"
               style={{ color: fg }}
@@ -792,9 +901,11 @@ export function EpubReader({
         {/* Real-DOM tap zones over the book. epub.js renders into an iframe
             whose in-page click/touch handlers fire unreliably on iOS Safari, so
             on touch devices navigation and toolbar-toggle live here instead:
-            wide left/right thirds page back/forward, the center third always
-            toggles the bars (so you can never get stuck with the toolbar
-            hidden). Desktop keeps the in-iframe handlers — they work with a
+            narrow 15% left/right edges page back/forward, the center 70% is
+            interactive book content — in Read mode a center tap toggles the
+            bars (so you can never get stuck with the toolbar hidden), in
+            Interact mode the center is fully pass-through for links and
+            selection. Desktop keeps the in-iframe handlers — they work with a
             mouse and preserve clicking links inside the book. */}
         {!isLoading && !htmlDocument && isTouchDevice && (
           <>
@@ -802,36 +913,69 @@ export function EpubReader({
               type="button"
               aria-label="Previous page"
               title="Previous page"
-              className="absolute left-0 top-0 bottom-0 z-[106] w-[30%] cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none"
+              className="absolute left-0 top-0 bottom-0 z-[106] w-[15%] cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none"
               onClick={() => renditionRef.current?.prev()}
             />
-            <button
-              type="button"
-              aria-label={showUI ? "Hide toolbars" : "Show toolbars"}
-              title={showUI ? "Hide toolbars" : "Show toolbars"}
-              className="absolute left-[30%] top-0 bottom-0 z-[106] w-[40%] cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none"
-              onClick={toggleUI}
-            />
+            {touchMode === "read" ? (
+              <button
+                type="button"
+                aria-label={showUI ? "Hide toolbars" : "Show toolbars"}
+                title={showUI ? "Hide toolbars" : "Show toolbars"}
+                className="absolute left-[15%] top-0 bottom-0 z-[106] w-[70%] cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none"
+                onClick={toggleUI}
+              />
+            ) : (
+              <div aria-hidden="true" className="absolute left-[15%] top-0 bottom-0 z-[105] w-[70%] pointer-events-none" />
+            )}
             <button
               type="button"
               aria-label="Next page"
               title="Next page"
-              className="absolute right-0 top-0 bottom-0 z-[106] w-[30%] cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none"
+              className="absolute right-0 top-0 bottom-0 z-[106] w-[15%] cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none"
               onClick={() => renditionRef.current?.next()}
             />
           </>
         )}
       </div>
 
-      {/* Footer */}
+      {/* Persistent accessible page controls: always available, including in
+          immersive mode and for keyboard / screen-reader users. */}
+      {!isLoading && !loadError && (
+        <div className="fixed bottom-4 left-0 right-0 z-[107] flex items-center justify-between px-4 pointer-events-none">
+          <button
+            type="button"
+            onClick={() => renditionRef.current?.prev()}
+            aria-label="Previous page"
+            title="Previous page"
+            className="pointer-events-auto w-11 h-11 rounded-full flex items-center justify-center shadow-lg active:opacity-70"
+            style={{ color: fg, background: barBg, border: `1px solid ${subtle}` }}
+          >
+            <ChevronLeft className="h-5 w-5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => renditionRef.current?.next()}
+            aria-label="Next page"
+            title="Next page"
+            className="pointer-events-auto w-11 h-11 rounded-full flex items-center justify-center shadow-lg active:opacity-70"
+            style={{ color: fg, background: barBg, border: `1px solid ${subtle}` }}
+          >
+            <ChevronRight className="h-5 w-5" />
+          </button>
+        </div>
+      )}
+
+      {/* Footer overlay: position fixed so immersive mode never reserves
+          flex space or shifts the page layout. */}
       <div
-        className="shrink-0 z-[108] transition-transform duration-200"
+        className="fixed bottom-0 left-0 right-0 z-[108] transition-transform duration-200"
         style={{
           transform: showUI ? "translateY(0)" : "translateY(100%)",
           background: barBg,
           backdropFilter: "blur(12px)",
           borderTop: `1px solid ${subtle}`,
           paddingBottom: "env(safe-area-inset-bottom, 0px)",
+          pointerEvents: showUI ? "auto" : "none",
         }}
       >
         <div className="px-4 py-3">
@@ -850,20 +994,26 @@ export function EpubReader({
               {pageInfo ? ` (${pageInfo.current} / ${pageInfo.total})` : ""}
             </span>
             <span>{isTouchDevice ? "Tap edges to turn pages" : "Click edges or use ← → keys"}</span>
+            <span>{touchMode === "read" ? "Read mode" : "Interact mode"}</span>
           </div>
         </div>
       </div>
 
-      {/* Settings panel */}
+      {/* Settings dialog primitive: role=dialog + aria-modal with a focus
+          trap and Esc handling (see effect above). */}
       {showSettings && (
         <>
           <button
             type="button"
             aria-label="Close settings"
             className="fixed inset-0 z-[109] cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none block w-full h-full"
-            onClick={() => setShowSettings(false)}
+            onClick={closeSettings}
           />
           <div
+            ref={settingsDialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Reader settings"
             className="absolute bottom-0 left-0 right-0 z-[110] rounded-t-2xl shadow-2xl"
             style={{
               background: isDark ? "#1e1e1e" : "#ffffff",
@@ -872,7 +1022,19 @@ export function EpubReader({
             }}
           >
             <div className="p-5 space-y-5">
-              <div className="w-10 h-1 rounded-full mx-auto" style={{ background: subtle }} />
+              <div className="flex items-center justify-between">
+                <div className="w-10 h-1 rounded-full" style={{ background: subtle }} />
+                <button
+                  type="button"
+                  onClick={closeSettings}
+                  aria-label="Close settings"
+                  title="Close settings"
+                  className="p-1.5 rounded-lg active:opacity-60"
+                  style={{ color: fg }}
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
 
               {/* Font size */}
               <div className="flex items-center justify-between">

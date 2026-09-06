@@ -134,7 +134,7 @@ const SeriesCell = memo(function SeriesCell({
   return (
     <div className="flex flex-col gap-0.5 min-w-0">
       <span className="text-ink-tertiary truncate">{series}</span>
-      <span className="text-xs text-ink-muted">Book {seriesIndex || 1}</span>
+      <span className="text-xs text-ink-muted">Book {seriesIndex ?? 1}</span>
     </div>
   );
 });
@@ -258,18 +258,25 @@ const TableRow = memo(function TableRow({ book }: TableRowProps) {
 });
 
 // Empty state
-const EmptyState = memo(function EmptyState({ searchQuery }: { searchQuery: string }) {
+const EmptyState = memo(function EmptyState({ searchQuery, reason }: { searchQuery: string; reason?: string | null }) {
+  const heading =
+    reason === "empty-library" ? "Your library is empty" : reason === "offline" ? "You're offline" : reason === "auth-expired" ? "Session expired" : "No books found";
+  const hint = searchQuery
+    ? `No books match "${searchQuery}". Try a different search term.`
+    : reason === "empty-library"
+      ? "Your library is empty. Add some books to get started."
+      : reason === "offline"
+        ? "Check your connection and try again."
+        : reason === "auth-expired"
+          ? "Please sign in again to continue browsing."
+          : "No books match the current filters.";
   return (
     <div className="flex flex-col items-center justify-center h-64 text-center px-8">
       <div className="w-14 h-14 rounded-full bg-parchment-dark flex items-center justify-center mb-3 border border-ink">
         <Search className="h-5 w-5 text-ink-muted" strokeWidth={1.5} />
       </div>
-      <h3 className="text-base font-semibold text-ink mb-1">No books found</h3>
-      <p className="text-sm text-ink-tertiary">
-        {searchQuery
-          ? `No books match "${searchQuery}". Try a different search term.`
-          : "Your library is empty. Add some books to get started."}
-      </p>
+      <h3 className="text-base font-semibold text-ink mb-1">{heading}</h3>
+      <p className="text-sm text-ink-tertiary">{hint}</p>
     </div>
   );
 });
@@ -392,14 +399,19 @@ export const TableHeader = memo(function TableHeader({
 });
 
 export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, sortConfig, tagIds }: BookTableInfiniteProps) {
-  const { books, hasNextPage, fetchNextPage, isFetchingNextPage, isLoading, isError, error, refetch } =
-    useFlattenedBooks(searchQuery, sortConfig, tagIds);
+  const {
+    books, totalCount, retainedCount, windowTruncated, hasNextPage, fetchNextPage,
+    isFetchingNextPage, isFetchNextPageError, isLoading, isError, error, errorStage,
+    isPlaceholder, emptyReason, isAuthExpired, isOffline, refetch,
+  } = useFlattenedBooks(searchQuery, sortConfig, tagIds);
 
-  // Set up window virtualizer - uses window scroll
+  // Set up window virtualizer - uses window scroll. scrollMargin keeps the
+  // restored/focused row clear of the sticky search + table headers.
   const virtualizer = useWindowVirtualizer({
     count: books.length,
     estimateSize: useCallback(() => ROW_HEIGHT, []),
     overscan: 20,
+    scrollMargin: 140,
     scrollPaddingStart: 200,
     useFlushSync: false,
   });
@@ -424,15 +436,75 @@ export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, 
     }
   }, [shouldFetch]);
 
-  // Scroll to top when search or sort changes (skip initial mount for scroll restoration)
-  const hasMountedTable = useRef(false);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional - scroll to top when search/sort/tags change
+  // Persist the top-visible book anchor (id + offset) for content-based
+  // restore instead of a raw pixel offset.
   useEffect(() => {
-    if (hasMountedTable.current) {
-      window.scrollTo({ top: 0 });
-    }
-    hasMountedTable.current = true;
-  }, [searchQuery, sortConfig, tagIds]);
+    let raf = 0;
+    let cancelled = false;
+    const onScroll = () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        if (cancelled) return;
+        try {
+          const start = virtualizer.range?.startIndex ?? 0;
+          const anchor = books[start];
+          if (anchor) {
+            sessionStorage.setItem(
+              "caliber-scroll",
+              JSON.stringify({ id: anchor.id, offset: window.scrollY % ROW_HEIGHT }),
+            );
+          }
+        } catch {}
+      });
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf);
+      window.removeEventListener("scroll", onScroll);
+    };
+  }, [books, virtualizer]);
+
+  // Anchor restore: fetch the required window before scrolling. Cancelled on
+  // unmount or when the query identity changes.
+  const restoreKey = `${searchQuery}|${sortConfig.field}|${sortConfig.order}|${(tagIds ?? []).join(",")}`;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional - restore once per query identity
+  useEffect(() => {
+    let cancelled = false;
+    let raf = 0;
+    const run = async () => {
+      let anchorId: number | null = null;
+      let anchorOffset = 0;
+      try {
+        const raw = sessionStorage.getItem("caliber-scroll");
+        const saved = raw ? (JSON.parse(raw) as { id?: unknown; offset?: unknown }) : null;
+        if (saved && typeof saved.id === "number") anchorId = saved.id;
+        if (saved && typeof saved.offset === "number") anchorOffset = saved.offset;
+      } catch { anchorId = null; }
+      if (anchorId === null || books.length === 0) return;
+      const wanted = anchorId;
+      let guard = 0;
+      while (!cancelled && guard < 10 && hasNextPage && !books.some((b) => b.id === wanted)) {
+        guard++;
+        try { await fetchNextPage(); } catch { break; }
+      }
+      if (cancelled) return;
+      const idx = books.findIndex((b) => b.id === wanted);
+      if (idx >= 0) {
+        const off = anchorOffset;
+        raf = requestAnimationFrame(() => {
+          if (cancelled) return;
+          try {
+            virtualizer.scrollToIndex(idx, { align: "start" });
+            if (off > 0) window.scrollBy({ top: off });
+          } catch {}
+          try { sessionStorage.removeItem("caliber-scroll"); } catch {}
+        });
+      }
+    };
+    void run();
+    return () => { cancelled = true; cancelAnimationFrame(raf); };
+  }, [restoreKey]);
 
   if (isLoading) {
     return (
@@ -452,15 +524,20 @@ export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, 
     );
   }
 
-  if (isError) {
+  if (isError && errorStage === "initial") {
+    const title = isAuthExpired ? "Session expired" : isOffline ? "You're offline" : "Failed to load books";
     return (
       <div className="flex flex-col items-center justify-center h-64 text-center px-8">
         <div className="w-14 h-14 rounded-full bg-error/10 flex items-center justify-center mb-3">
           <BookOpen className="h-5 w-5 text-error" strokeWidth={1.5} />
         </div>
-        <h3 className="text-base font-semibold text-ink mb-1">Failed to load books</h3>
+        <h3 className="text-base font-semibold text-ink mb-1">{title}</h3>
         <p className="text-sm text-ink-tertiary">
-          {error instanceof Error ? error.message : "Unknown error"}
+          {isAuthExpired
+            ? "Please sign in again to continue browsing."
+            : isOffline
+              ? "Check your connection and try again."
+              : error instanceof Error ? error.message : "Unknown error"}
         </p>
         <button
           type="button"
@@ -473,12 +550,24 @@ export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, 
     );
   }
 
-  if (books.length === 0) {
-    return <EmptyState searchQuery={searchQuery} />;
+  const refreshBanner = isError && errorStage === "refresh" ? (
+    <div className="mx-4 mt-3 rounded-lg border border-ink px-3 py-2 text-sm text-ink-tertiary flex items-center justify-between gap-2" role="alert">
+      <span>Couldn't refresh — showing saved results.</span>
+      <button type="button" onClick={() => refetch()} className="underline font-medium">Retry</button>
+    </div>
+  ) : null;
+
+  if (books.length === 0 && !isPlaceholder) {
+    return <EmptyState searchQuery={searchQuery} reason={emptyReason} />;
   }
+
+  const footerCount = totalCount !== null && windowTruncated
+    ? `Showing ${retainedCount.toLocaleString()} of ${totalCount.toLocaleString()} (retained window)`
+    : `${books.length.toLocaleString()} book${books.length !== 1 ? "s" : ""}`;
 
   return (
     <div>
+      {refreshBanner}
       {/* Virtual list container - no internal scroll, uses window */}
       <div style={{ height: `${totalSize}px`, position: "relative" }}>
         {virtualItems.map((virtualItem) => {
@@ -512,12 +601,19 @@ export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, 
         </div>
       )}
 
+      {isFetchNextPageError && !isFetchingNextPage && (
+        <div className="flex items-center justify-center gap-2 py-3 border-t border-parchment text-sm text-ink-tertiary" role="alert">
+          <span>Couldn't load more books.</span>
+          <button type="button" onClick={() => fetchNextPage()} className="underline font-medium">Retry</button>
+        </div>
+      )}
+
       {/* Footer */}
       <div className="px-3 sm:px-4 py-3 border-t border-ink bg-parchment-dark flex items-center justify-between gap-2 overflow-hidden">
         <div className="flex items-center gap-2 min-w-0">
           <BookOpen className="h-4 w-4 text-accent flex-shrink-0" strokeWidth={2} />
           <span className="text-sm font-medium text-ink whitespace-nowrap">
-            {books.length.toLocaleString()} book{books.length !== 1 ? "s" : ""}
+            {footerCount}
           </span>
           <span className="text-sm text-ink-muted truncate">
             {searchQuery ? `matching "${searchQuery}"` : "loaded"}

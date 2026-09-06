@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import JSZip from "jszip";
 import { ArrowLeft, ChevronLeft, ChevronRight, Download, Wifi, ZoomIn, ZoomOut } from "lucide-react";
-import { stored } from "@/lib/utils";
 import { useReaderSettings } from "@/lib/reader-settings";
-import { flushBookProgress, fetchBookProgress, saveBookProgress } from "@/lib/reading-progress";
+import { flushBookProgress, fetchBookProgress, saveBookProgress, progressPosKey, readScopedPos } from "@/lib/reading-progress";
 import {
   getNextReaderLoadMode,
   prefetchOrder,
@@ -25,6 +24,7 @@ interface ComicManifest {
 interface ComicReaderProps {
   bookId: number;
   title: string;
+  format: "CBZ" | "CBR";
   streamManifestUrl: string;
   fullUrl: string;
   supportsFullFile?: boolean;
@@ -70,6 +70,7 @@ function sortPageNames(a: string, b: string): number {
 export function ComicReader({
   bookId,
   title,
+  format,
   streamManifestUrl,
   fullUrl,
   supportsFullFile = true,
@@ -79,9 +80,13 @@ export function ComicReader({
   const touchRef = useRef<{ x: number; y: number; t: number } | null>(null);
   const lastTouchEndRef = useRef(0);
   const objectUrlsRef = useRef<string[]>([]);
+  // F19: full-mode blob store for windowed pagination. Blobs are retained so
+  // object URLs outside the visible window can be revoked and re-created.
+  const fullBlobsRef = useRef<Map<number, Blob>>(new Map());
+  const FULL_BLOB_WINDOW = 3;
   const preloadedImagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const decodedHrefsRef = useRef<Set<string>>(new Set());
-  const posKey = `caliber-pos-${bookId}-comic`;
+  const posKey = progressPosKey(bookId, `comic-${format}`);
 
   const settings = useReaderSettings();
 
@@ -91,7 +96,7 @@ export function ComicReader({
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [pages, setPages] = useState<ComicPage[]>([]);
-  const [currentPage, setCurrentPage] = useState(() => stored(posKey, { page: 1 }).page as number);
+  const [currentPage, setCurrentPage] = useState(() => readScopedPos<{ page: number }>(bookId, `comic-${format}`, { page: 1 }).page as number);
   const [showUI, setShowUI] = useState(true);
   const [zoom, setZoom] = useState(1);
   const [displayed, setDisplayed] = useState<ComicPage | null>(null);
@@ -112,6 +117,7 @@ export function ComicReader({
       URL.revokeObjectURL(url);
     }
     objectUrlsRef.current = [];
+    fullBlobsRef.current.clear();
   }, []);
 
   const goNext = useCallback(() => {
@@ -137,6 +143,7 @@ export function ComicReader({
 
   useEffect(() => {
     let cancelled = false;
+    const abort = new AbortController();
 
     async function loadComic() {
       setIsLoading(true);
@@ -149,14 +156,19 @@ export function ComicReader({
 
       try {
         if (loadMode === "stream") {
-          const response = await fetch(streamManifestUrl);
+          const response = await fetch(streamManifestUrl, { signal: abort.signal });
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           const manifest = (await response.json()) as ComicManifest;
           if (cancelled) return;
           setPages(manifest.pages);
           setCurrentPage((p) => Math.min(Math.max(p, 1), manifest.pageCount || 1));
         } else {
-          const response = await fetch(fullUrl);
+          // F06: CBR has no full-file JSZip path — capability-gated, never
+          // attempt a full-file fetch for CBR.
+          if (format === "CBR") {
+            throw new Error("Full-file loading is not supported for CBR");
+          }
+          const response = await fetch(fullUrl, { signal: abort.signal });
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           const zip = await JSZip.loadAsync(await response.arrayBuffer());
           const entries = Object.values(zip.files)
@@ -165,16 +177,38 @@ export function ComicReader({
 
           const fullPages: ComicPage[] = [];
           const objectUrls: string[] = [];
-          for (const [offset, entry] of entries.entries()) {
-            const blob = await entry.async("blob");
-            const href = URL.createObjectURL(blob);
-            objectUrls.push(href);
-            fullPages.push({
-              index: offset + 1,
-              href,
-              type: imageType(entry.name),
-              name: entry.name.split("/").pop() || `Page ${offset + 1}`,
-            });
+          let abortedInLoop = false;
+          try {
+            for (const [offset, entry] of entries.entries()) {
+              if (cancelled || abort.signal.aborted) {
+                abortedInLoop = true;
+                break;
+              }
+              const blob = await entry.async("blob");
+              if (cancelled || abort.signal.aborted) {
+                abortedInLoop = true;
+                break;
+              }
+              // F19: retain the blob for windowed pagination; only the visible
+              // window keeps live object URLs (see windowing effect below).
+              fullBlobsRef.current.set(offset + 1, blob);
+              const href = URL.createObjectURL(blob);
+              objectUrls.push(href);
+              fullPages.push({
+                index: offset + 1,
+                href,
+                type: imageType(entry.name),
+                name: entry.name.split("/").pop() || `Page ${offset + 1}`,
+              });
+            }
+          } catch (loopError) {
+            abortedInLoop = cancelled || abort.signal.aborted;
+            if (!abortedInLoop) throw loopError;
+          }
+          if (abortedInLoop || cancelled || abort.signal.aborted) {
+            // F06: never leak object URLs on cancellation/failure.
+            for (const href of objectUrls) URL.revokeObjectURL(href);
+            return;
           }
 
           if (cancelled) {
@@ -189,9 +223,10 @@ export function ComicReader({
 
         if (!cancelled) setIsLoading(false);
       } catch (error) {
-        if (cancelled) return;
+        if (cancelled || abort.signal.aborted) return;
 
-        if (loadMode === "stream") {
+        // F06: stream->full fallback only when the format is capable of it.
+        if (loadMode === "stream" && format === "CBZ" && supportsFullFile) {
           setLoadMode("full");
           return;
         }
@@ -201,12 +236,13 @@ export function ComicReader({
       }
     }
 
-    void loadComic();
+    void loadComic().catch(() => {});
 
     return () => {
       cancelled = true;
+      abort.abort();
     };
-  }, [streamManifestUrl, fullUrl, loadMode, clearObjectUrls, clearPreloadedImages]);
+  }, [streamManifestUrl, fullUrl, loadMode, format, supportsFullFile, clearObjectUrls, clearPreloadedImages]);
 
   useEffect(() => {
     return () => {
@@ -215,6 +251,38 @@ export function ComicReader({
       clearPreloadedImages();
     };
   }, [bookId, clearObjectUrls, clearPreloadedImages]);
+
+  // F19: full-mode blob pagination — only keep object URLs for the window
+  // around the current page; revoke all others to bound browser memory.
+  // Blobs stay in fullBlobsRef so revoked pages re-materialize on demand.
+  useEffect(() => {
+    if (loadMode !== "full" || pages.length === 0) return;
+    if (fullBlobsRef.current.size === 0) return;
+    const lo = Math.max(1, currentPage - FULL_BLOB_WINDOW);
+    const hi = Math.min(pages.length, currentPage + FULL_BLOB_WINDOW);
+    let changed = false;
+    const next = pages.map((p) => {
+      const inWindow = p.index >= lo && p.index <= hi;
+      if (!inWindow && p.href.startsWith("blob:")) {
+        URL.revokeObjectURL(p.href);
+        const idx = objectUrlsRef.current.indexOf(p.href);
+        if (idx >= 0) objectUrlsRef.current.splice(idx, 1);
+        changed = true;
+        return { ...p, href: "" };
+      }
+      if (inWindow && !p.href) {
+        const blob = fullBlobsRef.current.get(p.index);
+        if (blob) {
+          const href = URL.createObjectURL(blob);
+          objectUrlsRef.current.push(href);
+          changed = true;
+          return { ...p, href };
+        }
+      }
+      return p;
+    });
+    if (changed) setPages(next);
+  }, [loadMode, currentPage, pages]);
 
   useEffect(() => {
     if (isLoading || pages.length === 0) return;
@@ -274,11 +342,18 @@ export function ComicReader({
   const totalPagesRef = useRef(totalPages);
   const serverRestoredRef = useRef(false);
   const restoreSettledRef = useRef(false);
+  const displayedPageRef = useRef<number>(currentPage);
 
   useEffect(() => {
     currentPageRef.current = currentPage;
     totalPagesRef.current = totalPages;
   });
+
+  useEffect(() => {
+    // F06: persist the actually displayed page, not the requested one, so a
+    // fast page-turn burst never saves a page the user never saw.
+    if (displayed) displayedPageRef.current = displayed.index;
+  }, [displayed]);
 
   useEffect(() => {
     try {
@@ -288,16 +363,19 @@ export function ComicReader({
     // until the initial restore attempt settles so a slow/failed fetch can't
     // let this device's older page clobber newer server progress.
     if (totalPages > 0 && restoreSettledRef.current) {
+      const shown = displayedPageRef.current || currentPage;
       saveBookProgress(bookId, {
-        format: "CBZ",
-        location: String(currentPage),
-        percentage: (currentPage / totalPages) * 100,
-        finished: currentPage >= totalPages,
+        format,
+        location: String(shown),
+        percentage: (shown / totalPages) * 100,
+        finished: shown >= totalPages,
       });
     }
-  }, [currentPage, posKey, bookId, totalPages]);
+  }, [currentPage, posKey, bookId, totalPages, format]);
 
   // Restore the signed-in user's server-side page once, after pages load.
+  // F03: ignore server locators whose format doesn't match this reader and
+  // fall back to local state — never trigger a full-file redownload loop.
   useEffect(() => {
     if (serverRestoredRef.current || totalPages === 0) return;
     let cancelled = false;
@@ -316,26 +394,30 @@ export function ComicReader({
       // Catch-up save: a page turned while the gate was closed never entered
       // the debounced pending map; queue one canonical save for current state.
       if (!cancelled && totalPagesRef.current > 0) {
-        const page = currentPageRef.current;
+        const page = displayedPageRef.current || currentPageRef.current;
         const total = totalPagesRef.current;
         saveBookProgress(bookId, {
-          format: "CBZ",
+          format,
           location: String(page),
           percentage: (page / total) * 100,
           finished: page >= total,
         });
       }
       if (cancelled || !record?.location) return;
+      if (record.format && record.format.toUpperCase() !== format) return;
       const restored = Number.parseInt(record.location, 10);
       if (Number.isFinite(restored) && restored >= 1 && restored <= totalPages) {
         setCurrentPage(restored);
       }
-    })();
+    })().catch(() => {
+      serverRestoredRef.current = true;
+      restoreSettledRef.current = true;
+    });
 
     return () => {
       cancelled = true;
     };
-  }, [bookId, totalPages]);
+  }, [bookId, totalPages, format]);
 
   // Double-buffer page turns: if the target page is already decoded (warm
   // buffer), swap instantly with no flash. Otherwise hold the old page only

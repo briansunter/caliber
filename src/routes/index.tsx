@@ -1,9 +1,9 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { BookTableInfinite, TableHeader, SortHeader } from "@/components/BookTableInfinite";
 import { BookGridInfinite } from "@/components/BookGridInfinite";
 import { BookSearch } from "@/components/BookSearch";
 import { LibraryConfigPanel } from "@/components/LibraryConfigPanel";
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useMemo } from "react";
 import { BookOpen, Users, Layers, Library, LayoutGrid, List, Settings } from "lucide-react";
 import { useLibraryConfig, useLibraryStats, useTags, type SortConfig, type SortField } from "@/hooks/useBooksInfinite";
 import { UserMenu } from "@/components/UserMenu";
@@ -11,170 +11,125 @@ import { TagFilter } from "@/components/TagFilter";
 import { RecentlyRead } from "@/components/RecentlyRead";
 
 type ViewMode = "list" | "grid";
+type Density = "comfortable" | "compact";
 
-const STORAGE_KEY = "caliber-ui";
-const SCROLL_KEY = "caliber-scroll";
+const DENSITY_KEY = "caliber-density";
 
-interface UIState {
+interface CanonicalState {
   view: ViewMode;
   sort: SortConfig;
   search: string;
   tags: number[];
 }
 
-function loadUIState(): UIState {
-  const defaultView = window.innerWidth < 768 ? "grid" : "list";
-  const defaults: UIState = {
-    view: defaultView,
-    sort: { field: "added", order: "desc" },
-    search: "",
-    tags: [],
-  };
-  try {
-    const saved = sessionStorage.getItem(STORAGE_KEY);
-    const parsed = saved ? (JSON.parse(saved) as Partial<UIState>) : {};
-    const savedState: UIState = {
-      view: parsed.view === "list" || parsed.view === "grid" ? parsed.view : defaults.view,
-      sort: {
-        field:
-          parsed.sort?.field === "title" ||
-          parsed.sort?.field === "author" ||
-          parsed.sort?.field === "added" ||
-          parsed.sort?.field === "rating"
-            ? parsed.sort.field
-            : defaults.sort.field,
-        order: parsed.sort?.order === "asc" || parsed.sort?.order === "desc" ? parsed.sort.order : defaults.sort.order,
-      },
-      search: typeof parsed.search === "string" ? parsed.search : defaults.search,
-      tags: Array.isArray(parsed.tags)
-        ? parsed.tags.filter((id) => typeof id === "number" && Number.isSafeInteger(id) && id > 0)
-        : defaults.tags,
-    };
+const SORT_FIELDS: SortField[] = ["title", "author", "added", "rating"];
 
-    const url = new URL(window.location.href);
-    const urlView = url.searchParams.get("view");
-    const urlSortField = url.searchParams.get("sortBy");
-    const urlSortOrder = url.searchParams.get("sortOrder");
-    const urlTags = url.searchParams.getAll("tag");
-    return {
-      ...savedState,
-      view: urlView === "list" || urlView === "grid" ? urlView : savedState.view,
-      search: url.searchParams.has("q") ? url.searchParams.get("q") || "" : savedState.search,
-      sort: {
-        field:
-          urlSortField === "title" ||
-          urlSortField === "author" ||
-          urlSortField === "added" ||
-          urlSortField === "rating"
-            ? urlSortField
-            : savedState.sort.field,
-        order: urlSortOrder === "asc" || urlSortOrder === "desc" ? urlSortOrder : savedState.sort.order,
-      },
-      tags: urlTags.length
-        ? urlTags.filter((id) => /^\d+$/.test(id) && Number(id) > 0).map(Number)
-        : savedState.tags,
-    };
-  } catch {
-    return defaults;
-  }
+function toSearchParams(state: CanonicalState): Record<string, unknown> {
+  const params: Record<string, unknown> = {};
+  if (state.search) params.q = state.search;
+  params.view = state.view;
+  params.sortBy = state.sort.field;
+  params.sortOrder = state.sort.order;
+  if (state.tags.length > 0) params.tag = state.tags.map(String);
+  return params;
 }
 
-function saveUIState(state: UIState) {
+function loadDensity(): Density {
   try {
-    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    const saved = sessionStorage.getItem(DENSITY_KEY);
+    if (saved === "compact" || saved === "comfortable") return saved;
   } catch {}
+  return "comfortable";
 }
 
-function saveScrollPos() {
+function saveDensity(density: Density) {
   try {
-    sessionStorage.setItem(SCROLL_KEY, String(window.scrollY));
+    // sessionStorage holds density prefs only; q/sort/view/tags live in the URL.
+    sessionStorage.setItem(DENSITY_KEY, density);
   } catch {}
-}
-
-function popScrollPos(): number | null {
-  try {
-    const v = sessionStorage.getItem(SCROLL_KEY);
-    sessionStorage.removeItem(SCROLL_KEY);
-    return v ? Number(v) : null;
-  } catch {
-    return null;
-  }
 }
 
 export const Route = createFileRoute("/")({
+  // Canonical URL params for q/sort/view/tags so links are shareable.
+  validateSearch: (search: Record<string, unknown>) => {
+    const pick = (v: unknown): string | undefined =>
+      typeof v === "string" ? v : Array.isArray(v) && typeof v[0] === "string" ? v[0] : undefined;
+    const tags = search.tag;
+    const tagList = Array.isArray(tags) ? tags : tags === undefined ? [] : [tags];
+    return {
+      q: pick(search.q) ?? "",
+      view: pick(search.view) === "grid" ? "grid" : "list",
+      sortBy: SORT_FIELDS.includes(pick(search.sortBy) as SortField)
+        ? (pick(search.sortBy) as SortField)
+        : "added",
+      sortOrder: pick(search.sortOrder) === "asc" ? "asc" : "desc",
+      tag: tagList
+        .filter((t): t is string => typeof t === "string" && /^\d+$/.test(t) && Number(t) > 0),
+    };
+  },
   component: IndexComponent,
 });
 
 function IndexComponent() {
-  const [uiState, setUIState] = useState(loadUIState);
+  const search = Route.useSearch();
+  const navigate = useNavigate();
+  const defaultView: ViewMode = typeof window !== "undefined" && window.innerWidth < 768 ? "grid" : "list";
+  // Stable numeric tag ids for query keys.
+  const tagNumbers = useMemo(() => {
+    const list: unknown[] = Array.isArray(search.tag) ? search.tag : [];
+    return list.filter((t): t is string => typeof t === "string" && /^\d+$/.test(t)).map(Number);
+  }, [search.tag]);
+  const uiState: CanonicalState = useMemo(
+    () => ({
+      view: search.view === "grid" ? "grid" : search.view === "list" ? "list" : defaultView,
+      search: typeof search.q === "string" ? search.q : "",
+      sort: {
+        field: SORT_FIELDS.includes(search.sortBy as SortField) ? (search.sortBy as SortField) : "added",
+        order: search.sortOrder === "asc" ? "asc" : "desc",
+      },
+      tags: tagNumbers,
+    }),
+    [search.q, search.view, search.sortBy, search.sortOrder, tagNumbers, defaultView],
+  );
+  const [density, setDensity] = useState<Density>(loadDensity);
   const searchQuery = uiState.search;
   const viewMode = uiState.view;
   const sortConfig = uiState.sort;
 
-  const setSearchQuery = useCallback((q: string) => {
-    setUIState((prev) => {
-      const next = { ...prev, search: q };
-      saveUIState(next);
-      return next;
-    });
-  }, []);
-
-  const setViewMode = useCallback((v: ViewMode) => {
-    setUIState((prev) => {
-      const next = { ...prev, view: v };
-      saveUIState(next);
-      return next;
-    });
-  }, []);
-
-  const setSortConfig = useCallback((config: SortConfig) => {
-    setUIState((prev) => {
-      const next = { ...prev, sort: config };
-      saveUIState(next);
-      return next;
-    });
-  }, []);
-
-  const setTags = useCallback((tags: number[]) => {
-    setUIState((prev) => {
-      const next = { ...prev, tags };
-      saveUIState(next);
-      return next;
-    });
-  }, []);
-
-  // Save scroll position on any click that navigates away
-  useEffect(() => {
-    const handleClick = (e: MouseEvent) => {
-      const link = (e.target as HTMLElement).closest("a[href]");
-      if (link && !link.getAttribute("href")?.startsWith("#")) {
-        saveScrollPos();
-      }
-    };
-    document.addEventListener("click", handleClick, true);
-    return () => document.removeEventListener("click", handleClick, true);
-  }, []);
-
-  // Restore scroll position after data is ready
-  const scrollRestored = useRef(false);
-  const savedScroll = useRef(popScrollPos());
-  useEffect(() => {
-    if (!scrollRestored.current && savedScroll.current && savedScroll.current > 0) {
-      const target = savedScroll.current;
-      // Retry scroll until the page is tall enough or timeout
-      let attempts = 0;
-      const tryScroll = () => {
-        if (document.documentElement.scrollHeight >= target + 100 || attempts > 20) {
-          window.scrollTo(0, target);
-          scrollRestored.current = true;
-        } else {
-          attempts++;
-          requestAnimationFrame(tryScroll);
-        }
+  const updateCanonical = useCallback(
+    (patch: Partial<CanonicalState>) => {
+      const next: CanonicalState = {
+        view: uiState.view,
+        search: uiState.search,
+        sort: uiState.sort,
+        tags: uiState.tags,
+        ...patch,
       };
-      requestAnimationFrame(tryScroll);
-    }
+      void navigate({ to: "/", search: toSearchParams(next) as never, replace: true });
+    },
+    [navigate, uiState],
+  );
+
+  const setSearchQuery = useCallback((q: string) => updateCanonical({ search: q }), [updateCanonical]);
+  const setViewMode = useCallback((v: ViewMode) => updateCanonical({ view: v }), [updateCanonical]);
+  const setSortConfig = useCallback(
+    (config: SortConfig) => updateCanonical({ sort: config }),
+    [updateCanonical],
+  );
+  const setTags = useCallback(
+    (tags: number[]) => updateCanonical({ tags }),
+    [updateCanonical],
+  );
+  const toggleDensity = useCallback(() => {
+    setDensity((prev) => {
+      const next: Density = prev === "compact" ? "comfortable" : "compact";
+      saveDensity(next);
+      return next;
+    });
   }, []);
+
+  // Anchor-based scroll restore lives in BookGridInfinite/BookTableInfinite
+  // (they fetch the required window, then scroll to the stored book anchor).
 
   const { data: libraryConfig, error: libraryConfigError, isLoading: libraryConfigLoading, refetch: refetchLibraryConfig } = useLibraryConfig();
   const libraryReady = libraryConfig?.ready === true;
@@ -190,7 +145,7 @@ function IndexComponent() {
   }
 
   return (
-    <div className="min-h-screen bg-parchment paper-texture">
+    <div className={`min-h-screen bg-parchment paper-texture${density === "compact" ? " density-compact" : ""}`}>
       {/* Main Content - Unified Scroll */}
       <main id="main-content" className="max-w-7xl mx-auto px-3 sm:px-6 pt-4 sm:pt-8 pb-10">
         {/* Welcome Section */}
@@ -274,6 +229,16 @@ function IndexComponent() {
                 <LayoutGrid className="h-4 w-4" strokeWidth={1.5} />
               </button>
             </fieldset>
+            <button
+              type="button"
+              onClick={toggleDensity}
+              aria-pressed={density === "compact"}
+              aria-label="Compact density"
+              title="Toggle compact density"
+              className={`p-2 transition-colors flex-shrink-0 border border-ink rounded-lg ${density === "compact" ? "bg-ink text-white" : "bg-surface text-ink-muted hover:text-ink"}`}
+            >
+              <span aria-hidden="true" className="block text-xs font-semibold leading-none px-0.5">≡</span>
+            </button>
           </div>
           {viewMode === "grid" && (
             <GridSortBar sortConfig={sortConfig} onSortChange={setSortConfig} />

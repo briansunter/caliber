@@ -152,6 +152,8 @@ function server2Env(port: number) {
   delete env.CALIBER_AUTH_ENABLED;
   env.CALIBER_CONFIG_DIR = configDir2;
   env.CALIBER_USER_DB_PATH = join(configDir2, "users.db");
+  // F09: no-auth management on loopback requires explicit opt-in.
+  env.CALIBER_ALLOW_NOAUTH_ADMIN = "1";
   return env;
 }
 

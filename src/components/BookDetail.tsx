@@ -309,6 +309,7 @@ export function BookDetail({ bookId }: BookDetailProps) {
                         key={format}
                         to="/read/$id/$format"
                         params={{ id: String(bookId), format: format.toLowerCase() }}
+                        search={{ from: `/book/${bookId}`, mode: undefined }}
                       >
                         <Button
                           size="sm"

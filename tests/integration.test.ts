@@ -26,11 +26,58 @@ let libraryPath = "";
 let homePath = "";
 let baseUrl = "";
 let serverProcess: ReturnType<typeof Bun.spawn> | null = null;
+let serverStdout = "";
+let serverStderr = "";
 
-function drainPipe(pipe: unknown) {
-  if (pipe instanceof ReadableStream) {
-    void new Response(pipe).text();
+// Only these host variables pass through to the spawned server; everything
+// else is set explicitly below so tests are hermetic.
+const PASSTHROUGH_ENV = [
+  "PATH",
+  "HOME",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "TZ",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "LOGNAME",
+  "USER",
+  "SHELL",
+  "SYSTEMROOT",
+  "WINDIR",
+  "BUN_INSTALL",
+  "NO_COLOR",
+  "CI",
+] as const;
+
+function childEnv(extra: Record<string, string>): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of PASSTHROUGH_ENV) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
   }
+  return { ...env, ...extra };
+}
+
+function tapPipe(pipe: unknown, onChunk: (text: string) => void) {
+  if (pipe instanceof ReadableStream) {
+    void (async () => {
+      const reader = pipe.getReader();
+      const decoder = new TextDecoder();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          onChunk(decoder.decode(value, { stream: true }));
+        }
+      } catch {}
+    })();
+  }
+}
+
+function lastLines(text: string, count: number): string {
+  return text.split("\n").slice(-count).join("\n");
 }
 
 async function freePort(): Promise<number> {
@@ -60,7 +107,27 @@ async function waitForServer(url: string) {
     await Bun.sleep(100);
   }
 
-  throw lastError instanceof Error ? lastError : new Error("Server did not start");
+  // Preserve the last 100 log lines so startup failures are diagnosable.
+  const tail = [
+    "--- server stdout (last 100 lines) ---",
+    lastLines(serverStdout, 100),
+    "--- server stderr (last 100 lines) ---",
+    lastLines(serverStderr, 100),
+  ].join("\n");
+  throw new Error(
+    `Server did not start: ${lastError instanceof Error ? lastError.message : lastError}\n${tail}`,
+  );
+}
+
+// XML-escape fixture titles: a raw "&" in book metadata must not produce
+// malformed EPUB XML or OPDS feeds.
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
 function createPdf(): Uint8Array {
@@ -93,6 +160,7 @@ function createPdf(): Uint8Array {
 }
 
 async function createEpub(path: string, title: string) {
+  const safeTitle = escapeXml(title);
   const zip = new JSZip();
   zip.file("mimetype", "application/epub+zip", { compression: "STORE" });
   zip.file(
@@ -109,7 +177,7 @@ async function createEpub(path: string, title: string) {
     `<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-    <dc:title>${title}</dc:title>
+    <dc:title>${safeTitle}</dc:title>
     <dc:identifier id="bookid">urn:uuid:fixture-${title.replace(/\W+/g, "-")}</dc:identifier>
     <dc:language>en</dc:language>
   </metadata>
@@ -128,7 +196,7 @@ async function createEpub(path: string, title: string) {
     `<?xml version="1.0" encoding="UTF-8"?>
 <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
   <head><meta name="dtb:uid" content="fixture"/></head>
-  <docTitle><text>${title}</text></docTitle>
+  <docTitle><text>${safeTitle}</text></docTitle>
   <navMap>
     <navPoint id="chapter1" playOrder="1">
       <navLabel><text>Start</text></navLabel>
@@ -141,8 +209,8 @@ async function createEpub(path: string, title: string) {
     "OEBPS/chapter1.xhtml",
     `<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml">
-  <head><title>${title}</title><link rel="stylesheet" href="styles.css"/></head>
-  <body><h1>${title}</h1><p>Fixture chapter.</p></body>
+  <head><title>${safeTitle}</title><link rel="stylesheet" href="styles.css"/></head>
+  <body><h1>${safeTitle}</h1><p>Fixture chapter.</p></body>
 </html>`,
   );
   zip.file("OEBPS/styles.css", "body { font-family: serif; }");
@@ -208,20 +276,33 @@ async function createFixtureLibrary() {
   db.run("INSERT INTO tags (id, name) VALUES (2, 'Fiction')");
   db.run("INSERT INTO publishers (id, name, sort) VALUES (1, 'Fixture Press', 'Fixture Press')");
   db.run("INSERT INTO ratings (id, rating) VALUES (1, 8)");
+  seedValidCoreBooks(db);
+  seedInvalidBooks(db);
+  seedFormatVariantBooks(db);
+  db.close();
+
+  await seedValidCoreFiles();
+  await seedInvalidFiles();
+  await seedFormatVariantFiles();
+}
+
+// --- Valid core fixtures -------------------------------------------------
+// Well-formed books used by the OPDS/reader happy-path tests.
+
+function seedValidCoreBooks(db: Database) {
   db.run(`
     INSERT INTO books
       (id, title, sort, timestamp, pubdate, series_index, author_sort, path, flags, uuid, has_cover, last_modified)
     VALUES
       (1, 'Alpha & Beta', 'Alpha & Beta', '2024-01-02 00:00:00+00:00', '2023-01-01 00:00:00+00:00', 1.0, 'Author, Alice', 'Alpha Book', 1, '11111111-1111-1111-1111-111111111111', 0, '2024-01-02 00:00:00+00:00'),
-      (2, 'Gamma Search', 'Gamma Search', '2024-01-03 00:00:00+00:00', '2023-01-02 00:00:00+00:00', 1.0, 'Writer, Bob', 'Gamma Book', 1, '22222222-2222-2222-2222-222222222222', 0, '2024-01-03 00:00:00+00:00'),
-      (3, 'Invalid EPUB', 'Invalid EPUB', '2024-01-04 00:00:00+00:00', '2023-01-03 00:00:00+00:00', 1.0, 'Author, Invalid', 'Invalid Book', 1, '33333333-3333-3333-3333-333333333333', 0, '2024-01-04 00:00:00+00:00')
+      (2, 'Gamma Search', 'Gamma Search', '2024-01-03 00:00:00+00:00', '2023-01-02 00:00:00+00:00', 1.0, 'Writer, Bob', 'Gamma Book', 1, '22222222-2222-2222-2222-222222222222', 0, '2024-01-03 00:00:00+00:00')
   `);
   db.run(`
     INSERT INTO identifiers (book, type, val) VALUES
       (1, 'isbn', '9780000000001'),
       (2, 'isbn', '9780000000002')
   `);
-  db.run("INSERT INTO books_authors_link (book, author) VALUES (1, 1), (2, 2), (3, 3)");
+  db.run("INSERT INTO books_authors_link (book, author) VALUES (1, 1), (2, 2)");
   db.run("INSERT INTO books_series_link (book, series) VALUES (1, 1)");
   db.run("INSERT INTO books_tags_link (book, tag) VALUES (1, 1), (1, 2), (2, 2)");
   db.run("INSERT INTO books_publishers_link (book, publisher) VALUES (1, 1)");
@@ -233,26 +314,158 @@ async function createFixtureLibrary() {
       (1, 'PDF', 0, 'Alpha Book'),
       (1, 'CBZ', 0, 'Alpha Book'),
       (1, 'CBR', 0, 'Alpha Book'),
-      (2, 'EPUB', 0, 'Gamma Book'),
-      (3, 'EPUB', 0, 'Invalid Book')
+      (2, 'EPUB', 0, 'Gamma Book')
   `);
-  db.close();
+}
 
+// --- Deliberately invalid fixtures ----------------------------------------
+// Malformed archives kept separate from the valid set so a regression in
+// error handling can't be masked by (or break) the happy-path books.
+
+function seedInvalidBooks(db: Database) {
+  db.run(`
+    INSERT INTO books
+      (id, title, sort, timestamp, pubdate, series_index, author_sort, path, flags, uuid, has_cover, last_modified)
+    VALUES
+      (3, 'Invalid EPUB', 'Invalid EPUB', '2024-01-04 00:00:00+00:00', '2023-01-03 00:00:00+00:00', 1.0, 'Author, Invalid', 'Invalid Book', 1, '33333333-3333-3333-3333-333333333333', 0, '2024-01-04 00:00:00+00:00')
+  `);
+  db.run("INSERT INTO books_authors_link (book, author) VALUES (3, 3)");
+  db.run("INSERT INTO data (book, format, uncompressed_size, name) VALUES (3, 'EPUB', 0, 'Invalid Book')");
+}
+
+// --- Single-format / edge-case variants ------------------------------------
+// One scenario per book so each test can seed-assert exactly the book it
+// needs without depending on another test's state.
+
+export const SCENARIO_BOOK_IDS = {
+  cbzOnly: 10,
+  cbrOnly: 11,
+  pdfOnly: 12,
+  epubOnly: 13,
+  multiFormat: 14,
+  metadataOnly: 15,
+  missingCover: 16,
+} as const;
+
+function seedFormatVariantBooks(db: Database) {
+  const rows = [
+    [10, "CBZ Only", "CBZ Only Book", "44444444-4444-4444-4444-444444444444", 0],
+    [11, "CBR Only", "CBR Only Book", "55555555-5555-5555-5555-555555555555", 0],
+    [12, "PDF Only", "PDF Only Book", "66666666-6666-6666-6666-666666666666", 0],
+    [13, "EPUB Only", "EPUB Only Book", "77777777-7777-7777-7777-777777777777", 0],
+    [14, "Multi Format", "Multi Format Book", "88888888-8888-8888-8888-888888888888", 0],
+    [15, "Metadata Only", "Metadata Only Book", "99999999-9999-9999-9999-999999999999", 0],
+    // Claims a cover but ships no cover file: the cover endpoint must 404
+    // so the client falls back instead of hanging on a broken image.
+    [16, "Missing Cover", "Missing Cover Book", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 1],
+  ] as const;
+  for (const [id, title, path, uuid, hasCover] of rows) {
+    db.run(
+      `INSERT INTO books
+        (id, title, sort, timestamp, pubdate, series_index, author_sort, path, flags, uuid, has_cover, last_modified)
+      VALUES
+        (${id}, '${title}', '${title}', '2024-02-01 00:00:00+00:00', '2023-02-01 00:00:00+00:00', 1.0, 'Author, Alice', '${path}', 1, '${uuid}', ${hasCover}, '2024-02-01 00:00:00+00:00')`,
+    );
+    db.run(`INSERT INTO books_authors_link (book, author) VALUES (${id}, 1)`);
+  }
+  db.run(`
+    INSERT INTO data (book, format, uncompressed_size, name) VALUES
+      (10, 'CBZ', 0, 'CBZ Only Book'),
+      (11, 'CBR', 0, 'CBR Only Book'),
+      (12, 'PDF', 0, 'PDF Only Book'),
+      (13, 'EPUB', 0, 'EPUB Only Book'),
+      (14, 'EPUB', 0, 'Multi Format Book'),
+      (14, 'PDF', 0, 'Multi Format Book'),
+      (14, 'CBZ', 0, 'Multi Format Book'),
+      (16, 'EPUB', 0, 'Missing Cover Book')
+  `);
+}
+
+async function seedValidCoreFiles() {
   const alphaDir = join(libraryPath, "Alpha Book");
   const gammaDir = join(libraryPath, "Gamma Book");
-  const invalidDir = join(libraryPath, "Invalid Book");
   mkdirSync(alphaDir, { recursive: true });
   mkdirSync(gammaDir, { recursive: true });
-  mkdirSync(invalidDir, { recursive: true });
   await createEpub(join(alphaDir, "Alpha Book.epub"), "Alpha & Beta");
   await Bun.write(join(alphaDir, "Alpha Book.pdf"), createPdf());
   await createCbz(join(alphaDir, "Alpha Book.cbz"));
   await createCbr(join(alphaDir, "Alpha Book.cbr"));
   await createEpub(join(gammaDir, "Gamma Book.epub"), "Gamma Search");
+}
+
+async function seedInvalidFiles() {
+  const invalidDir = join(libraryPath, "Invalid Book");
+  mkdirSync(invalidDir, { recursive: true });
   await Bun.write(
     join(invalidDir, "Invalid Book.epub"),
     "<!doctype html><html><head><title>Not an EPUB</title></head><body>wrong file</body></html>",
   );
+}
+
+async function seedFormatVariantFiles() {
+  const variants: Array<{ dir: string; file: string; make: () => Promise<unknown> }> = [
+    {
+      dir: "CBZ Only Book",
+      file: "CBZ Only Book.cbz",
+      make: async () => createCbz(join(libraryPath, "CBZ Only Book", "CBZ Only Book.cbz")),
+    },
+    {
+      dir: "CBR Only Book",
+      file: "CBR Only Book.cbr",
+      make: async () => createCbr(join(libraryPath, "CBR Only Book", "CBR Only Book.cbr")),
+    },
+    {
+      dir: "PDF Only Book",
+      file: "PDF Only Book.pdf",
+      make: async () =>
+        Bun.write(join(libraryPath, "PDF Only Book", "PDF Only Book.pdf"), createPdf()),
+    },
+    {
+      dir: "EPUB Only Book",
+      file: "EPUB Only Book.epub",
+      make: async () =>
+        createEpub(join(libraryPath, "EPUB Only Book", "EPUB Only Book.epub"), "EPUB Only"),
+    },
+    {
+      dir: "Multi Format Book",
+      file: "Multi Format Book.epub",
+      make: async () => {
+        await createEpub(
+          join(libraryPath, "Multi Format Book", "Multi Format Book.epub"),
+          "Multi Format",
+        );
+        await Bun.write(
+          join(libraryPath, "Multi Format Book", "Multi Format Book.pdf"),
+          createPdf(),
+        );
+        await createCbz(join(libraryPath, "Multi Format Book", "Multi Format Book.cbz"));
+      },
+    },
+    {
+      dir: "Missing Cover Book",
+      file: "Missing Cover Book.epub",
+      make: async () =>
+        createEpub(
+          join(libraryPath, "Missing Cover Book", "Missing Cover Book.epub"),
+          "Missing Cover",
+        ),
+    },
+  ];
+  for (const variant of variants) {
+    mkdirSync(join(libraryPath, variant.dir), { recursive: true });
+    await variant.make();
+    void variant.file;
+  }
+  // Metadata Only intentionally gets an empty directory: no data rows, no files.
+  mkdirSync(join(libraryPath, "Metadata Only Book"), { recursive: true });
+}
+
+// Per-test seeding assertion: each scenario test declares the exact book it
+// needs up front instead of depending on another test having run first.
+async function requireScenarioBook(id: number) {
+  const response = await fetch(`${baseUrl}/api/books/${id}`);
+  expect(response.status).toBe(200);
+  return (await response.json()) as { id: number; title: string; formats: string[] };
 }
 
 function parseXml(xml: string) {
@@ -289,20 +502,23 @@ beforeAll(async () => {
   baseUrl = `http://localhost:${port}`;
   serverProcess = Bun.spawn(["bun", "src/index.ts"], {
     cwd: process.cwd(),
-    env: {
-      ...process.env,
+    env: childEnv({
       HOME: homePath,
       CALIBER_CONFIG_DIR: join(homePath, ".config", "caliber"),
       CALIBRE_LIBRARY_PATH: libraryPath,
       PORT: String(port),
       NODE_ENV: "test",
-    },
+    }),
     stdout: "pipe",
     stderr: "pipe",
   });
 
-  drainPipe(serverProcess.stdout);
-  drainPipe(serverProcess.stderr);
+  tapPipe(serverProcess.stdout, (chunk) => {
+    serverStdout += chunk;
+  });
+  tapPipe(serverProcess.stderr, (chunk) => {
+    serverStderr += chunk;
+  });
   await waitForServer(baseUrl);
 }, TEST_TIMEOUT);
 
@@ -453,4 +669,75 @@ describe("file and reader endpoints", () => {
     expect(pdfPage.status).toBe(200);
     expect(pdfPage.headers.get("content-type")).toContain("image/png");
   }, TEST_TIMEOUT);
+});
+
+describe("ampersand escaping", () => {
+  test("OPDS search and feeds keep Alpha & Beta well-formed", async () => {
+    const xml = await fetchText("/opds/search?q=Alpha");
+    expect(xml).toContain("Alpha &amp; Beta");
+    expect(xml).not.toContain("Alpha & Beta</");
+  });
+});
+
+describe("format variant fixtures", () => {
+  test("CBZ-only book serves its manifest and pages", async () => {
+    const book = await requireScenarioBook(SCENARIO_BOOK_IDS.cbzOnly);
+    expect(book.formats).toEqual(["CBZ"]);
+    const manifest = await fetch(
+      `${baseUrl}/api/books/${SCENARIO_BOOK_IDS.cbzOnly}/pages/CBZ/manifest`,
+    );
+    expect(manifest.status).toBe(200);
+    const body = (await manifest.json()) as { pageCount: number };
+    expect(body.pageCount).toBe(2);
+  });
+
+  test("CBR-only book serves its manifest", async () => {
+    const book = await requireScenarioBook(SCENARIO_BOOK_IDS.cbrOnly);
+    expect(book.formats).toEqual(["CBR"]);
+    const manifest = await fetch(
+      `${baseUrl}/api/books/${SCENARIO_BOOK_IDS.cbrOnly}/pages/CBR/manifest`,
+    );
+    expect(manifest.status).toBe(200);
+    const body = (await manifest.json()) as { pageCount: number };
+    expect(body.pageCount).toBe(2);
+  });
+
+  test("PDF-only book serves its manifest", async () => {
+    const book = await requireScenarioBook(SCENARIO_BOOK_IDS.pdfOnly);
+    expect(book.formats).toEqual(["PDF"]);
+    const manifest = await fetch(
+      `${baseUrl}/api/books/${SCENARIO_BOOK_IDS.pdfOnly}/pages/PDF/manifest`,
+    );
+    expect(manifest.status).toBe(200);
+    const body = (await manifest.json()) as { pageCount: number };
+    expect(body.pageCount).toBe(1);
+  }, TEST_TIMEOUT);
+
+  test("EPUB-only book streams its container", async () => {
+    const book = await requireScenarioBook(SCENARIO_BOOK_IDS.epubOnly);
+    expect(book.formats).toEqual(["EPUB"]);
+    const container = await fetch(
+      `${baseUrl}/api/books/${SCENARIO_BOOK_IDS.epubOnly}/epub/META-INF/container.xml`,
+    );
+    expect(container.status).toBe(200);
+    expect(await container.text()).toContain("OEBPS/content.opf");
+  });
+
+  test("multi-format book lists EPUB, PDF, and CBZ", async () => {
+    const book = await requireScenarioBook(SCENARIO_BOOK_IDS.multiFormat);
+    expect(book.formats.sort()).toEqual(["CBZ", "EPUB", "PDF"]);
+  });
+
+  test("metadata-only book has no downloadable formats", async () => {
+    const book = await requireScenarioBook(SCENARIO_BOOK_IDS.metadataOnly);
+    expect(book.formats).toEqual([]);
+    const file = await fetch(`${baseUrl}/api/books/${SCENARIO_BOOK_IDS.metadataOnly}/file/EPUB`);
+    expect(file.status).toBe(404);
+  });
+
+  test("missing-cover book 404s on cover so the client falls back", async () => {
+    await requireScenarioBook(SCENARIO_BOOK_IDS.missingCover);
+    const cover = await fetch(`${baseUrl}/api/books/${SCENARIO_BOOK_IDS.missingCover}/cover`);
+    expect(cover.status).toBe(404);
+  });
 });

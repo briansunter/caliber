@@ -14,7 +14,7 @@ function BookDetailPage() {
   const navigate = useNavigate();
 
   function handleBack() {
-    navigate({ to: "/" });
+    navigate({ to: "/", search: { q: "", view: "list", sortBy: "added", sortOrder: "desc", tag: [] } });
   }
 
   // Ensure the browser's back button goes to the library instead of leaving

@@ -14,6 +14,8 @@ import {
   countUsersWithPassword,
   createSession,
   createUserWithPassword,
+  deleteSessionsForUser,
+  getAuthEpoch,
   getCredentialByUsername,
   getSession,
   getUserById,
@@ -98,6 +100,12 @@ export function resolveSessionToken(token: string | undefined | null): User | nu
   if (!token) return null;
   const session = getSession(sha256Hex(token));
   if (!session || session.expiresAt <= Date.now()) return null;
+  // Cross-process credential-epoch check: sessions store the epoch at login;
+  // a password reset bumps users.auth_epoch and deletes sessions, but a
+  // concurrent process may hold a session row written before the bump, so
+  // reject any session whose epoch no longer matches the DB.
+  const currentEpoch = getAuthEpoch(session.userId);
+  if (currentEpoch === null || currentEpoch !== session.authEpoch) return null;
   return getUserById(session.userId);
 }
 
@@ -156,6 +164,29 @@ function clearLoginFailures(req: Request, username: string): void {
   loginFailures.delete(clientKey(req, username));
 }
 
+// Global concurrent argon2 semaphore: hashing is CPU-heavy, so cap parallel
+// verifications across both the form and Basic paths to avoid starving the
+// event loop under credential-stuffing bursts.
+const MAX_CONCURRENT_HASHES = 4;
+let activeHashes = 0;
+const hashWaiters: Array<() => void> = [];
+
+function withHashSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (activeHashes >= MAX_CONCURRENT_HASHES) {
+    return new Promise<T>((resolve, reject) => {
+      hashWaiters.push(() => {
+        void withHashSlot(fn).then(resolve, reject);
+      });
+    });
+  }
+  activeHashes += 1;
+  return fn().finally(() => {
+    activeHashes -= 1;
+    const next = hashWaiters.shift();
+    if (next) next();
+  });
+}
+
 // Verify a username/password pair and update the failure throttle.
 // Returns the user on success, null on bad credentials.
 export async function authenticateWithPassword(
@@ -166,7 +197,7 @@ export async function authenticateWithPassword(
   const credential = getCredentialByUsername(username);
   const passwordOk =
     credential?.passwordHash != null && credential.passwordHash.length > 0
-      ? await verifyPassword(password, credential.passwordHash)
+      ? await withHashSlot(() => verifyPassword(password, credential.passwordHash as string))
       : false;
 
   if (!credential || !passwordOk) {
@@ -180,11 +211,17 @@ export async function authenticateWithPassword(
 
 // --- HTTP Basic Auth ---
 
-const basicCache = new Map<string, { userId: number; expiresAt: number }>();
+const basicCache = new Map<string, { userId: number; authEpoch: number; expiresAt: number }>();
 
-function cacheBasicCredential(headerValue: string, userId: number): void {
+function cacheBasicCredential(headerValue: string, userId: number, authEpoch: number): void {
   if (basicCache.size >= BASIC_CACHE_MAX_ENTRIES) basicCache.clear();
-  basicCache.set(sha256Hex(headerValue), { userId, expiresAt: Date.now() + BASIC_CACHE_TTL_MS });
+  basicCache.set(sha256Hex(headerValue), { userId, authEpoch, expiresAt: Date.now() + BASIC_CACHE_TTL_MS });
+}
+
+function clearBasicCacheForUser(userId: number): void {
+  for (const [key, entry] of basicCache) {
+    if (entry.userId === userId) basicCache.delete(key);
+  }
 }
 
 export interface BasicCredentials {
@@ -215,26 +252,43 @@ export function parseBasicAuth(header: string | null): BasicCredentials | null {
   return { username, password };
 }
 
-async function authenticateBasic(headerValue: string): Promise<User | null> {
+async function authenticateBasic(req: Request, headerValue: string): Promise<User | null> {
   const cacheKey = sha256Hex(headerValue);
   const cached = basicCache.get(cacheKey);
   if (cached) {
-    if (cached.expiresAt > Date.now()) return getUserById(cached.userId);
-    basicCache.delete(cacheKey);
+    if (cached.expiresAt <= Date.now()) {
+      basicCache.delete(cacheKey);
+    } else {
+      // Cross-process epoch check against the DB, not just the in-memory
+      // clear performed on password reset.
+      const currentEpoch = getAuthEpoch(cached.userId);
+      if (currentEpoch === null || currentEpoch !== cached.authEpoch) {
+        basicCache.delete(cacheKey);
+      } else {
+        return getUserById(cached.userId);
+      }
+    }
   }
 
   const credentials = parseBasicAuth(headerValue);
   if (!credentials) return null;
 
+  // Same throttle as the form path so OPDS guessing is rate-limited too.
+  if (loginRateLimited(req, credentials.username)) return null;
+
   const credential = getCredentialByUsername(credentials.username);
   const passwordOk =
     credential?.passwordHash != null && credential.passwordHash.length > 0
-      ? await verifyPassword(credentials.password, credential.passwordHash)
+      ? await withHashSlot(() => verifyPassword(credentials.password, credential.passwordHash as string))
       : false;
 
-  if (!credential || !passwordOk) return null;
+  if (!credential || !passwordOk) {
+    recordLoginFailure(req, credentials.username);
+    return null;
+  }
 
-  cacheBasicCredential(headerValue, credential.id);
+  clearLoginFailures(req, credentials.username);
+  cacheBasicCredential(headerValue, credential.id, credential.authEpoch);
   return getUserById(credential.id);
 }
 
@@ -272,7 +326,7 @@ export async function authenticateRequest(req: Request): Promise<AuthenticatedRe
 
   const authorization = req.headers.get("Authorization");
   if (authorization) {
-    const user = await authenticateBasic(authorization);
+    const user = await authenticateBasic(req, authorization);
     if (user) {
       const result = { user, via: "basic" as const };
       requestUserCache.set(req, result);
@@ -314,7 +368,12 @@ export async function setPasswordForUser(username: string, password: string): Pr
     if (!created) throw new PasswordError("Could not create user");
     return created;
   }
+  // setUserPassword bumps users.auth_epoch and deletes sessions transactionally
+  // (cross-process invalidation via the DB); also drop this process's cached
+  // Basic entries for the user.
   setUserPassword(credential.id, hash);
+  deleteSessionsForUser(credential.id);
+  clearBasicCacheForUser(credential.id);
   const user = getUserById(credential.id);
   if (!user) throw new PasswordError("Could not update user");
   return user;

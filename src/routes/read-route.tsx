@@ -4,7 +4,6 @@ import { lazy, Suspense, useCallback, useEffect } from "react";
 import { normalizeReaderLoadMode } from "@/components/reader-types";
 import { useBook } from "@/hooks/useBooksInfinite";
 import { loadReaderSettings } from "@/lib/reader-settings";
-
 const EpubReader = lazy(() =>
   import("@/components/EpubReader").then((m) => ({ default: m.EpubReader })),
 );
@@ -16,59 +15,52 @@ const ComicReader = lazy(() =>
 );
 
 export const Route = createFileRoute("/read/$id/$format")({
+  validateSearch: (search: Record<string, unknown>) => ({
+    from: typeof search.from === "string" ? search.from : undefined,
+    mode: typeof search.mode === "string" ? search.mode : undefined,
+  }),
   component: ReaderPage,
 });
 
+function isSafeReturnTo(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.startsWith("/") &&
+    !value.startsWith("//") &&
+    !value.startsWith("/read")
+  );
+}
+
 function ReaderPage() {
   const { id, format } = useParams({ from: "/read/$id/$format" });
+  const { from, mode: modeParam } = Route.useSearch();
   const bookId = /^\d+$/.test(id) ? Number(id) : Number.NaN;
   const navigate = useNavigate();
   const fmt = format.toUpperCase();
   const { data: book, isLoading, error } = useBook(bookId);
   // Explicit ?mode= in the URL wins; otherwise fall back to the user's default.
-  const modeParam = new URLSearchParams(window.location.search).get("mode");
   const loadMode = modeParam
     ? normalizeReaderLoadMode(modeParam)
     : loadReaderSettings().defaultLoadMode;
 
+  const returnTo = isSafeReturnTo(from) ? from : Number.isNaN(bookId) ? "/" : `/book/${bookId}`;
+
   const goBack = useCallback(() => {
-    if (!Number.isNaN(bookId)) {
-      navigate({ to: "/book/$id", params: { id: String(bookId) } });
-    } else {
-      navigate({ to: "/" });
-    }
-  }, [bookId, navigate]);
+    navigate({ to: returnTo });
+  }, [navigate, returnTo]);
 
-  // Ensure the browser's back button goes to the book detail instead of
-  // leaving the app when the reader was opened as a direct link (e.g.
-  // from an external referrer or a bookmark). In that case history has no
-  // in-app entry to go back to, so we insert the detail page behind the
-  // reader. Normal in-app navigation (library -> detail -> reader) already
-  // has the detail behind us, so we leave history alone.
+  // Ensure the reader URL carries an explicit return target (?from=...) via
+  // router navigation so Back always lands in-app, including direct opens
+  // and bookmarks. No document.referrer sniffing or raw history splicing.
   useEffect(() => {
-    if (Number.isNaN(bookId)) return;
-
-    let sameOriginReferrer = false;
-    try {
-      if (document.referrer) {
-        sameOriginReferrer = new URL(document.referrer).origin === window.location.origin;
-      }
-    } catch {
-      sameOriginReferrer = false;
-    }
-
-    // If the reader was reached via in-app navigation the referrer is same-origin
-    // (e.g. the book detail page) and there is already a useful entry behind us.
-    // Otherwise this is a direct open / external link and a single Back would
-    // leave Caliber, so insert the detail page behind the reader.
-    if (sameOriginReferrer) return;
-
-    const detailHref = `/book/${bookId}`;
-    const readerHref = window.location.href;
-    // Insert the detail entry behind the reader so Back lands on it.
-    window.history.replaceState(null, "", detailHref);
-    window.history.pushState(null, "", readerHref);
-  }, [bookId]);
+    if (Number.isNaN(bookId) || isSafeReturnTo(from)) return;
+    void navigate({
+      to: "/read/$id/$format",
+      params: { id: String(bookId), format: format.toLowerCase() },
+      search: { from: `/book/${bookId}`, mode: modeParam },
+      replace: true,
+    });
+  }, [bookId, from, format, navigate, modeParam]);
 
   if (isLoading) {
     return (
@@ -145,6 +137,7 @@ function ReaderPage() {
           bookId={bookId}
           onBack={goBack}
           title={bookTitle}
+          format={fmt as "CBZ" | "CBR"}
           streamManifestUrl={`/api/books/${bookId}/pages/${fmt}/manifest`}
           fullUrl={bookUrl}
           supportsFullFile={fmt === "CBZ"}

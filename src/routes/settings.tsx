@@ -80,6 +80,7 @@ function SettingsComponent() {
         <div className="flex items-center gap-3 mb-6">
           <Link
             to="/"
+            search={{ q: "", view: "list", sortBy: "added", sortOrder: "desc", tag: [] }}
             className="p-2 -ml-2 rounded-lg text-ink-muted hover:text-ink hover:bg-ink/5 transition-colors"
             aria-label="Back to library"
           >

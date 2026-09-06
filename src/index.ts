@@ -14,8 +14,12 @@ import {
   listBooksByFormatCursor,
   getCatalogEntry,
   getBookByIdOptimized,
+  getBooksByIdsOptimized,
   getLibraryStats,
   getBookCount,
+  getSnapshotRevision,
+  getSnapshotStatus,
+  acquireSnapshotLease,
   streamBooks,
   getLibraryPath,
   getBookFormatPath,
@@ -33,6 +37,7 @@ import {
   OPDS_ACQUISITION_TYPE,
   OPDS_NAVIGATION_TYPE,
   OPENSEARCH_TYPE,
+  getRequestPrefix,
   renderAcquisitionFeed,
   renderCatalogFeed,
   renderNavigationFeed,
@@ -102,7 +107,7 @@ const DEFAULT_PORT = 3003;
 const MAX_QUERY_LIMIT = 100;
 const MAX_STREAM_BATCH_SIZE = 5000;
 const LOCAL_SETUP_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
-const SORT_FIELDS = ["title", "author", "added", "rating"] as const;
+const SORT_FIELDS = ["title", "author", "added", "rating", "series_index"] as const;
 const SORT_ORDERS = ["asc", "desc"] as const;
 const OPTIONAL_EPUB_DISPLAY_OPTIONS_PATH = "META-INF/com.apple.ibooks.display-options.xml";
 const FORMAT_PATTERN = /^[A-Za-z0-9]{1,10}$/;
@@ -199,13 +204,28 @@ function publicUser(user: User) {
   return { id: user.id, username: user.username };
 }
 
-// Auth administration (toggle, accounts) is a local-operator action: allowed
-// when Caliber is bound to loopback, or — once auth is on — for a signed-in
-// user. On a network-exposed instance without auth it stays env/CLI-only.
+// Auth administration (toggle, accounts) is a local-operator action.
+// Trust model: when auth is enabled, ALL authenticated users are trusted as
+// operators (there is no separate admin role). Set CALIBER_ADMIN_RESTRICTED=1
+// to disable this all-users-trusted default and deny management even to
+// signed-in users (loopback operators only). When auth is disabled, management
+// is denied unless the server is bound to loopback AND the operator explicitly
+// opts in with CALIBER_ALLOW_NOAUTH_ADMIN=1.
+const ALLOW_ALL_USERS_AS_ADMINS = process.env.CALIBER_ADMIN_RESTRICTED !== "1";
 async function canManageAuth(req: Request): Promise<boolean> {
+  if (!AUTH_ENABLED) {
+    if (!LOCAL_SETUP_HOSTS.has(HOST.toLowerCase())) return false;
+    if (process.env.CALIBER_ALLOW_NOAUTH_ADMIN !== "1") return false;
+    return true;
+  }
   if (LOCAL_SETUP_HOSTS.has(HOST.toLowerCase())) return true;
+  if (!ALLOW_ALL_USERS_AS_ADMINS) return false;
   return (await currentUser(req)) !== null;
 }
+
+// Serializes first-run setup so concurrent POSTs cannot both pass the
+// needsInitialSetup check and create duplicate bootstrap accounts.
+let setupMutex: Promise<void> = Promise.resolve();
 
 // Initialize FTS on startup. A missing default library should leave the UI
 // reachable so the local operator can select a different database in Settings.
@@ -278,34 +298,81 @@ function generateETag(data: string): string {
   return `"${hash.toString(36)}"`;
 }
 
-function getCachedResponse(cacheKey: string, data: unknown, req: Request): Response {
+// Authenticated responses must never be served from shared caches: any
+// request carrying an Authorization header or a session cookie gets a
+// private (or no-store, for per-user endpoints) Cache-Control, including on
+// 304s. Only anonymous-public responses get public.
+function requestLooksAuthenticated(req: Request): boolean {
+  if (req.headers.get("Authorization")) return true;
+  const cookie = req.headers.get("Cookie");
+  return cookie !== null && /(?:^|;\s*)(?:caliber-session|caliber-user)=/.test(cookie);
+}
+
+function cacheControlFor(req: Request, isSensitive = false): string {
+  if (isSensitive || requestLooksAuthenticated(req)) {
+    return isSensitive ? "private, no-store" : "private, max-age=60";
+  }
+  return "public, max-age=60";
+}
+
+function coverCacheControlFor(req: Request): string {
+  if (requestLooksAuthenticated(req)) return "private, max-age=60, must-revalidate";
+  return "public, max-age=300, must-revalidate";
+}
+
+// Shared-cache key: includes the snapshot revision (normalized params are
+// already part of `base` at each call site) so a DB refresh invalidates
+// stale list/detail/OPDS entries. Auth is kept separate from the shared
+// cache: authenticated requests get a private namespace and never
+// read/populate anonymous entries.
+function sharedCacheKey(base: string, req: Request): string {
+  const revision = getSnapshotRevision();
+  if (requestLooksAuthenticated(req)) {
+    return `auth-private:rev${revision}:${base}`;
+  }
+  return `shared:rev${revision}:${base}`;
+}
+
+function getCachedResponse(
+  cacheKey: string,
+  dataOrProducer: unknown | (() => unknown),
+  req: Request,
+): Response {
+  const key = sharedCacheKey(cacheKey, req);
   const now = Date.now();
-  const cached = apiCache.get(cacheKey);
+  const cached = apiCache.get(key);
+  const cacheControl = cacheControlFor(req);
 
   if (cached && now - cached.timestamp < CACHE_TTL) {
     const ifNoneMatch = req.headers.get("If-None-Match");
     if (ifNoneMatch === cached.etag) {
-      return new Response(null, { status: 304, headers: { ETag: cached.etag } });
+      return new Response(null, { status: 304, headers: { ETag: cached.etag, "Cache-Control": cacheControl } });
     }
 
     return new Response(cached.data, {
       headers: {
         "Content-Type": "application/json",
-        "Cache-Control": "public, max-age=60",
+        "Cache-Control": cacheControl,
         ETag: cached.etag,
       },
     });
   }
 
+  // Lazy producer: the DB query only runs on a cache miss. A producer may
+  // return a Response to bypass the cache (e.g. 404s, which must not be stored).
+  const data =
+    typeof dataOrProducer === "function" ? (dataOrProducer as () => unknown)() : dataOrProducer;
+  if (data instanceof Response) return data;
+
   const jsonData = JSON.stringify(data);
   const etag = generateETag(jsonData);
 
-  apiCache.set(cacheKey, { data: jsonData, etag, timestamp: now });
+  apiCache.set(key, { data: jsonData, etag, timestamp: now });
 
   return new Response(jsonData, {
     headers: {
       "Content-Type": "application/json",
-      "Cache-Control": "public, max-age=60",
+      "Cache-Control": cacheControl,
       ETag: etag,
     },
   });
@@ -313,36 +380,44 @@ function getCachedResponse(cacheKey: string, data: unknown, req: Request): Respo
 
 function getCachedTextResponse(
   cacheKey: string,
-  data: string,
+  dataOrProducer: string | (() => string | Response),
   req: Request,
   contentType: string,
   cacheControl: string = "public, max-age=60",
 ): Response {
+  const key = sharedCacheKey(cacheKey, req);
   const now = Date.now();
-  const cached = apiCache.get(cacheKey);
+  const cached = apiCache.get(key);
+  // Sensitive callers pass no-store explicitly; otherwise derive from auth.
+  const effectiveControl = cacheControl.includes("no-store")
+    ? cacheControl
+    : cacheControlFor(req);
 
   if (cached && now - cached.timestamp < CACHE_TTL) {
     const ifNoneMatch = req.headers.get("If-None-Match");
     if (ifNoneMatch === cached.etag) {
-      return new Response(null, { status: 304, headers: { ETag: cached.etag } });
+      return new Response(null, { status: 304, headers: { ETag: cached.etag, "Cache-Control": effectiveControl } });
     }
 
     return new Response(cached.data, {
       headers: {
         "Content-Type": contentType,
-        "Cache-Control": cacheControl,
+        "Cache-Control": effectiveControl,
         ETag: cached.etag,
       },
     });
   }
 
+  const data = typeof dataOrProducer === "function" ? dataOrProducer() : dataOrProducer;
+  if (data instanceof Response) return data;
+
   const etag = generateETag(data);
-  apiCache.set(cacheKey, { data, etag, timestamp: now });
+  apiCache.set(key, { data, etag, timestamp: now });
 
   return new Response(data, {
     headers: {
       "Content-Type": contentType,
-      "Cache-Control": cacheControl,
+      "Cache-Control": effectiveControl,
       ETag: etag,
     },
   });
@@ -367,6 +442,20 @@ function getPublicBaseUrl(req: Request): string {
 function getRequestPath(req: Request): string {
   const url = new URL(req.url);
   return `${url.pathname}${url.search}`;
+}
+
+// F24: deployment path prefix shared with OPDS absoluteUrl (X-Forwarded-Prefix
+// when behind a trusted proxy, else BASE_PATH). Threaded into every feed
+// render so entry hrefs keep working under a sub-path mount.
+function opdsPathPrefix(req: Request): string {
+  return getRequestPrefix(req, TRUST_PROXY);
+}
+
+// F22: wall-clock instant for navigation/catalog feeds, truncated to the
+// minute so repeated renders of unchanged state produce stable XML (and a
+// deterministic ETag) within the feed cache TTL.
+function opdsNow(): string {
+  return new Date(Math.floor(Date.now() / 60000) * 60000).toISOString();
 }
 
 function buildPath(pathname: string, params: Record<string, string | number | null | undefined>) {
@@ -427,29 +516,34 @@ function opdsCatalogResponse(
   req: Request,
   title: string,
   basePath: string,
-  result: CursorPaginatedResult<CatalogEntry>,
+  queryOrResult: CursorPaginatedResult<CatalogEntry> | (() => CursorPaginatedResult<CatalogEntry>),
   entryHref: (entry: CatalogEntry) => string,
 ): Response {
   const { limit } = parseOpdsCatalogParams(req);
   const baseUrl = getPublicBaseUrl(req);
   const selfPath = getRequestPath(req);
-  const nextPath = result.nextCursor
-    ? buildPath(basePath, { cursor: result.nextCursor, limit })
-    : undefined;
-  const feed = renderCatalogFeed({
-    baseUrl,
-    selfPath,
-    title,
-    id: new URL(selfPath, baseUrl).toString(),
-    updated: new Date().toISOString(),
-    result,
-    nextPath,
-    entryHref,
-  });
+  const pathPrefix = opdsPathPrefix(req);
 
+  // Lazy: the catalog query + feed render only run on a cache miss.
   return getCachedTextResponse(
-    `opds:catalog:${baseUrl}:${selfPath}`,
-    feed,
+    `opds:catalog:${baseUrl}:${pathPrefix}:${selfPath}`,
+    () => {
+      const result = typeof queryOrResult === "function" ? queryOrResult() : queryOrResult;
+      const nextPath = result.nextCursor
+        ? buildPath(basePath, { cursor: result.nextCursor, limit })
+        : undefined;
+      return renderCatalogFeed({
+        baseUrl,
+        pathPrefix,
+        selfPath,
+        title,
+        id: new URL(selfPath, baseUrl).toString(),
+        updated: opdsNow(),
+        result,
+        nextPath,
+        entryHref,
+      });
+    },
     req,
     `${OPDS_NAVIGATION_TYPE}; charset=utf-8`,
   );
@@ -459,7 +553,9 @@ function opdsAcquisitionResponse(
   req: Request,
   title: string,
   basePath: string,
-  result: CursorPaginatedResult<BookListItem>,
+  queryOrResult:
+    | CursorPaginatedResult<BookListItem>
+    | (() => CursorPaginatedResult<BookListItem>),
   options?: { sortBy?: SortField; sortOrder?: SortOrder; noStore?: boolean },
 ): Response {
   const params = parseOpdsPageParams(req);
@@ -467,26 +563,32 @@ function opdsAcquisitionResponse(
   const sortOrder = options?.sortOrder ?? params.sortOrder;
   const baseUrl = getPublicBaseUrl(req);
   const selfPath = getRequestPath(req);
-  const nextPath = result.nextCursor
-    ? buildPath(basePath, {
-        cursor: result.nextCursor,
-        limit: params.limit,
-        sortBy,
-        sortOrder,
-      })
-    : undefined;
-  const feed = renderAcquisitionFeed({
-    baseUrl,
-    selfPath,
-    title,
-    id: new URL(selfPath, baseUrl).toString(),
-    updated: new Date().toISOString(),
-    result,
-    nextPath,
-  });
+  const pathPrefix = opdsPathPrefix(req);
+
+  const renderFeed = (result: CursorPaginatedResult<BookListItem>): string => {
+    const nextPath = result.nextCursor
+      ? buildPath(basePath, {
+          cursor: result.nextCursor,
+          limit: params.limit,
+          sortBy,
+          sortOrder,
+        })
+      : undefined;
+    return renderAcquisitionFeed({
+      baseUrl,
+      pathPrefix,
+      selfPath,
+      title,
+      id: new URL(selfPath, baseUrl).toString(),
+      updated: opdsNow(),
+      result,
+      nextPath,
+    });
+  };
 
   if (options?.noStore) {
-    return new Response(feed, {
+    const result = typeof queryOrResult === "function" ? queryOrResult() : queryOrResult;
+    return new Response(renderFeed(result), {
       headers: {
         "Content-Type": `${OPDS_ACQUISITION_TYPE}; charset=utf-8`,
         "Cache-Control": "no-store",
@@ -494,9 +596,13 @@ function opdsAcquisitionResponse(
     });
   }
 
+  // Lazy: the book query + feed render only run on a cache miss.
   return getCachedTextResponse(
-    `opds:acquisition:${baseUrl}:${selfPath}`,
-    feed,
+    `opds:acquisition:${baseUrl}:${pathPrefix}:${selfPath}`,
+    () => {
+      const result = typeof queryOrResult === "function" ? queryOrResult() : queryOrResult;
+      return renderFeed(result);
+    },
     req,
     `${OPDS_ACQUISITION_TYPE}; charset=utf-8`,
   );
@@ -715,6 +821,98 @@ function routeErrorResponse(error: unknown, logLabel: string, message: string): 
   return Response.json({ error: message }, { status: 500 });
 }
 
+// F24: shared artwork handlers behind both /api and the challenge-capable
+// /opds file routes so OPDS clients use the same bytes and validators.
+async function serveCoverById(req: Request, id: number): Promise<Response> {
+  const coverPath = getBookCoverPath(id);
+  if (!coverPath) {
+    return Response.json({ error: "Cover not found" }, { status: 404 });
+  }
+
+  const file = Bun.file(coverPath);
+  if (!(await file.exists())) {
+    return Response.json({ error: "Cover file not found" }, { status: 404 });
+  }
+
+  const fileStat = await file.stat();
+  const etag = `"${fileStat.size}-${fileStat.mtime?.getTime() || 0}"`;
+
+  const ifNoneMatch = req.headers.get("If-None-Match");
+  if (ifNoneMatch === etag) {
+    return new Response(null, {
+      status: 304,
+      headers: {
+        ETag: etag,
+        "Cache-Control": coverCacheControlFor(req),
+      },
+    });
+  }
+
+  return new Response(file, {
+    headers: {
+      "Content-Type": "image/jpeg",
+      "Cache-Control": coverCacheControlFor(req),
+      ETag: etag,
+    },
+  });
+}
+
+async function serveThumbById(req: Request, id: number): Promise<Response> {
+  const url = new URL(req.url);
+  const size = parseThumbSize(url.searchParams.get("size"));
+
+  const coverPath = getBookCoverPath(id);
+  if (!coverPath) {
+    return Response.json({ error: "Cover not found" }, { status: 404 });
+  }
+
+  const coverFile = Bun.file(coverPath);
+  if (!(await coverFile.exists())) {
+    return Response.json({ error: "Cover file not found" }, { status: 404 });
+  }
+
+  // Revision key over (library, cover size, cover mtime).
+  const fileStat = await coverFile.stat();
+  const mtimeMs = fileStat.mtime?.getTime() || 0;
+  const sig = Bun.hash(`${LIBRARY_PATH}:${fileStat.size}:${mtimeMs}`).toString(36);
+  const etag = `"t${size}-${sig}"`;
+  const cacheControl = coverCacheControlFor(req);
+
+  const ifNoneMatch = req.headers.get("If-None-Match");
+  if (ifNoneMatch === etag) {
+    return new Response(null, {
+      status: 304,
+      headers: { ETag: etag, "Cache-Control": cacheControl },
+    });
+  }
+
+  const thumbDir = join(WORK_DIR, "thumbs");
+  const thumbPath = join(thumbDir, `${id}-${size}-${sig}.jpg`);
+  const thumbFile = Bun.file(thumbPath);
+
+  if (!(await thumbFile.exists())) {
+    await runThumbJob(async () => {
+      if (await thumbFile.exists()) return;
+      const { mkdir } = await import("node:fs/promises");
+      await mkdir(thumbDir, { recursive: true });
+      const original = new Uint8Array(await coverFile.arrayBuffer());
+      const resized = await tryResizeImage(original, THUMB_SIZES[size]);
+      await Bun.write(thumbPath, resized ?? original);
+    });
+  }
+
+  if (!(await thumbFile.exists())) {
+    return Response.json({ error: "Failed to get thumbnail" }, { status: 500 });
+  }
+  return new Response(thumbFile, {
+    headers: {
+      "Content-Type": "image/jpeg",
+      "Cache-Control": cacheControl,
+      ETag: etag,
+    },
+  });
+}
+
 function pageStreamingErrorResponse(error: unknown): Response {
   if (error instanceof PageStreamingError) {
     return Response.json({ error: error.message }, { status: error.status });
@@ -737,6 +935,58 @@ function epubEntryErrorResponse(error: unknown): Response {
 }
 
 const streamEncoder = new TextEncoder();
+
+// --- Cover thumbnails (F17) ------------------------------------------------
+// ?size=small (default, 256px wide) or ?size=medium (512px wide). Thumbnails
+// are cached on disk as {id}-{size}-{sig}.jpg where sig is a revision key
+// over (library path, cover size, cover mtime), so a changed cover naturally
+// misses the old file. Resize uses Bun's built-in image API when present;
+// otherwise the original bytes are served with correct headers (Sharp-free
+// fallback). Generations run through a FIFO queue with max 2 concurrent jobs.
+const THUMB_SIZES = { small: 256, medium: 512 } as const;
+type ThumbSize = keyof typeof THUMB_SIZES;
+
+function parseThumbSize(value: string | null): ThumbSize {
+  return value === "medium" ? "medium" : "small";
+}
+
+const THUMB_MAX_CONCURRENT = 2;
+let thumbActiveJobs = 0;
+const thumbWaitQueue: Array<() => void> = [];
+
+function runThumbJob<T>(job: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const run = () => {
+      thumbActiveJobs += 1;
+      job().then(resolve, reject).finally(() => {
+        thumbActiveJobs -= 1;
+        const next = thumbWaitQueue.shift();
+        if (next) next();
+      });
+    };
+    if (thumbActiveJobs < THUMB_MAX_CONCURRENT) run();
+    else thumbWaitQueue.push(run);
+  });
+}
+
+// Resize via Bun's built-in image API when available; null means "unavailable,
+// caller falls back to the original bytes".
+async function tryResizeImage(
+  bytes: Uint8Array,
+  targetWidth: number,
+): Promise<Uint8Array | null> {
+  const bunGlobal = Bun as unknown as Record<string, unknown>;
+  const resize = bunGlobal.resize;
+  if (typeof resize !== "function") return null;
+  try {
+    const out = await (
+      resize as (input: Uint8Array, width: number) => Promise<Uint8Array> | Uint8Array
+    )(bytes, targetWidth);
+    return out ?? null;
+  } catch {
+    return null;
+  }
+}
 
 // Streaming JSON response for large datasets
 async function* streamBooksJSON(
@@ -768,11 +1018,24 @@ const routes: RouteTable = {
     // Local setup/configuration surface. The server binds to loopback by
     // default; deployments exposing it beyond the host should add auth.
     "/api/config/library": {
-      GET: () =>
-        Response.json(
-          { ...getLibraryConfigStatus(), ready: libraryReady },
+      GET: () => {
+        const snapshot = getSnapshotStatus();
+        return Response.json(
+          {
+            ...getLibraryConfigStatus(),
+            ready: libraryReady,
+            // Snapshot generation status (F15): stale while a refresh is
+            // pending/deferred, refreshing during publish, failed with the
+            // last publish error (null when healthy).
+            stale: snapshot.stale,
+            refreshing: snapshot.refreshing,
+            failed: snapshot.failed,
+            generation: snapshot.generation,
+            revision: snapshot.revision,
+          },
           { headers: { "Cache-Control": "no-store" } },
-        ),
+        );
+      },
       PUT: async (req) => {
         if (!LOCAL_SETUP_HOSTS.has(HOST.toLowerCase())) {
           return Response.json(
@@ -817,8 +1080,7 @@ const routes: RouteTable = {
     // Library stats
     "/api/stats": {
       GET: (req) => {
-        const stats = getLibraryStats();
-        return getCachedResponse("stats", stats, req);
+        return getCachedResponse("stats", () => getLibraryStats(), req);
       },
     },
 
@@ -992,6 +1254,17 @@ const routes: RouteTable = {
           );
         }
         const username = decodeURIComponent(req.params.username ?? "");
+        const target = getCredentialByUsername(username);
+        if (!target) {
+          return Response.json({ error: "User not found" }, { status: 404 });
+        }
+        // Never delete the last account that can log in.
+        if (target.passwordHash && countUsersWithPassword() <= 1) {
+          return Response.json(
+            { error: "Cannot delete the last user with a password" },
+            { status: 409, headers: { "Cache-Control": "no-store" } },
+          );
+        }
         const removed = deleteUser(username);
         if (!removed) {
           return Response.json({ error: "User not found" }, { status: 404 });
@@ -1049,16 +1322,14 @@ const routes: RouteTable = {
     // All tags with book counts (for the tag filter UI)
     "/api/tags": {
       GET: (req) => {
-        const tags = listAllTags();
-        return getCachedResponse("tags", tags, req);
+        return getCachedResponse("tags", () => listAllTags(), req);
       },
     },
 
     // Book count (lightweight)
     "/api/books/count": {
       GET: (req) => {
-        const count = getBookCount();
-        return getCachedResponse("count", { count }, req);
+        return getCachedResponse("count", () => ({ count: getBookCount() }), req);
       },
     },
 
@@ -1144,60 +1415,81 @@ const routes: RouteTable = {
     // user can log in yet, so an exposed instance cannot be claimed later.
     "/api/auth/setup": {
       POST: async (req) => {
-        if (!AUTH_ENABLED) {
-          return Response.json(
-            { error: "Authentication is disabled" },
-            { status: 403, headers: { "Cache-Control": "no-store" } },
-          );
-        }
-        if (!needsInitialSetup()) {
-          return Response.json(
-            { error: "Setup is already complete; ask an existing user or use the CLI to add accounts" },
-            { status: 403, headers: { "Cache-Control": "no-store" } },
-          );
-        }
-
-        const rawBody = await readJsonBodyOr400(req);
-        if (rawBody instanceof Response) return rawBody;
-        if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
-          return Response.json({ error: "Request body must be an object" }, { status: 400 });
-        }
-        const body = rawBody as { username?: unknown; password?: unknown };
-        const username = typeof body.username === "string" ? body.username : "";
-        const password = typeof body.password === "string" ? body.password : "";
-        if (!isValidUsername(username)) {
-          return Response.json({ error: "Invalid username" }, { status: 400 });
-        }
-        if (password.length < MIN_PASSWORD_LENGTH) {
-          return Response.json(
-            { error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` },
-            { status: 400 },
-          );
-        }
-        if (loginRateLimited(req, username)) {
-          return Response.json(
-            { error: "Too many failed attempts; try again later" },
-            { status: 429, headers: { "Cache-Control": "no-store" } },
-          );
-        }
-
+        // Serialize bootstrap: recheck inside the mutex so concurrent
+        // requests cannot both create the first account.
+        const previous = setupMutex;
+        let release!: () => void;
+        setupMutex = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        await previous;
         try {
-          const user = await setPasswordForUser(username, password);
-          const session = createSessionToken(user.id);
-          return Response.json(
-            { user: publicUser(user) },
-            {
-              headers: {
-                "Set-Cookie": sessionCookieHeader(session.token),
-                "Cache-Control": "private, no-store",
-              },
-            },
-          );
-        } catch (error) {
-          if (error instanceof PasswordError) {
-            return Response.json({ error: error.message }, { status: 400 });
+          if (!AUTH_ENABLED) {
+            return Response.json(
+              { error: "Authentication is disabled" },
+              { status: 403, headers: { "Cache-Control": "no-store" } },
+            );
           }
-          throw error;
+          if (!needsInitialSetup()) {
+            return Response.json(
+              { error: "Setup is already complete; ask an existing user or use the CLI to add accounts" },
+              { status: 403, headers: { "Cache-Control": "no-store" } },
+            );
+          }
+
+          const rawBody = await readJsonBodyOr400(req);
+          if (rawBody instanceof Response) return rawBody;
+          if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
+            return Response.json({ error: "Request body must be an object" }, { status: 400 });
+          }
+          const body = rawBody as { username?: unknown; password?: unknown };
+          const username = typeof body.username === "string" ? body.username : "";
+          const password = typeof body.password === "string" ? body.password : "";
+          if (!isValidUsername(username)) {
+            return Response.json({ error: "Invalid username" }, { status: 400 });
+          }
+          if (password.length < MIN_PASSWORD_LENGTH) {
+            return Response.json(
+              { error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` },
+              { status: 400 },
+            );
+          }
+          if (loginRateLimited(req, username)) {
+            return Response.json(
+              { error: "Too many failed attempts; try again later" },
+              { status: 429, headers: { "Cache-Control": "no-store" } },
+            );
+          }
+
+          // Recheck after validation: another request may have completed setup
+          // while this one was awaiting the mutex or hashing inputs.
+          if (!needsInitialSetup()) {
+            return Response.json(
+              { error: "Setup is already complete; ask an existing user or use the CLI to add accounts" },
+              { status: 403, headers: { "Cache-Control": "no-store" } },
+            );
+          }
+
+          try {
+            const user = await setPasswordForUser(username, password);
+            const session = createSessionToken(user.id);
+            return Response.json(
+              { user: publicUser(user) },
+              {
+                headers: {
+                  "Set-Cookie": sessionCookieHeader(session.token),
+                  "Cache-Control": "private, no-store",
+                },
+              },
+            );
+          } catch (error) {
+            if (error instanceof PasswordError) {
+              return Response.json({ error: error.message }, { status: 400 });
+            }
+            throw error;
+          }
+        } finally {
+          release();
         }
       },
     },
@@ -1228,9 +1520,12 @@ const routes: RouteTable = {
         const url = new URL(req.url);
         const limit = parseBoundedInt(url.searchParams.get("limit"), 200, { min: 1, max: 500 });
         const rows = listProgress(user.id, limit);
+        // Batch enrichment: one WHERE id IN (...) lookup instead of one
+        // getBookByIdOptimized round-trip per row.
+        const booksById = getBooksByIdsOptimized(rows.map((row) => row.bookId));
         const items = [];
         for (const row of rows) {
-          const book = getBookByIdOptimized(row.bookId);
+          const book = booksById.get(row.bookId);
           if (!book) continue; // book removed from library — skip
           items.push({
             book: {
@@ -1313,6 +1608,48 @@ const routes: RouteTable = {
           { headers: { "Cache-Control": "private, no-store" } },
         );
       },
+      // POST alias for PUT: navigator.sendBeacon can only POST, and the
+      // client treats beacon queueing as unacked until a PUT/POST returns ok.
+      POST: async (req) => {
+        const bookId = parseBookId(req.params.bookId ?? "");
+        if (bookId === null) {
+          return Response.json({ error: "Invalid book id" }, { status: 400 });
+        }
+        const user = await currentUser(req);
+        if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
+
+        const book = getBookByIdOptimized(bookId);
+        if (!book) return Response.json({ error: "Book not found" }, { status: 404 });
+
+        const rawBody = await readJsonBodyOr400(req);
+        if (rawBody instanceof Response) return rawBody;
+
+        if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
+          return Response.json({ error: "Request body must be an object" }, { status: 400 });
+        }
+
+        const body = rawBody as {
+          format?: unknown;
+          location?: unknown;
+          percentage?: unknown;
+          finished?: unknown;
+        };
+        const format = typeof body.format === "string" ? body.format.trim().toUpperCase() : "";
+        if (!FORMAT_PATTERN.test(format) || !book.formats.includes(format)) {
+          return Response.json({ error: "Invalid book format" }, { status: 400 });
+        }
+
+        const progress = upsertProgress(user.id, bookId, {
+          format,
+          location: typeof body.location === "string" ? body.location : null,
+          percentage: typeof body.percentage === "number" ? body.percentage : 0,
+          finished: body.finished === true,
+        });
+        return Response.json(
+          { progress },
+          { headers: { "Cache-Control": "private, no-store" } },
+        );
+      },
       DELETE: async (req) => {
         const bookId = parseBookId(req.params.bookId ?? "");
         if (bookId === null) {
@@ -1332,16 +1669,19 @@ const routes: RouteTable = {
       GET: (req) => {
         try {
           const baseUrl = getPublicBaseUrl(req);
-          const updated = new Date().toISOString();
-          const feed = renderNavigationFeed({
-            baseUrl,
-            updated,
-            totalBooks: getBookCount(),
-          });
+          const pathPrefix = opdsPathPrefix(req);
+          const updated = opdsNow();
+          const selfPath = getRequestPath(req);
 
           return getCachedTextResponse(
-            `opds:root:${baseUrl}`,
-            feed,
+            `opds:root:${baseUrl}:${pathPrefix}:${selfPath}`,
+            () =>
+              renderNavigationFeed({
+                baseUrl,
+                pathPrefix,
+                updated,
+                totalBooks: getBookCount(),
+              }),
             req,
             `${OPDS_NAVIGATION_TYPE}; charset=utf-8`,
           );
@@ -1357,11 +1697,12 @@ const routes: RouteTable = {
       GET: (req) => {
         try {
           const baseUrl = getPublicBaseUrl(req);
-          const description = renderOpenSearchDescription(baseUrl);
+          const pathPrefix = opdsPathPrefix(req);
+          const selfPath = getRequestPath(req);
 
           return getCachedTextResponse(
-            `opds:search-description:${baseUrl}`,
-            description,
+            `opds:search-description:${baseUrl}:${pathPrefix}:${selfPath}`,
+            () => renderOpenSearchDescription(baseUrl, pathPrefix),
             req,
             `${OPENSEARCH_TYPE}; charset=utf-8`,
             "public, max-age=3600",
@@ -1381,9 +1722,10 @@ const routes: RouteTable = {
       GET: (req) => {
         try {
           const params = parseOpdsPageParams(req);
-          const result = listBooksCursor(params);
           const title = params.sortBy === "added" ? "Recently added" : "All books";
-          return opdsAcquisitionResponse(req, title, "/opds/books", result);
+          return opdsAcquisitionResponse(req, title, "/opds/books", () =>
+            listBooksCursor({ ...params, requireFormats: true }),
+          );
         } catch (error) {
           return routeErrorResponse(error, "Error rendering OPDS books:", "Failed to render OPDS books");
         }
@@ -1395,14 +1737,15 @@ const routes: RouteTable = {
       GET: (req) => {
         try {
           const params = parseOpdsPageParams(req);
-          const result = listBooksCursor({
-            cursor: params.cursor,
-            limit: params.limit,
-            sortBy: "added",
-            sortOrder: "desc",
-          });
-
-          return opdsAcquisitionResponse(req, "Recently added", "/opds/recent", result, {
+          return opdsAcquisitionResponse(req, "Recently added", "/opds/recent", () =>
+            listBooksCursor({
+              cursor: params.cursor,
+              limit: params.limit,
+              sortBy: "added",
+              sortOrder: "desc",
+              requireFormats: true,
+            }),
+          {
             sortBy: "added",
             sortOrder: "desc",
           });
@@ -1417,8 +1760,7 @@ const routes: RouteTable = {
       GET: (req) => {
         try {
           const params = parseOpdsCatalogParams(req);
-          const result = listAuthorsCursor(params);
-          return opdsCatalogResponse(req, "Authors", "/opds/authors", result, (entry) =>
+          return opdsCatalogResponse(req, "Authors", "/opds/authors", () => listAuthorsCursor(params), (entry) =>
             `/opds/authors/${encodeURIComponent(String(entry.id))}/books`
           );
         } catch (error) {
@@ -1441,8 +1783,9 @@ const routes: RouteTable = {
           }
 
           const params = parseOpdsPageParams(req);
-          const result = listBooksByAuthorCursor(id, params);
-          return opdsAcquisitionResponse(req, `Author: ${entry.title}`, `/opds/authors/${id}/books`, result);
+          return opdsAcquisitionResponse(req, `Author: ${entry.title}`, `/opds/authors/${id}/books`, () =>
+            listBooksByAuthorCursor(id, { ...params, requireFormats: true }),
+          );
         } catch (error) {
           return routeErrorResponse(error, "Error rendering OPDS author books:", "Failed to render OPDS author books");
         }
@@ -1454,8 +1797,7 @@ const routes: RouteTable = {
       GET: (req) => {
         try {
           const params = parseOpdsCatalogParams(req);
-          const result = listSeriesCursor(params);
-          return opdsCatalogResponse(req, "Series", "/opds/series", result, (entry) =>
+          return opdsCatalogResponse(req, "Series", "/opds/series", () => listSeriesCursor(params), (entry) =>
             `/opds/series/${encodeURIComponent(String(entry.id))}/books`
           );
         } catch (error) {
@@ -1478,8 +1820,17 @@ const routes: RouteTable = {
           }
 
           const params = parseOpdsPageParams(req);
-          const result = listBooksBySeriesCursor(id, params);
-          return opdsAcquisitionResponse(req, `Series: ${entry.title}`, `/opds/series/${id}/books`, result);
+          // F25: series books default to series_index order unless the caller
+          // passes an explicit sortBy.
+          const explicitSortBy = new URL(req.url).searchParams.get("sortBy");
+          const seriesSortBy = explicitSortBy ? params.sortBy : "series_index";
+          return opdsAcquisitionResponse(
+            req,
+            `Series: ${entry.title}`,
+            `/opds/series/${id}/books`,
+            () => listBooksBySeriesCursor(id, { ...params, sortBy: seriesSortBy, requireFormats: true }),
+            { sortBy: seriesSortBy, sortOrder: params.sortOrder },
+          );
         } catch (error) {
           return routeErrorResponse(error, "Error rendering OPDS series books:", "Failed to render OPDS series books");
         }
@@ -1491,8 +1842,7 @@ const routes: RouteTable = {
       GET: (req) => {
         try {
           const params = parseOpdsCatalogParams(req);
-          const result = listTagsCursor(params);
-          return opdsCatalogResponse(req, "Tags", "/opds/tags", result, (entry) =>
+          return opdsCatalogResponse(req, "Tags", "/opds/tags", () => listTagsCursor(params), (entry) =>
             `/opds/tags/${encodeURIComponent(String(entry.id))}/books`
           );
         } catch (error) {
@@ -1515,8 +1865,9 @@ const routes: RouteTable = {
           }
 
           const params = parseOpdsPageParams(req);
-          const result = listBooksByTagCursor(id, params);
-          return opdsAcquisitionResponse(req, `Tag: ${entry.title}`, `/opds/tags/${id}/books`, result);
+          return opdsAcquisitionResponse(req, `Tag: ${entry.title}`, `/opds/tags/${id}/books`, () =>
+            listBooksByTagCursor(id, { ...params, requireFormats: true }),
+          );
         } catch (error) {
           return routeErrorResponse(error, "Error rendering OPDS tag books:", "Failed to render OPDS tag books");
         }
@@ -1528,8 +1879,7 @@ const routes: RouteTable = {
       GET: (req) => {
         try {
           const params = parseOpdsCatalogParams(req);
-          const result = listFormatsCursor(params);
-          return opdsCatalogResponse(req, "Formats", "/opds/formats", result, (entry) =>
+          return opdsCatalogResponse(req, "Formats", "/opds/formats", () => listFormatsCursor(params), (entry) =>
             `/opds/formats/${encodeURIComponent(String(entry.id))}/books`
           );
         } catch (error) {
@@ -1548,12 +1898,11 @@ const routes: RouteTable = {
           }
 
           const params = parseOpdsPageParams(req);
-          const result = listBooksByFormatCursor(format, params);
           return opdsAcquisitionResponse(
             req,
             `Format: ${entry.title}`,
             `/opds/formats/${encodeURIComponent(format)}/books`,
-            result,
+            () => listBooksByFormatCursor(format, { ...params, requireFormats: true }),
           );
         } catch (error) {
           return routeErrorResponse(error, "Error rendering OPDS format books:", "Failed to render OPDS format books");
@@ -1567,6 +1916,7 @@ const routes: RouteTable = {
         try {
           const url = new URL(req.url);
           const baseUrl = getPublicBaseUrl(req);
+          const pathPrefix = opdsPathPrefix(req);
           const query = url.searchParams.get("q") || "";
           const cursor = url.searchParams.get("cursor") || undefined;
           const limit = parseBoundedInt(url.searchParams.get("limit"), 50, {
@@ -1575,7 +1925,7 @@ const routes: RouteTable = {
           });
           const sortBy = parseSortField(url.searchParams.get("sortBy"));
           const sortOrder = parseSortOrder(url.searchParams.get("sortOrder"));
-          const result = searchBooksCursor({ query, cursor, limit, sortBy, sortOrder });
+          const result = searchBooksCursor({ query, cursor, limit, sortBy, sortOrder, requireFormats: true });
           const nextPath = result.nextCursor
             ? buildPath("/opds/search", {
                 q: query,
@@ -1589,10 +1939,11 @@ const routes: RouteTable = {
           const title = query.trim() ? `Search: ${query.trim()}` : "Search";
           const feed = renderAcquisitionFeed({
             baseUrl,
+            pathPrefix,
             selfPath,
             title,
             id: new URL(selfPath, baseUrl).toString(),
-            updated: new Date().toISOString(),
+            updated: opdsNow(),
             result,
             nextPath,
           });
@@ -1618,23 +1969,25 @@ const routes: RouteTable = {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
 
-          const book = getBookByIdOptimized(id);
-          if (!book) {
-            return Response.json({ error: "Book not found" }, { status: 404 });
-          }
-
           const baseUrl = getPublicBaseUrl(req);
+          const pathPrefix = opdsPathPrefix(req);
           const selfPath = getRequestPath(req);
-          const feed = renderSingleBookFeed({
-            baseUrl,
-            selfPath,
-            updated: new Date().toISOString(),
-            book,
-          });
 
           return getCachedTextResponse(
-            `opds:book:${baseUrl}:${id}`,
-            feed,
+            `opds:book:${baseUrl}:${pathPrefix}:${selfPath}`,
+            () => {
+              const book = getBookByIdOptimized(id);
+              if (!book) {
+                return Response.json({ error: "Book not found" }, { status: 404 });
+              }
+              return renderSingleBookFeed({
+                baseUrl,
+                pathPrefix,
+                selfPath,
+                updated: opdsNow(),
+                book,
+              });
+            },
             req,
             `${OPDS_ACQUISITION_TYPE}; charset=utf-8`,
           );
@@ -1645,7 +1998,136 @@ const routes: RouteTable = {
       },
     },
 
-    // Stream all books (for massive datasets)
+    // F23: complete-entry alternate for a single book (subsection kept for
+    // compat in the entry itself).
+    "/opds/book/:id/complete": {
+      GET: (req) => {
+        try {
+          const id = parseBookId(req.params.id ?? "");
+          if (id === null) {
+            return Response.json({ error: "Invalid book ID" }, { status: 400 });
+          }
+
+          const baseUrl = getPublicBaseUrl(req);
+          const pathPrefix = opdsPathPrefix(req);
+          const selfPath = getRequestPath(req);
+
+          return getCachedTextResponse(
+            `opds:book-complete:${baseUrl}:${pathPrefix}:${selfPath}`,
+            () => {
+              const book = getBookByIdOptimized(id);
+              if (!book) {
+                return Response.json({ error: "Book not found" }, { status: 404 });
+              }
+              return renderSingleBookFeed({
+                baseUrl,
+                pathPrefix,
+                selfPath,
+                updated: opdsNow(),
+                book,
+              });
+            },
+            req,
+            `${OPDS_ACQUISITION_TYPE}; charset=utf-8`,
+          );
+        } catch (error) {
+          console.error("Error rendering OPDS complete book:", error);
+          return Response.json({ error: "Failed to render OPDS book" }, { status: 500 });
+        }
+      },
+    },
+
+    // F24: OPDS acquisition/artwork routes. Challenge-capable (matched by the
+    // /opds auth guard) proxies to the same file handlers as /api.
+    "/opds/book/:id/download/:format": {
+      GET: async (req) => {
+        try {
+          const id = parseBookId(req.params.id ?? "");
+          if (id === null) {
+            return Response.json({ error: "Invalid book ID" }, { status: 400 });
+          }
+          return await serveBookFile(req, id, req.params.format ?? "", "attachment");
+        } catch (error) {
+          console.error("Error downloading OPDS book:", error);
+          return Response.json({ error: "Failed to download book" }, { status: 500 });
+        }
+      },
+      HEAD: async (req) => {
+        try {
+          const id = parseBookId(req.params.id ?? "");
+          if (id === null) {
+            return Response.json({ error: "Invalid book ID" }, { status: 400 });
+          }
+          return await serveBookFile(req, id, req.params.format ?? "", "attachment");
+        } catch (error) {
+          console.error("Error downloading OPDS book:", error);
+          return Response.json({ error: "Failed to download book" }, { status: 500 });
+        }
+      },
+    },
+
+    "/opds/book/:id/file/:format": {
+      GET: async (req) => {
+        try {
+          const id = parseBookId(req.params.id ?? "");
+          if (id === null) {
+            return Response.json({ error: "Invalid book ID" }, { status: 400 });
+          }
+          return await serveBookFile(req, id, req.params.format ?? "", "inline");
+        } catch (error) {
+          console.error("Error streaming OPDS book:", error);
+          return Response.json({ error: "Failed to stream book" }, { status: 500 });
+        }
+      },
+      HEAD: async (req) => {
+        try {
+          const id = parseBookId(req.params.id ?? "");
+          if (id === null) {
+            return Response.json({ error: "Invalid book ID" }, { status: 400 });
+          }
+          return await serveBookFile(req, id, req.params.format ?? "", "inline");
+        } catch (error) {
+          console.error("Error streaming OPDS book:", error);
+          return Response.json({ error: "Failed to stream book" }, { status: 500 });
+        }
+      },
+    },
+
+    "/opds/book/:id/cover": {
+      GET: async (req) => {
+        try {
+          const id = parseBookId(req.params.id ?? "");
+          if (id === null) {
+            return Response.json({ error: "Invalid book ID" }, { status: 400 });
+          }
+          return await serveCoverById(req, id);
+        } catch (error) {
+          console.error("Error getting OPDS cover:", error);
+          return Response.json({ error: "Failed to get cover" }, { status: 500 });
+        }
+      },
+    },
+
+    "/opds/book/:id/thumb": {
+      GET: async (req) => {
+        try {
+          const id = parseBookId(req.params.id ?? "");
+          if (id === null) {
+            return Response.json({ error: "Invalid book ID" }, { status: 400 });
+          }
+          return await serveThumbById(req, id);
+        } catch (error) {
+          console.error("Error getting OPDS thumb:", error);
+          return Response.json({ error: "Failed to get thumbnail" }, { status: 500 });
+        }
+      },
+    },
+
+    // Stream all books (for massive datasets). Pull-driven: each pull()
+    // awaits the next DB batch (streamBooks checks out and releases a pool
+    // connection per batch), backpressure propagates to the database cursor,
+    // a generation lease pins the snapshot for the export duration, and a
+    // client abort stops iteration immediately.
     "/api/books/stream": {
       GET: async (req) => {
         const url = new URL(req.url);
@@ -1654,18 +2136,46 @@ const routes: RouteTable = {
           max: MAX_STREAM_BATCH_SIZE,
         });
 
+        const releaseLease = acquireSnapshotLease();
+        let leaseReleased = false;
+        const finishLease = () => {
+          if (!leaseReleased) {
+            leaseReleased = true;
+            releaseLease();
+          }
+        };
+        const jsonGen = streamBooksJSON(streamBooks(batchSize));
+
         const stream = new ReadableStream({
-          async start(controller) {
-            try {
-              for await (const chunk of streamBooksJSON(streamBooks(batchSize))) {
-                controller.enqueue(streamEncoder.encode(chunk));
-              }
+          async pull(controller) {
+            if (req.signal.aborted) {
+              finishLease();
               controller.close();
+              return;
+            }
+            try {
+              const next = await jsonGen.next();
+              if (req.signal.aborted || next.done) {
+                finishLease();
+                controller.close();
+                return;
+              }
+              controller.enqueue(streamEncoder.encode(next.value));
             } catch (error) {
+              finishLease();
               controller.error(error);
             }
           },
+          async cancel() {
+            finishLease();
+            try {
+              await jsonGen.return(undefined);
+            } catch {
+              // ignore teardown errors
+            }
+          },
         });
+        req.signal.addEventListener("abort", finishLease, { once: true });
 
         return new Response(stream, {
           headers: {
@@ -1690,10 +2200,12 @@ const routes: RouteTable = {
           const sortOrder = parseSortOrder(url.searchParams.get("sortOrder"));
           const tagIds = parseTagIds(url);
 
-          const result = listBooksCursor({ cursor, limit, sortBy, sortOrder, tagIds });
-
           const cacheKey = `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}:tags:${tagIds.join(",")}`;
-          return getCachedResponse(cacheKey, result, req);
+          return getCachedResponse(
+            cacheKey,
+            () => listBooksCursor({ cursor, limit, sortBy, sortOrder, tagIds }),
+            req,
+          );
         } catch (error) {
           return routeErrorResponse(error, "Error listing books:", "Failed to list books");
         }
@@ -1716,10 +2228,9 @@ const routes: RouteTable = {
           const tagIds = parseTagIds(url);
 
           if (!query.trim()) {
-            const result = listBooksCursor({ cursor, limit, sortBy, sortOrder, tagIds });
             return getCachedResponse(
               `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}:tags:${tagIds.join(",")}`,
-              result,
+              () => listBooksCursor({ cursor, limit, sortBy, sortOrder, tagIds }),
               req,
             );
           }
@@ -1748,13 +2259,13 @@ const routes: RouteTable = {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
 
-          const book = getBookByIdOptimized(id);
-
-          if (!book) {
-            return Response.json({ error: "Book not found" }, { status: 404 });
-          }
-
-          return getCachedResponse(`book:${id}`, book, req);
+          return getCachedResponse(`book:${id}`, () => {
+            const book = getBookByIdOptimized(id);
+            if (!book) {
+              return Response.json({ error: "Book not found" }, { status: 404 });
+            }
+            return book;
+          }, req);
         } catch (error) {
           console.error("Error getting book:", error);
           return Response.json({ error: "Failed to get book" }, { status: 500 });
@@ -1930,6 +2441,10 @@ const routes: RouteTable = {
           return serveLocalFile(req, pageFile.path, {
             contentType: pageFile.contentType,
             cacheControl: "no-cache",
+            // Defense in depth now that SVG pages are filtered upstream: pages
+            // render in <img>, never as documents. Sandbox + nosniff (set by
+            // serveLocalFile) limits damage if a hostile image is mislabeled.
+            contentSecurityPolicy: "sandbox; default-src 'none'; style-src 'unsafe-inline'",
           });
         } catch (error) {
           return pageStreamingErrorResponse(error);
@@ -1950,6 +2465,7 @@ const routes: RouteTable = {
           return serveLocalFile(req, pageFile.path, {
             contentType: pageFile.contentType,
             cacheControl: "no-cache",
+            contentSecurityPolicy: "sandbox; default-src 'none'; style-src 'unsafe-inline'",
           });
         } catch (error) {
           return pageStreamingErrorResponse(error);
@@ -1966,37 +2482,7 @@ const routes: RouteTable = {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
 
-          const coverPath = getBookCoverPath(id);
-          if (!coverPath) {
-            return Response.json({ error: "Cover not found" }, { status: 404 });
-          }
-
-          const file = Bun.file(coverPath);
-          if (!(await file.exists())) {
-            return Response.json({ error: "Cover file not found" }, { status: 404 });
-          }
-
-          const fileStat = await file.stat();
-          const etag = `"${fileStat.size}-${fileStat.mtime?.getTime() || 0}"`;
-
-          const ifNoneMatch = req.headers.get("If-None-Match");
-          if (ifNoneMatch === etag) {
-            return new Response(null, {
-              status: 304,
-              headers: {
-                ETag: etag,
-                "Cache-Control": "public, max-age=300, must-revalidate",
-              },
-            });
-          }
-
-          return new Response(file, {
-            headers: {
-              "Content-Type": "image/jpeg",
-              "Cache-Control": "public, max-age=300, must-revalidate",
-              ETag: etag,
-            },
-          });
+          return await serveCoverById(req, id);
         } catch (error) {
           console.error("Error getting cover:", error);
           return Response.json({ error: "Failed to get cover" }, { status: 500 });
@@ -2013,67 +2499,7 @@ const routes: RouteTable = {
             return Response.json({ error: "Invalid book ID" }, { status: 400 });
           }
 
-          // Check thumbnail cache first
-          const thumbDir = join(WORK_DIR, "thumbs");
-          const thumbPath = join(thumbDir, `${id}.jpg`);
-          const thumbFile = Bun.file(thumbPath);
-
-          if (await thumbFile.exists()) {
-            const ifNoneMatch = req.headers.get("If-None-Match");
-            const stat = await thumbFile.stat();
-            const etag = `"t${stat.size}-${stat.mtime?.getTime() || 0}"`;
-            if (ifNoneMatch === etag) {
-              return new Response(null, {
-                status: 304,
-                headers: {
-                  ETag: etag,
-                  "Cache-Control": "public, max-age=300, must-revalidate",
-                },
-              });
-            }
-            return new Response(thumbFile, {
-              headers: {
-                "Content-Type": "image/jpeg",
-                "Cache-Control": "public, max-age=300, must-revalidate",
-                ETag: etag,
-              },
-            });
-          }
-
-          // Generate thumbnail
-          const coverPath = getBookCoverPath(id);
-          if (!coverPath) {
-            return Response.json({ error: "Cover not found" }, { status: 404 });
-          }
-
-          const coverFile = Bun.file(coverPath);
-          if (!(await coverFile.exists())) {
-            return Response.json({ error: "Cover file not found" }, { status: 404 });
-          }
-
-          // Use sharp-like resize if available, otherwise serve original with size hint
-          // For now, serve the original with aggressive caching — the browser will cache it
-          const fileStat = await coverFile.stat();
-          const etag = `"${fileStat.size}-${fileStat.mtime?.getTime() || 0}"`;
-
-          const ifNoneMatch = req.headers.get("If-None-Match");
-          if (ifNoneMatch === etag) {
-            return new Response(null, {
-              status: 304,
-              headers: {
-                ETag: etag,
-                "Cache-Control": "public, max-age=300, must-revalidate",
-              },
-            });
-          }
-
-          return new Response(coverFile, {
-            headers: {
-              "Content-Type": "image/jpeg",
-              "Cache-Control": "public, max-age=300, must-revalidate",
-              ETag: etag,
-            },
-          });
+          return await serveThumbById(req, id);
         } catch (error) {
           console.error("Error getting thumb:", error);
           return Response.json({ error: "Failed to get thumbnail" }, { status: 500 });
