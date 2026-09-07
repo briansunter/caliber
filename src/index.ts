@@ -228,6 +228,76 @@ function parseFormatQuery(value: string | null): string | undefined | null {
   return format;
 }
 
+// S2/S3: shared progress-write handler. Catalog context (resolved libraryId
+// + book existence) is captured BEFORE the body is awaited; the body is then
+// validated for identity match (expected user/library vs authenticated user +
+// resolved library) before any write. All responses carry server_seq.
+function expectedIdentityFromBody(body: Record<string, unknown>): {
+  userId: number | null;
+  libraryId: string | null;
+} {
+  const rawUser = body.expectedUserId ?? body.userId;
+  const rawLib = body.expectedLibraryId ?? body.libraryId;
+  return {
+    userId: typeof rawUser === "number" && Number.isInteger(rawUser) ? rawUser : null,
+    libraryId: typeof rawLib === "string" && rawLib ? rawLib : null,
+  };
+}
+
+async function handleProgressWrite(
+  req: Request,
+  bookId: number,
+  user: User,
+  libraryId: string,
+  book: { formats: string[] },
+): Promise<Response> {
+  const rawBody = await readJsonBodyOr400(req);
+  if (rawBody instanceof Response) return rawBody;
+  if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
+    return Response.json({ error: "Request body must be an object" }, { status: 400 });
+  }
+  const body = rawBody as {
+    format?: unknown;
+    location?: unknown;
+    percentage?: unknown;
+    finished?: unknown;
+    mutationId?: unknown;
+    clientTs?: unknown;
+    baseRevision?: unknown;
+  } & Record<string, unknown>;
+  // S3: identity enforcement — a claimed principal/library that disagrees
+  // with the authenticated user / resolved library is rejected with no write.
+  const expected = expectedIdentityFromBody(body);
+  if (expected.userId !== null && expected.userId !== user.id) {
+    return Response.json({ error: "Principal mismatch" }, { status: 401 });
+  }
+  if (expected.libraryId !== null && expected.libraryId !== libraryId) {
+    return Response.json({ error: "Library mismatch" }, { status: 409 });
+  }
+  const format = typeof body.format === "string" ? body.format.trim().toUpperCase() : "";
+  if (!FORMAT_PATTERN.test(format) || !book.formats.includes(format)) {
+    return Response.json({ error: "Invalid book format" }, { status: 400 });
+  }
+  const result = upsertProgress(user.id, libraryId, bookId, {
+    format,
+    location: typeof body.location === "string" ? body.location : null,
+    percentage: typeof body.percentage === "number" ? body.percentage : 0,
+    finished: body.finished === true,
+    mutationId: typeof body.mutationId === "string" ? body.mutationId : null,
+    clientTs: typeof body.clientTs === "number" ? body.clientTs : null,
+    baseRevision: typeof body.baseRevision === "number" ? body.baseRevision : null,
+  });
+  return Response.json(
+    {
+      progress: result.progress,
+      applied: result.applied,
+      reason: result.reason,
+      serverSeq: result.progress?.serverSeq ?? null,
+    },
+    { headers: { "Cache-Control": "private, no-store" } },
+  );
+}
+
 // Auth administration (toggle, accounts) is a local-operator action.
 // Trust model: when auth is enabled, ALL authenticated users are trusted as
 // operators (there is no separate admin role). Set CALIBER_ADMIN_RESTRICTED=1
@@ -1052,10 +1122,15 @@ interface BunFileWithImagePipeline {
 // are feature-detected: the in-memory `new Bun.Image(bytes)` constructor
 // first, then the file-backed `Bun.file(path).image()` fallback. Failures are
 // logged (message + runtime + attempted path) instead of swallowed.
+// CALIBER_THUMB_DISABLE_RESIZE=1 forces null immediately so tests can
+// deterministically exercise the degraded fallback without stubbing.
 async function tryResizeImage(
   bytes: Uint8Array,
   targetWidth: number,
 ): Promise<Uint8Array | null> {
+  if (process.env.CALIBER_THUMB_DISABLE_RESIZE === "1") {
+    return null;
+  }
   try {
     const ImageCtor = (Bun as BunWithImagePipeline).Image;
     if (typeof ImageCtor === "function") {
@@ -1722,10 +1797,12 @@ const routes: RouteTable = {
         if (format === null) {
           return Response.json({ error: "Invalid format" }, { status: 400 });
         }
+        const progress = getProgress(user.id, libraryId, bookId, format);
         return Response.json(
           {
-            progress: getProgress(user.id, libraryId, bookId, format),
+            progress,
             formats: listProgressFormats(user.id, libraryId, bookId),
+            serverSeq: progress?.serverSeq ?? null,
           },
           { headers: { "Cache-Control": "private, no-store" } },
         );
@@ -1737,44 +1814,11 @@ const routes: RouteTable = {
         }
         const user = await currentUser(req);
         if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
-
+        // S3: catalog context captured BEFORE the body is awaited.
+        const libraryId = resolveLibraryId(req);
         const book = getBookByIdOptimized(bookId);
         if (!book) return Response.json({ error: "Book not found" }, { status: 404 });
-
-        const rawBody = await readJsonBodyOr400(req);
-        if (rawBody instanceof Response) return rawBody;
-
-        if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
-          return Response.json({ error: "Request body must be an object" }, { status: 400 });
-        }
-
-        const body = rawBody as {
-          format?: unknown;
-          location?: unknown;
-          percentage?: unknown;
-          finished?: unknown;
-          mutationId?: unknown;
-          clientTs?: unknown;
-          baseRevision?: unknown;
-        };
-        const format = typeof body.format === "string" ? body.format.trim().toUpperCase() : "";
-        if (!FORMAT_PATTERN.test(format) || !book.formats.includes(format)) {
-          return Response.json({ error: "Invalid book format" }, { status: 400 });
-        }
-
-        const result = upsertProgress(user.id, resolveLibraryId(req), bookId, {
-          format,
-          location: typeof body.location === "string" ? body.location : null,
-          percentage: typeof body.percentage === "number" ? body.percentage : 0,
-          finished: body.finished === true,
-          mutationId: typeof body.mutationId === "string" ? body.mutationId : null,
-          clientTs: typeof body.clientTs === "number" ? body.clientTs : null,
-          baseRevision: typeof body.baseRevision === "number" ? body.baseRevision : null,
-        });
-        return Response.json(
-          { progress: result.progress, applied: result.applied, reason: result.reason },
-          { headers: { "Cache-Control": "private, no-store" } },
-        );
+        return handleProgressWrite(req, bookId, user, libraryId, book);
       },
       // POST alias for PUT: navigator.sendBeacon can only POST, and the
       // client treats beacon queueing as unacked until a PUT/POST returns ok.
@@ -1785,44 +1829,11 @@ const routes: RouteTable = {
         }
         const user = await currentUser(req);
         if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
-
+        // S3: catalog context captured BEFORE the body is awaited.
+        const libraryId = resolveLibraryId(req);
         const book = getBookByIdOptimized(bookId);
         if (!book) return Response.json({ error: "Book not found" }, { status: 404 });
-
-        const rawBody = await readJsonBodyOr400(req);
-        if (rawBody instanceof Response) return rawBody;
-
-        if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
-          return Response.json({ error: "Request body must be an object" }, { status: 400 });
-        }
-
-        const body = rawBody as {
-          format?: unknown;
-          location?: unknown;
-          percentage?: unknown;
-          finished?: unknown;
-          mutationId?: unknown;
-          clientTs?: unknown;
-          baseRevision?: unknown;
-        };
-        const format = typeof body.format === "string" ? body.format.trim().toUpperCase() : "";
-        if (!FORMAT_PATTERN.test(format) || !book.formats.includes(format)) {
-          return Response.json({ error: "Invalid book format" }, { status: 400 });
-        }
-
-        const progress = upsertProgress(user.id, resolveLibraryId(req), bookId, {
-          format,
-          location: typeof body.location === "string" ? body.location : null,
-          percentage: typeof body.percentage === "number" ? body.percentage : 0,
-          finished: body.finished === true,
-          mutationId: typeof body.mutationId === "string" ? body.mutationId : null,
-          clientTs: typeof body.clientTs === "number" ? body.clientTs : null,
-          baseRevision: typeof body.baseRevision === "number" ? body.baseRevision : null,
-        });
-        return Response.json(
-          { progress: progress.progress, applied: progress.applied, reason: progress.reason },
-          { headers: { "Cache-Control": "private, no-store" } },
-        );
+        return handleProgressWrite(req, bookId, user, libraryId, book);
       },
       DELETE: async (req) => {
         const bookId = parseBookId(req.params.bookId ?? "");
@@ -2410,11 +2421,19 @@ const routes: RouteTable = {
           const sortBy = parseSortField(url.searchParams.get("sortBy"));
           const sortOrder = parseSortOrder(url.searchParams.get("sortOrder"));
           const tagIds = parseTagIds(url);
+          // S7: cheap first-page total. Explicit ?includeTotal=0/false opts
+          // out; otherwise the first page (cursor == null) includes total via
+          // COUNT(*) with the same filters and later pages omit it.
+          const includeParam = url.searchParams.get("includeTotal");
+          const wantTotal =
+            includeParam === null
+              ? !cursor
+              : includeParam === "1" || includeParam.toLowerCase() === "true";
 
-          const cacheKey = `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}:tags:${tagIds.join(",")}`;
+          const cacheKey = `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}:tags:${tagIds.join(",")}:total:${wantTotal ? 1 : 0}`;
           return getCachedResponse(
             cacheKey,
-            () => listBooksCursor({ cursor, limit, sortBy, sortOrder, tagIds }),
+            () => listBooksCursor({ cursor, limit, sortBy, sortOrder, tagIds, includeTotal: wantTotal }),
             req,
           );
         } catch (error) {
@@ -2437,16 +2456,22 @@ const routes: RouteTable = {
           const sortBy = parseSortField(url.searchParams.get("sortBy"));
           const sortOrder = parseSortOrder(url.searchParams.get("sortOrder"));
           const tagIds = parseTagIds(url);
+          // S7: same first-page-total contract as /api/books (see above).
+          const includeParam = url.searchParams.get("includeTotal");
+          const wantTotal =
+            includeParam === null
+              ? !cursor
+              : includeParam === "1" || includeParam.toLowerCase() === "true";
 
           if (!query.trim()) {
             return getCachedResponse(
-              `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}:tags:${tagIds.join(",")}`,
-              () => listBooksCursor({ cursor, limit, sortBy, sortOrder, tagIds }),
+              `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}:tags:${tagIds.join(",")}:total:${wantTotal ? 1 : 0}`,
+              () => listBooksCursor({ cursor, limit, sortBy, sortOrder, tagIds, includeTotal: wantTotal }),
               req,
             );
           }
 
-          const result = searchBooksCursor({ query, cursor, limit, sortBy, sortOrder, tagIds });
+          const result = searchBooksCursor({ query, cursor, limit, sortBy, sortOrder, tagIds, includeTotal: wantTotal });
 
           // Don't cache search results
           return Response.json(result, {

@@ -787,7 +787,7 @@ describe("format variant fixtures", () => {
     expect(cover.status).toBe(404);
   });
 
-  test("cover thumbnails serve a 200 jpeg, resized or degraded-original", async () => {
+  test("cover thumbnails serve a real resized jpeg (resize path)", async () => {
     const cover = await fetch(`${baseUrl}/api/books/1/cover`);
     expect(cover.status).toBe(200);
     const coverBytes = new Uint8Array(await cover.arrayBuffer());
@@ -803,30 +803,90 @@ describe("format variant fixtures", () => {
     expect(thumb.status).toBe(200);
     expect(thumb.headers.get("content-type")).toContain("image/jpeg");
     const degraded = thumb.headers.get("x-thumbnail-degraded");
-    expect(degraded === null || degraded === "resize-unavailable").toBe(true);
+    console.log(
+      `[thumb-test] resize path: status=${thumb.status} degraded=${degraded} (Bun ${Bun.version})`,
+    );
+    // Require a real resize: the degraded fallback must NOT be present here.
+    // Availability is covered by the degraded-path test below.
+    expect(degraded).toBeNull();
     const thumbBytes = new Uint8Array(await thumb.arrayBuffer());
     expect(thumbBytes.byteLength).toBeGreaterThan(0);
 
-    if (degraded === "resize-unavailable") {
-      // Resize pipeline unavailable on this runtime: the degraded fallback
-      // serves the original cover bytes as a valid 200 image.
-      return;
-    }
-
-    // Resize worked: a real 256px JPEG of the 800px cover is strictly
-    // smaller than the source; a full-bytes fallback would fail this.
+    // A real 256px JPEG of the 800px cover is strictly smaller than the
+    // source; a full-bytes fallback would fail this.
     expect(thumbBytes.byteLength).toBeLessThan(coverBytes.byteLength);
 
     // Decode via Bun's image pipeline when the test runtime has it
     // (structurally detected: the pinned @types/bun has no Image type).
+    // Skip decode only when Bun.Image is truly absent (and log the branch).
     interface ThumbImage {
       metadata(): Promise<{ width?: number; format?: string }>;
     }
     const ImageCtor = (Bun as { Image?: new (input: Uint8Array) => ThumbImage }).Image;
     if (typeof ImageCtor === "function") {
       const metadata = await new ImageCtor(thumbBytes).metadata();
+      console.log(
+        `[thumb-test] resize path decoded: width=${metadata.width} format=${metadata.format} (Bun ${Bun.version})`,
+      );
       expect(metadata.width).toBeLessThanOrEqual(256);
       expect(metadata.format).toBe("jpeg");
+    } else {
+      console.log(
+        `[thumb-test] resize path: Bun.Image absent, skipping decode (Bun ${Bun.version})`,
+      );
     }
   });
+
+  test("cover thumbnails degrade to original bytes when resize is disabled (degraded path)", async () => {
+    const port = await freePort();
+    const degradedBaseUrl = `http://localhost:${port}`;
+    const degradedConfigDir = join(homePath, ".config", "caliber-degraded");
+    const proc = Bun.spawn(["bun", "src/index.ts"], {
+      cwd: process.cwd(),
+      env: childEnv({
+        HOME: homePath,
+        CALIBER_CONFIG_DIR: degradedConfigDir,
+        CALIBRE_LIBRARY_PATH: libraryPath,
+        CALIBER_THUMB_DISABLE_RESIZE: "1",
+        PORT: String(port),
+        NODE_ENV: "test",
+      }),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    tapPipe(proc.stdout, () => {});
+    tapPipe(proc.stderr, () => {});
+    try {
+      let started = false;
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        try {
+          const health = await fetch(`${degradedBaseUrl}/api/health`);
+          if (health.ok) {
+            started = true;
+            break;
+          }
+        } catch {}
+        await Bun.sleep(100);
+      }
+      expect(started).toBe(true);
+
+      let thumb = await fetch(`${degradedBaseUrl}/api/books/1/thumb?size=small`);
+      for (let attempt = 0; attempt < 4 && thumb.status === 500; attempt += 1) {
+        await Bun.sleep(250);
+        thumb = await fetch(`${degradedBaseUrl}/api/books/1/thumb?size=small`);
+      }
+      expect(thumb.status).toBe(200);
+      expect(thumb.headers.get("content-type")).toContain("image/jpeg");
+      const degraded = thumb.headers.get("x-thumbnail-degraded");
+      console.log(
+        `[thumb-test] degraded path: status=${thumb.status} degraded=${degraded} (Bun ${Bun.version})`,
+      );
+      expect(degraded).toBe("resize-unavailable");
+      const thumbBytes = new Uint8Array(await thumb.arrayBuffer());
+      expect(thumbBytes.byteLength).toBeGreaterThan(0);
+    } finally {
+      proc.kill();
+      await proc.exited.catch(() => {});
+    }
+  }, TEST_TIMEOUT);
 });

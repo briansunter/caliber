@@ -18,15 +18,11 @@ interface BookGridInfiniteProps {
 const CARD_GAP = 16;
 const CARD_MIN_WIDTH = 140;
 
-// Sticky chrome above the grid measured ~120px in devtools (desktop + mobile):
-// search bar ~64px + section/filter header ~56px. scrollMargin keeps the
-// restored/focused row from sliding under it.
-const MEASURED_STICKY_CHROME_PX = 120;
-const GRID_SCROLL_MARGIN = 120;
-// Invariant: the virtualizer margin must cover the measured sticky chrome.
-if (GRID_SCROLL_MARGIN < MEASURED_STICKY_CHROME_PX) {
-  throw new Error("GRID_SCROLL_MARGIN is below the measured sticky chrome height");
-}
+// Fallback scroll margin used before the runtime measurement below runs.
+// Devtools-measured sticky chrome above the grid ~120px (desktop + mobile:
+// search bar ~64px + section/filter header ~56px); the measured list origin
+// replaces this fallback at mount and on resize.
+const GRID_SCROLL_MARGIN_FALLBACK = 120;
 
 const GridCard = memo(function GridCard({ book }: { book: BookListItem }) {
   const unknown = isUnknownAuthor(book.authors);
@@ -83,6 +79,34 @@ export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, so
   });
   const [cardHeight, setCardHeight] = useState(320);
 
+  // S7: REAL scrollMargin measurement. The callback ref (setContainerEl)
+  // captures the list container; its document-relative origin (viewport top
+  // + scroll offset, which is scroll-invariant) is measured at mount and
+  // re-measured on resize via ResizeObserver (+ a window resize fallback).
+  // The measured value is passed to the virtualizer as scrollMargin, which
+  // the React adapter picks up dynamically on re-render — no constant
+  // assertion.
+  const [measuredScrollMargin, setMeasuredScrollMargin] = useState(GRID_SCROLL_MARGIN_FALLBACK);
+  useEffect(() => {
+    const el = containerEl;
+    if (!el) return;
+    const measureOrigin = () => {
+      const origin = Math.max(0, Math.round(el.getBoundingClientRect().top + window.scrollY));
+      setMeasuredScrollMargin((prev) => (prev === origin ? prev : origin));
+    };
+    measureOrigin();
+    let ro: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(measureOrigin);
+      ro.observe(el);
+    }
+    window.addEventListener("resize", measureOrigin);
+    return () => {
+      ro?.disconnect();
+      window.removeEventListener("resize", measureOrigin);
+    };
+  }, [containerEl]);
+
   // Measure the container (not the window) so grid sizing tracks the real
   // layout width, including sidebars and padding.
   useEffect(() => {
@@ -118,17 +142,18 @@ export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, so
 
   const rowCount = Math.ceil(books.length / columns);
 
-  // Sticky search + table header reserve GRID_SCROLL_MARGIN (see measured
-  // constant above); scrollMargin keeps the restored/focused row from
-  // sliding under them.
-  // FUP8 TanStack contract: keep scrollMargin on the virtualizer AND do NOT
-  // manually offset rows — rows use translateY(virtualRow.start) verbatim and
-  // the virtualizer applies the margin internally.
+  // scrollMargin is the MEASURED list origin (see above); it keeps the
+  // restored/focused row from sliding under the sticky search + header.
+  // TanStack contract: keep scrollMargin on the virtualizer AND do NOT
+  // manually offset rows — rows use translateY(virtualRow.start) verbatim
+  // and the virtualizer applies the margin internally. scrollPaddingStart
+  // (200px below) is separate breathing room for scrollToIndex, NOT part of
+  // the measured origin.
   const virtualizer = useWindowVirtualizer({
     count: rowCount,
     estimateSize: useCallback(() => cardHeight, [cardHeight]),
     overscan: 5,
-    scrollMargin: GRID_SCROLL_MARGIN,
+    scrollMargin: measuredScrollMargin,
     scrollPaddingStart: 200,
     // React 19 warns when the adapter flushes a virtualizer rerender while a
     // route transition is still rendering. Normal scheduling is sufficient

@@ -104,6 +104,9 @@ async function fetchBooks({
   params.set("sortOrder", sortOrder);
   if (pageParam) {
     params.set("cursor", pageParam);
+  } else {
+    // S7: request the cheap first-page total; later pages omit it.
+    params.set("includeTotal", "1");
   }
   appendTagParams(params, tagIds);
 
@@ -132,6 +135,9 @@ async function searchBooks({
   params.set("sortOrder", sortOrder);
   if (pageParam) {
     params.set("cursor", pageParam);
+  } else {
+    // S7: request the cheap first-page total; later pages omit it.
+    params.set("includeTotal", "1");
   }
   appendTagParams(params, tagIds);
 
@@ -213,9 +219,11 @@ export function useSearchInfinite(
 //   is derived from cached data length vs totalCount once the window is full.
 // - keepFirstPageAnchor retains the first page's items keyed by query
 //   identity and prepends them ONLY when eviction is proven
-//   (pages.length >= maxPages && retained < total). Otherwise rawBooks are
+//   (window full while retained < total when total is present; window full
+//   alone when later pages omit total). Otherwise rawBooks are
 //   returned untouched, so a search/sort/tag/user/library change can never
-//   inherit a stale anchor from a previous query.
+//   inherit a stale anchor from a previous query. keepPreviousData
+//   placeholder pages are never captured as the anchor.
 export function useFlattenedBooks(
   searchQuery: string,
   sortConfig: SortConfig,
@@ -243,15 +251,19 @@ export function useFlattenedBooks(
   // never loses the top anchor — and a query change never inherits a stale
   // anchor. Stored in a ref (not state) to avoid extra renders; reset when
   // the identity key changes.
+  // S7: keepPreviousData placeholder pages are NEVER captured — while
+  // isPlaceholderData is true, query.data still holds the PREVIOUS query's
+  // first page, which must not be anchored under the new identity key.
+  const isPlaceholderData = query.isPlaceholderData ?? false;
   const firstPageDataRef = useRef<{ key: string; items: BookListItem[] } | null>(null);
-  const firstPageSeen = query.data?.pages[0]?.items;
+  const firstPageSeen = !isPlaceholderData ? query.data?.pages[0]?.items : undefined;
   useEffect(() => {
-    if (firstPageSeen && firstPageSeen.length > 0) {
+    if (!isPlaceholderData && firstPageSeen && firstPageSeen.length > 0) {
       if (!firstPageDataRef.current || firstPageDataRef.current.key !== queryIdentityKey) {
         firstPageDataRef.current = { key: queryIdentityKey, items: firstPageSeen };
       }
     }
-  }, [firstPageSeen, queryIdentityKey]);
+  }, [firstPageSeen, queryIdentityKey, isPlaceholderData]);
 
   const rawBooks = useMemo(() => {
     return query.data?.pages.flatMap((page) => page.items) ?? [];
@@ -262,7 +274,9 @@ export function useFlattenedBooks(
   // biome-ignore lint/correctness/useExhaustiveDependencies: pages.length is the eviction signal; rawBooks identity alone does not change when maxPages drops leading pages.
   const books = useMemo(() => {
     // R6: prepend the anchor ONLY when it belongs to the current query
-    // identity AND eviction is proven (window full while retained < total).
+    // identity AND eviction is proven. S7: total is first-page-only, so when
+    // it is present require retained < total; when absent (later pages omit
+    // it), the full window (pages.length >= maxPages) alone proves eviction.
     // Otherwise return rawBooks untouched — forward-only, no backward fetch.
     if (!keepFirstPageAnchor) return rawBooks;
     const stored = firstPageDataRef.current;
@@ -278,8 +292,8 @@ export function useFlattenedBooks(
       }
       return null;
     })();
-    const evictionProven =
-      pagesLength >= maxPagesForAnchor && (total === null ? false : rawBooks.length < total);
+    const windowFull = pagesLength >= maxPagesForAnchor;
+    const evictionProven = windowFull && (total === null || rawBooks.length < total);
     if (!evictionProven) return rawBooks;
     if (rawBooks[0]?.id === anchor[0]?.id) return rawBooks;
     const seen = new Set(rawBooks.map((b) => b.id));
@@ -299,11 +313,13 @@ export function useFlattenedBooks(
 
   const retainedCount = books.length;
   const maxPages = maxPagesForAnchor;
-  // FUP8: windowTruncated reflects maxPages eviction — cached data length
-  // (retainedCount from queryClient data) is below totalCount while the page
-  // window is already full.
+  // FUP8: windowTruncated reflects maxPages eviction. S7: when total is
+  // present (first page), the window is truncated while retained < total;
+  // when total is absent (later pages omit it), the full window
+  // (pages.length >= maxPages) alone signals truncation.
+  const pagesLength = query.data?.pages.length ?? 0;
   const windowTruncated =
-    totalCount !== null && retainedCount < totalCount && (query.data?.pages.length ?? 0) >= maxPages;
+    pagesLength >= maxPages && (totalCount === null || retainedCount < totalCount);
 
   // FUP8: backward fetch is NOT supported (forward-only server). No-op until
   // the server emits prevCursor — never claim it fetches.
@@ -311,7 +327,7 @@ export function useFlattenedBooks(
 
   const hasData = retainedCount > 0;
   const errorStage = errorStageOf(query.error, hasData, query.isFetchingNextPage || query.isFetchNextPageError);
-  const isPlaceholder = query.isPlaceholderData ?? false;
+  const isPlaceholder = isPlaceholderData;
   const emptyReason = emptyReasonOf({
     booksLength: retainedCount,
     isLoading: query.isLoading,

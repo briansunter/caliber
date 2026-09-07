@@ -1,7 +1,7 @@
 import JSZip from "jszip";
 import { createExtractorFromData, type FileHeader } from "node-unrar-js/esm";
 import { type Dirent, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
-import { basename, dirname, extname, join } from "node:path";
+import { basename, extname, join } from "node:path";
 import { CONFIG_DIR_PATH, LIBRARY_PATH } from "./config";
 import { getBookFormatPath, getLibraryPath, getSnapshotRevision } from "./calibre-optimized";
 import { getPathContentType } from "./book-files";
@@ -20,6 +20,9 @@ const MAX_PAGE_COUNT = 10_000;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_IMAGE_PIXELS = 40_000_000;
 const COMMAND_TIMEOUT_MS = 30_000;
+// S6: CBR manifest version. Bump when the CBR meta layout/ordering contract
+// changes; metas missing this version (or failing contiguity) force rebuild.
+const CBR_MANIFEST_VERSION = 2;
 
 // Global job semaphore: max 3 concurrent PDF renders, max 2 archive extracts.
 class JobSemaphore {
@@ -185,6 +188,14 @@ interface PageCacheMeta {
   pages: CachedPage[];
   /** Library hash owning this scoped dir; entries without it predate scoping. */
   libHash?: string;
+  /** CBR manifest version (CBR_MANIFEST_VERSION); absent on pre-version metas. */
+  version?: number;
+}
+
+// S6: pages must be dense and 1-based with no gaps for positional lookup
+// (meta.pages[page-1]) to stay consistent.
+function isContiguousPages(pages: CachedPage[]): boolean {
+  return pages.every((page, i) => page.index === i + 1);
 }
 
 export interface PageManifestPage {
@@ -269,34 +280,21 @@ function getLegacyCacheDir(bookId: number, format: string): string {
 }
 
 /**
- * One-time migration from the old unscoped dir: when the scoped dir does not
- * exist yet and the legacy dir holds the same generation, move it once onto
- * the scoped path (stamping libHash) instead of re-extracting. Otherwise drop
- * the stale legacy dir so the caller rebuilds. Returns the adopted meta, or
- * null when the caller must rebuild.
+ * S5: legacy unscoped page dirs are disposable artifacts — never adopt on
+ * signature match. Always rm -rf the legacy dir and let the caller rebuild
+ * into the scoped dir (no rename of foreign content). Keeps only the
+ * scoped-dir hit path (validated in the ensure* callers).
  */
 async function adoptOrRebuildPageDir(
-  cacheDir: string,
+  _cacheDir: string,
   legacyDir: string,
-  source: SourceSignature,
-  libHash: string,
-  requirePages: boolean,
-): Promise<PageCacheMeta | null> {
-  if (existsSync(cacheDir) || !existsSync(legacyDir)) return null;
-  const legacyMeta = await readJson<PageCacheMeta>(join(legacyDir, CACHE_META_FILE));
-  if (
-    legacyMeta &&
-    (legacyMeta.libHash === undefined || legacyMeta.libHash === libHash) &&
-    isSameSignature(legacyMeta.source, source) &&
-    (!requirePages || legacyMeta.pages.every((page) => existsSync(join(legacyDir, page.fileName))))
-  ) {
-    mkdirSync(dirname(cacheDir), { recursive: true });
-    renameSync(legacyDir, cacheDir);
-    const adopted: PageCacheMeta = { ...legacyMeta, libHash };
-    await Bun.write(join(cacheDir, CACHE_META_FILE), `${JSON.stringify(adopted)}\n`);
-    return adopted;
+  _source: SourceSignature,
+  _libHash: string,
+  _requirePages: boolean,
+): Promise<null> {
+  if (existsSync(legacyDir)) {
+    rmSync(legacyDir, { recursive: true, force: true });
   }
-  rmSync(legacyDir, { recursive: true, force: true });
   return null;
 }
 
@@ -362,12 +360,8 @@ async function ensureCbzCache(
       return { cacheDir, meta: existingMeta };
     }
 
-    // CBZ pages materialize lazily, so adoption never requires page files.
-    const adopted = await adoptOrRebuildPageDir(cacheDir, legacyDir, source, libHash, false);
-    if (adopted) {
-      metaMemCache.set(cacheKey, { meta: adopted, signature: source });
-      return { cacheDir, meta: adopted };
-    }
+    // CBZ pages materialize lazily; legacy dirs are purged, never adopted.
+    await adoptOrRebuildPageDir(cacheDir, legacyDir, source, libHash, false);
 
     metaMemCache.delete(cacheKey);
     rmSync(cacheDir, { recursive: true, force: true });
@@ -524,7 +518,14 @@ async function ensureCbrCache(
   const cacheKey = metaCacheKey(bookId, format, resolvedLibrary);
 
   const memEntry = metaMemCache.get(cacheKey);
-  if (memEntry && memEntry.meta.libHash === libHash && isSameSignature(memEntry.signature, source)) {
+  if (
+    memEntry &&
+    memEntry.meta.libHash === libHash &&
+    memEntry.meta.version === CBR_MANIFEST_VERSION &&
+    memEntry.meta.pageCount === memEntry.meta.pages.length &&
+    isContiguousPages(memEntry.meta.pages) &&
+    isSameSignature(memEntry.signature, source)
+  ) {
     return { cacheDir, meta: memEntry.meta };
   }
 
@@ -534,6 +535,9 @@ async function ensureCbrCache(
     if (
       existingMeta &&
       existingMeta.libHash === libHash &&
+      existingMeta.version === CBR_MANIFEST_VERSION &&
+      existingMeta.pageCount === existingMeta.pages.length &&
+      isContiguousPages(existingMeta.pages) &&
       isSameSignature(existingMeta.source, source) &&
       existingMeta.pages.every((page) => existsSync(join(cacheDir, page.fileName)))
     ) {
@@ -541,12 +545,8 @@ async function ensureCbrCache(
       return { cacheDir, meta: existingMeta };
     }
 
-    // CBR extracts eagerly, so adoption requires every page file present.
-    const adopted = await adoptOrRebuildPageDir(cacheDir, legacyDir, source, libHash, true);
-    if (adopted) {
-      metaMemCache.set(cacheKey, { meta: adopted, signature: source });
-      return { cacheDir, meta: adopted };
-    }
+    // CBR extracts eagerly; legacy dirs are purged, never adopted.
+    await adoptOrRebuildPageDir(cacheDir, legacyDir, source, libHash, true);
 
     metaMemCache.delete(cacheKey);
     rmSync(cacheDir, { recursive: true, force: true });
@@ -661,13 +661,20 @@ async function ensureCbrCache(
     });
     sweepPageCacheQuota();
 
-    if (pages.length === 0) {
+    // S6 regression: node-unrar-js yields files in archive order, which may be
+    // shuffled relative to the sorted name order (e.g. a 3-page archive
+    // extracting as [3,1,2] while indices were assigned [1,2,3] from the sorted
+    // names). Sort retained metadata by index BEFORE publish so positional
+    // lookup (meta.pages[page-1]) stays consistent; never publish gaps.
+    pages.sort((a, b) => a.index - b.index);
+    if (pages.length === 0 || !isContiguousPages(pages)) {
       throw new PageStreamingError(422, "CBR pages could not be extracted");
     }
 
     const meta: PageCacheMeta = {
       source,
       libHash,
+      version: CBR_MANIFEST_VERSION,
       pageCount: pages.length,
       pages,
     };
@@ -878,11 +885,8 @@ async function ensurePdfCache(
       };
     }
 
-    // PDF pages render lazily, so adoption never requires page files.
-    const adopted = await adoptOrRebuildPageDir(cacheDir, legacyDir, source, libHash, false);
-    if (adopted) {
-      return { cacheDir, sourcePath, source, pageCount: adopted.pageCount };
-    }
+    // PDF pages render lazily; legacy dirs are purged, never adopted.
+    await adoptOrRebuildPageDir(cacheDir, legacyDir, source, libHash, false);
 
     rmSync(cacheDir, { recursive: true, force: true });
     mkdirSync(cacheDir, { recursive: true });

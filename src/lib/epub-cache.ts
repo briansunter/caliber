@@ -277,20 +277,14 @@ async function ensureEpubCache(bookId: number): Promise<{
 
   const signature = await runSingleFlight(`${library}::epub:${bookId}`, async () => {
     const current = getSourceSignature(epubPath);
+    // S5: legacy unscoped dirs are disposable artifacts — never adopt on
+    // signature match. Always drop the legacy dir and rebuild into the scoped
+    // dir; a libHash mismatch rebuilds without renaming foreign content.
+    if (existsSync(legacyDir)) {
+      rmSync(legacyDir, { recursive: true, force: true });
+    }
     const cachedSignature = await readCacheSignature(cacheDir);
     if (!isSameSignature(cachedSignature, current) || cachedSignature?.libHash !== libHash) {
-      if (!existsSync(cacheDir) && existsSync(legacyDir)) {
-        // One-time migration: adopt the old unscoped dir when it holds the
-        // same generation instead of re-extracting; otherwise rebuild.
-        const legacySignature = await readCacheSignature(legacyDir);
-        if (isSameSignature(legacySignature, current)) {
-          mkdirSync(EPUB_CACHE_DIR, { recursive: true });
-          renameSync(legacyDir, cacheDir);
-          await Bun.write(join(cacheDir, CACHE_META_FILE), `${JSON.stringify({ ...current, libHash })}\n`);
-          return current;
-        }
-        rmSync(legacyDir, { recursive: true, force: true });
-      }
       await resetCacheDir(cacheDir);
       await Bun.write(join(cacheDir, CACHE_META_FILE), `${JSON.stringify({ ...current, libHash })}\n`);
     } else {

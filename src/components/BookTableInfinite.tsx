@@ -1,4 +1,4 @@
-import { memo, useEffect, useCallback, useRef } from "react";
+import { memo, useEffect, useCallback, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useWindowVirtualizer } from "@tanstack/react-virtual";
 import { useFlattenedBooks, type SortConfig, type SortField } from "@/hooks/useBooksInfinite";
@@ -35,15 +35,11 @@ const GRID_COLS_DESKTOP =
   "xl:grid-cols-[minmax(0,3fr)_minmax(0,1.5fr)_minmax(0,1.2fr)_minmax(0,1.5fr)_90px_minmax(0,1fr)_60px]";
 
 const ROW_HEIGHT = 72;
-// Sticky chrome above the table measured ~140px in devtools (desktop):
-// search bar ~64px + table header ~48px + filter row ~28px. scrollMargin
-// keeps the restored/focused row clear of it.
-const MEASURED_STICKY_CHROME_PX = 140;
-const TABLE_SCROLL_MARGIN = 140;
-// Invariant: the virtualizer margin must cover the measured sticky chrome.
-if (TABLE_SCROLL_MARGIN < MEASURED_STICKY_CHROME_PX) {
-  throw new Error("TABLE_SCROLL_MARGIN is below the measured sticky chrome height");
-}
+// Fallback scroll margin used before the runtime measurement below runs.
+// Devtools-measured sticky chrome above the table ~140px on desktop
+// (search bar ~64px + table header ~48px + filter row ~28px); the measured
+// list origin replaces this fallback at mount and on resize.
+const TABLE_SCROLL_MARGIN_FALLBACK = 140;
 const SKELETON_ROW_KEYS = [
   "skeleton-1",
   "skeleton-2",
@@ -416,17 +412,47 @@ export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, 
   } = useFlattenedBooks(searchQuery, sortConfig, tagIds);
   const queryClient = useQueryClient();
 
-  // Set up window virtualizer - uses window scroll. scrollMargin keeps the
-  // restored/focused row clear of the sticky search + table headers (see
-  // TABLE_SCROLL_MARGIN measured constant above).
-  // FUP8 TanStack contract: keep scrollMargin on the virtualizer AND do NOT
+  // S7: REAL scrollMargin measurement. The callback ref captures the list
+  // container; its document-relative origin (viewport top + scroll offset,
+  // which is scroll-invariant) is measured at mount and re-measured on
+  // resize via ResizeObserver (+ a window resize fallback). The measured
+  // value is passed to the virtualizer as scrollMargin, which the React
+  // adapter picks up dynamically on re-render — no constant assertion.
+  const [listEl, setListEl] = useState<HTMLDivElement | null>(null);
+  const [measuredScrollMargin, setMeasuredScrollMargin] = useState(TABLE_SCROLL_MARGIN_FALLBACK);
+  useEffect(() => {
+    const el = listEl;
+    if (!el) return;
+    const measure = () => {
+      const origin = Math.max(0, Math.round(el.getBoundingClientRect().top + window.scrollY));
+      setMeasuredScrollMargin((prev) => (prev === origin ? prev : origin));
+    };
+    measure();
+    let ro: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(measure);
+      ro.observe(el);
+    }
+    window.addEventListener("resize", measure);
+    return () => {
+      ro?.disconnect();
+      window.removeEventListener("resize", measure);
+    };
+  }, [listEl]);
+
+  // Set up window virtualizer - uses window scroll. scrollMargin is the
+  // MEASURED list origin (see above) and keeps the restored/focused row
+  // clear of the sticky search + table headers.
+  // TanStack contract: keep scrollMargin on the virtualizer AND do NOT
   // manually offset rows — rows use translateY(virtualItem.start) verbatim
-  // and the virtualizer applies the margin internally.
+  // and the virtualizer applies the margin internally. scrollPaddingStart
+  // (200px below) is separate breathing room for scrollToIndex, NOT part of
+  // the measured origin.
   const virtualizer = useWindowVirtualizer({
     count: books.length,
     estimateSize: useCallback(() => ROW_HEIGHT, []),
     overscan: 20,
-    scrollMargin: TABLE_SCROLL_MARGIN,
+    scrollMargin: measuredScrollMargin,
     scrollPaddingStart: 200,
     useFlushSync: false,
   });
@@ -602,7 +628,7 @@ export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, 
     : `${books.length.toLocaleString()} book${books.length !== 1 ? "s" : ""}`;
 
   return (
-    <div>
+    <div ref={setListEl}>
       {refreshBanner}
       {/* Virtual list container - no internal scroll, uses window */}
       <div style={{ height: `${totalSize}px`, position: "relative" }}>

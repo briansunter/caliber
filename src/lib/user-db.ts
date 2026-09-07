@@ -631,11 +631,20 @@ export function upsertProgress(
     ? Math.min(100, Math.max(0, Number(input.percentage)))
     : 0;
   const finished = input.finished ? 1 : 0;
-  // R2 ordering: per-(user,library,book,format) stale-overwrite guard.
+  // S2 revision protocol (replaces mixed-clock clientTs-vs-updatedAt ordering):
+  // - baseRevision = caller's last known server_seq (null = first/blind write).
+  // - Duplicate mutationId -> idempotent applied:true, no server_seq bump.
+  // - baseRevision mismatch (non-null, != existing.server_seq, different
+  //   mutation) -> conflict: keep location/percentage/updated_at, advance only
+  //   furthest_percentage/finished monotonically, no server_seq bump.
+  //   Returns applied:false reason:"conflict".
+  // - incomingTs (clientTs) is diagnostics-only and never affects ordering.
   const incomingMutation =
     typeof input.mutationId === "string" && input.mutationId ? input.mutationId.slice(0, 128) : null;
-  const incomingTs =
-    typeof input.clientTs === "number" && Number.isFinite(input.clientTs) ? input.clientTs : null;
+  const baseRevision =
+    typeof input.baseRevision === "number" && Number.isFinite(input.baseRevision)
+      ? Math.floor(input.baseRevision)
+      : null;
 
   const existing = getProgress(userId, lib, bookId, format);
   if (existing && incomingMutation && incomingMutation === existing.lastMutationId) {
@@ -643,15 +652,9 @@ export function upsertProgress(
     // server_seq again.
     return { progress: existing, applied: true, reason: "duplicate" };
   }
-  if (
-    existing &&
-    incomingTs !== null &&
-    incomingMutation !== null &&
-    incomingTs < existing.updatedAt &&
-    incomingMutation !== existing.lastMutationId
-  ) {
-    // Stale write: keep the newer location/percentage/updated_at, but still
-    // advance furthest/completion monotonically so forward progress is never lost.
+  if (existing && baseRevision !== null && baseRevision !== existing.serverSeq) {
+    // Revision conflict: keep the existing resume point, but still advance
+    // furthest/completion monotonically so forward progress is never lost.
     getDb()
       .query(
         `UPDATE progress SET
@@ -660,7 +663,7 @@ export function upsertProgress(
          WHERE user_id = ? AND library_id = ? AND book_id = ? AND format = ?`,
       )
       .run(resume, finished, userId, lib, bookId, format);
-    return { progress: getProgress(userId, lib, bookId, format), applied: false, reason: "stale" };
+    return { progress: getProgress(userId, lib, bookId, format), applied: false, reason: "conflict" };
   }
 
   getDb()

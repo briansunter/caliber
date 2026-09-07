@@ -978,6 +978,11 @@ interface ListOptions {
   // F23: when true, exclude metadata-only books (no rows in data) at the
   // query level. Used by OPDS acquisition feeds.
   requireFormats?: boolean;
+  // S7: when true AND this is the first page (no cursor), include a cheap
+  // COUNT(*) total computed with the same base filters. Later pages omit
+  // total (no per-page count); the client falls back to
+  // pages.length >= maxPages window detection when total is absent.
+  includeTotal?: boolean;
 }
 
 // Build a `b.id IN (...)` clause for OR-logic tag filtering, or "" if none valid.
@@ -1143,6 +1148,19 @@ function listBooksWithWhere(
     const formatsWhere = options.requireFormats
       ? `${baseWhere} AND EXISTS (SELECT 1 FROM data d WHERE d.book = b.id)`
       : baseWhere;
+    // S7: cheap first-page total — COUNT(*) with the same base filters but
+    // WITHOUT the cursor predicate, computed only when includeTotal is set
+    // and this is the first page (cursor == null). countParams mirrors the
+    // base filter bindings (initial FTS/tag params); the cursor params are
+    // appended to `params` below, after this snapshot is taken.
+    let total: number | undefined;
+    if (options.includeTotal && !options.cursor) {
+      const countParams = [...params];
+      const countRow = db
+        .query(`SELECT COUNT(*) as count FROM books b ${formatsWhere}`)
+        .get(...countParams) as { count: number };
+      total = countRow.count;
+    }
     const bookWhere = appendBookCursorWhere(formatsWhere, params, options);
     const bookOrderBy = buildBookOrderBy(sortBy, sortOrder);
 
@@ -1185,7 +1203,7 @@ function listBooksWithWhere(
     const hasMore = pageRows.length > limit;
     const page = pageRows.slice(0, limit);
     if (page.length === 0) {
-      return { items: [], nextCursor: null, hasMore };
+      return { items: [], nextCursor: null, hasMore, ...(total !== undefined ? { total } : {}) };
     }
     const ids = page.map((row) => row.id);
     const placeholders = ids.map(() => "?").join(",");
@@ -1290,13 +1308,17 @@ function listBooksWithWhere(
       items,
       nextCursor,
       hasMore,
+      // S7: present on the first page only (when includeTotal was set);
+      // omitted on later pages so no per-page COUNT(*) runs.
+      ...(total !== undefined ? { total } : {}),
     };
   } finally {
     releaseDb();
   }
 }
 
-// Cursor-based paginated list with CTE for O(1) performance
+// Cursor-based paginated list with CTE for O(1) performance.
+// S7: forwards options.includeTotal to listBooksWithWhere (first-page total only).
 export function listBooksCursor(options: ListOptions = {}): CursorPaginatedResult<BookListItem> {
   return listBooksWithWhere(options);
 }
@@ -1305,7 +1327,9 @@ interface SearchOptions extends ListOptions {
   query: string;
 }
 
-// FTS-powered search with cursor pagination
+// FTS-powered search with cursor pagination.
+// S7: forwards options.includeTotal through ftsSearch to listBooksWithWhere
+// (first-page total only; the FTS MATCH filter is part of the counted base).
 export function searchBooksCursor(options: SearchOptions): CursorPaginatedResult<BookListItem> {
   const searchQuery = options.query.trim();
 
