@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.12](https://github.com/briansunter/caliber/compare/v0.1.11...v0.1.12) (2026-09-09)
+
+
+### Features
+
+* PDF fit-screen and actual-size zoom, progress sync and endpoint hardening ([0f06ad9](https://github.com/briansunter/caliber/commit/0f06ad9e347820610f8b19e1d054754d0c8b950f))
+
 ## [0.1.11](https://github.com/briansunter/caliber/compare/v0.1.10...v0.1.11) (2026-09-09)
 
 
