@@ -268,7 +268,7 @@ function ReadingCard({ item, onRemove }: { item: ReadingListItem; onRemove: () =
         to="/book/$id"
         params={{ id: String(book.id) }}
         aria-label={book.title}
-            className="flex flex-col overflow-hidden rounded-lg border border-ink bg-surface transition-[box-shadow,border-color] hover:border-accent/50 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        className="flex flex-col overflow-hidden rounded-lg border border-ink bg-surface transition-[box-shadow,border-color] hover:border-accent/50 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
       >
         <div className="relative aspect-[2/3] w-full overflow-hidden bg-parchment-dark">
           <BookCoverImage

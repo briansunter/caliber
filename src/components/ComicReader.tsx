@@ -12,12 +12,14 @@ import {
   darkTone,
 } from "./ReaderChrome";
 import { useReaderSettings } from "@/lib/reader-settings";
-import { flushBookProgress, fetchBookProgress, saveBookProgress, progressPosKey, readScopedPos } from "@/lib/reading-progress";
 import {
-  getNextReaderLoadMode,
-  prefetchOrder,
-  type ReaderLoadMode,
-} from "./reader-types";
+  flushBookProgress,
+  fetchBookProgress,
+  saveBookProgress,
+  progressPosKey,
+  readScopedPos,
+} from "@/lib/reading-progress";
+import { getNextReaderLoadMode, prefetchOrder, type ReaderLoadMode } from "./reader-types";
 
 interface ComicPage {
   index: number;
@@ -106,7 +108,9 @@ export function ComicReader({
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [pages, setPages] = useState<ComicPage[]>([]);
-  const [currentPage, setCurrentPage] = useState(() => readScopedPos<{ page: number }>(bookId, `comic-${format}`, { page: 1 }).page as number);
+  const [currentPage, setCurrentPage] = useState(
+    () => readScopedPos<{ page: number }>(bookId, `comic-${format}`, { page: 1 }).page as number,
+  );
   const [showUI, setShowUI] = useState(true);
   const [zoom, setZoom] = useState(1);
   const [displayed, setDisplayed] = useState<ComicPage | null>(null);
@@ -252,7 +256,15 @@ export function ComicReader({
       cancelled = true;
       abort.abort();
     };
-  }, [streamManifestUrl, fullUrl, loadMode, format, supportsFullFile, clearObjectUrls, clearPreloadedImages]);
+  }, [
+    streamManifestUrl,
+    fullUrl,
+    loadMode,
+    format,
+    supportsFullFile,
+    clearObjectUrls,
+    clearPreloadedImages,
+  ]);
 
   useEffect(() => {
     return () => {

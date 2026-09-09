@@ -61,6 +61,8 @@ import {
   getUserByUsername,
   isValidUsername,
   getProgress,
+  getProgressDeletion,
+  getLibraryDeletion,
   listProgress,
   listProgressFormats,
   upsertProgress,
@@ -80,6 +82,7 @@ import {
   CONFIG_DIR_PATH,
   COOKIE_SECURE,
   HOST,
+  getCanonicalLibraryId,
   getLibraryConfigStatus,
   LibraryConfigError,
   MCP_ENABLED,
@@ -214,9 +217,7 @@ function publicUser(user: User) {
 // explicit CALIBER_LIBRARY_ID override) and NEVER taken from client input —
 // progress rows are always scoped to the library the server is serving.
 function resolveLibraryId(_req?: Request): string {
-  const override = process.env.CALIBER_LIBRARY_ID?.trim();
-  if (override) return override.slice(0, 200);
-  return `lib-${Bun.hash(getLibraryPath()).toString(36)}`;
+  return getCanonicalLibraryId();
 }
 
 // Optional ?format= query for per-format progress reads/deletes. Returns
@@ -264,6 +265,9 @@ async function handleProgressWrite(
     mutationId?: unknown;
     clientTs?: unknown;
     baseRevision?: unknown;
+    baseDeletionSeq?: unknown;
+    force?: unknown;
+    forceResurrect?: unknown;
   } & Record<string, unknown>;
   // S3: identity enforcement — a claimed principal/library that disagrees
   // with the authenticated user / resolved library is rejected with no write.
@@ -286,13 +290,23 @@ async function handleProgressWrite(
     mutationId: typeof body.mutationId === "string" ? body.mutationId : null,
     clientTs: typeof body.clientTs === "number" ? body.clientTs : null,
     baseRevision: typeof body.baseRevision === "number" ? body.baseRevision : null,
+    // T5 deletion generation: stale/absent baseDeletionSeq after a DELETE or
+    // clear is rejected with applied:false reason:"deleted" (no resurrect).
+    // A fresh seq (from GET deletion info) or force:true (explicit
+    // user-confirmed re-read) resurrects.
+    baseDeletionSeq: typeof body.baseDeletionSeq === "number" ? body.baseDeletionSeq : null,
+    force: body.force === true || body.forceResurrect === true,
   });
+  // Always report the current deletion generation so writers can rebase and
+  // resurrect intentionally with a fresh baseDeletionSeq.
+  const deletion = getProgressDeletion(user.id, libraryId, bookId, format);
   return Response.json(
     {
       progress: result.progress,
       applied: result.applied,
       reason: result.reason,
       serverSeq: result.progress?.serverSeq ?? null,
+      deletionSeq: deletion.seq,
     },
     { headers: { "Cache-Control": "private, no-store" } },
   );
@@ -440,7 +454,10 @@ function getCachedResponse(
   if (cached && now - cached.timestamp < CACHE_TTL) {
     const ifNoneMatch = req.headers.get("If-None-Match");
     if (ifNoneMatch === cached.etag) {
-      return new Response(null, { status: 304, headers: { ETag: cached.etag, "Cache-Control": cacheControl } });
+      return new Response(null, {
+        status: 304,
+        headers: { ETag: cached.etag, "Cache-Control": cacheControl },
+      });
     }
 
     return new Response(cached.data, {
@@ -483,14 +500,15 @@ function getCachedTextResponse(
   const now = Date.now();
   const cached = apiCache.get(key);
   // Sensitive callers pass no-store explicitly; otherwise derive from auth.
-  const effectiveControl = cacheControl.includes("no-store")
-    ? cacheControl
-    : cacheControlFor(req);
+  const effectiveControl = cacheControl.includes("no-store") ? cacheControl : cacheControlFor(req);
 
   if (cached && now - cached.timestamp < CACHE_TTL) {
     const ifNoneMatch = req.headers.get("If-None-Match");
     if (ifNoneMatch === cached.etag) {
-      return new Response(null, { status: 304, headers: { ETag: cached.etag, "Cache-Control": effectiveControl } });
+      return new Response(null, {
+        status: 304,
+        headers: { ETag: cached.etag, "Cache-Control": effectiveControl },
+      });
     }
 
     return new Response(cached.data, {
@@ -648,9 +666,7 @@ function opdsAcquisitionResponse(
   req: Request,
   title: string,
   basePath: string,
-  queryOrResult:
-    | CursorPaginatedResult<BookListItem>
-    | (() => CursorPaginatedResult<BookListItem>),
+  queryOrResult: CursorPaginatedResult<BookListItem> | (() => CursorPaginatedResult<BookListItem>),
   options?: { sortBy?: SortField; sortOrder?: SortOrder; noStore?: boolean },
 ): Response {
   const params = parseOpdsPageParams(req);
@@ -1052,10 +1068,7 @@ function pageStreamingErrorResponse(error: unknown): Response {
 
 function epubEntryErrorResponse(error: unknown): Response {
   if (error instanceof EpubCacheError) {
-    return Response.json(
-      { error: error.message, code: error.code },
-      { status: error.status },
-    );
+    return Response.json({ error: error.message, code: error.code }, { status: error.status });
   }
 
   console.error("Error serving EPUB entry:", error);
@@ -1068,7 +1081,9 @@ const streamEncoder = new TextEncoder();
 // ?size=small (default, 256px wide) or ?size=medium (512px wide). Thumbnails
 // are cached on disk as {id}-{size}-{sig}.jpg where sig is a revision key
 // over (library path, cover size, cover mtime), so a changed cover naturally
-// misses the old file. Resize uses Bun's built-in image pipeline when present;
+// misses the old file. Resize uses Bun's built-in image pipeline when present
+// (PRIMARY: file-backed Bun.file(tmp).image(), FALLBACK: new Bun.Image(bytes),
+// each trying positional then object resize signatures for 1.3.x/1.4.x);
 // when the pipeline is unavailable the endpoint degrades to the original
 // cover bytes with a 200 + `X-Thumbnail-Degraded: resize-unavailable` header
 // so <img> clients keep working (501 is reserved for no cover bytes at all).
@@ -1089,11 +1104,13 @@ function runThumbJob<T>(job: () => Promise<T>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const run = () => {
       thumbActiveJobs += 1;
-      job().then(resolve, reject).finally(() => {
-        thumbActiveJobs -= 1;
-        const next = thumbWaitQueue.shift();
-        if (next) next();
-      });
+      job()
+        .then(resolve, reject)
+        .finally(() => {
+          thumbActiveJobs -= 1;
+          const next = thumbWaitQueue.shift();
+          if (next) next();
+        });
     };
     if (thumbActiveJobs < THUMB_MAX_CONCURRENT) run();
     else thumbWaitQueue.push(run);
@@ -1108,6 +1125,7 @@ interface BunImageEncoder {
 }
 interface BunImageInstance {
   resize(width: number): { jpeg(): BunImageEncoder };
+  resize(options: { width?: number; w?: number }): { jpeg(): BunImageEncoder };
   jpeg(): BunImageEncoder;
 }
 interface BunWithImagePipeline {
@@ -1117,17 +1135,53 @@ interface BunFileWithImagePipeline {
   image?: () => Promise<BunImageInstance>;
 }
 
+// Try every known resize signature against one live image instance.
+// 1.4.x uses positional resize(width[, height[, options]]); some 1.3.x builds
+// accept an object ({ width } / { w }). Each attempt chains .jpeg().bytes()
+// immediately so a shape mismatch throws before any bytes are produced.
+async function encodeResizedImage(
+  image: BunImageInstance,
+  targetWidth: number,
+  pathLabel: string,
+): Promise<Uint8Array | null> {
+  const attempts: Array<{ label: string; run: () => { jpeg(): BunImageEncoder } }> = [
+    {
+      label: "resize(width)",
+      run: () => (image.resize as (w: number) => { jpeg(): BunImageEncoder })(targetWidth),
+    },
+    {
+      label: "resize({width})",
+      run: () => image.resize({ width: targetWidth }),
+    },
+    { label: "resize({w})", run: () => image.resize({ w: targetWidth }) },
+  ];
+  let lastError: unknown = null;
+  for (const attempt of attempts) {
+    try {
+      const encoded = attempt.run().jpeg();
+      if (!encoded || typeof encoded.bytes !== "function") continue;
+      const out = await encoded.bytes();
+      if (out && out.byteLength > 0) return out;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  console.warn(
+    `[thumb] resize signatures exhausted (Bun ${Bun.version}, path ${pathLabel}, last: ${lastError instanceof Error ? lastError.message : String(lastError)})`,
+  );
+  return null;
+}
+
 // Resize via Bun's built-in image pipeline when available; null means
-// "unavailable, caller serves the degraded original". Both pipeline shapes
-// are feature-detected: the in-memory `new Bun.Image(bytes)` constructor
-// first, then the file-backed `Bun.file(path).image()` fallback. Failures are
-// logged (message + runtime + attempted path) instead of swallowed.
+// "unavailable, caller serves the degraded original". The FILE-BACKED
+// `Bun.file(tmp).image()` path is PRIMARY (it is the shape known to work
+// across 1.3.x/1.4.x); the in-memory `new Bun.Image(bytes)` constructor is
+// the fallback. Both paths try positional then object resize signatures to
+// tolerate API shape differences across Bun versions. Failures are logged
+// (message + runtime + attempted path) instead of swallowed.
 // CALIBER_THUMB_DISABLE_RESIZE=1 forces null immediately so tests can
 // deterministically exercise the degraded fallback without stubbing.
-async function tryResizeImage(
-  bytes: Uint8Array,
-  targetWidth: number,
-): Promise<Uint8Array | null> {
+async function tryResizeImage(bytes: Uint8Array, targetWidth: number): Promise<Uint8Array | null> {
   if (process.env.CALIBER_THUMB_DISABLE_RESIZE === "1") {
     return null;
   }
@@ -1145,60 +1199,60 @@ async function tryResizeImage(
       `[thumb] sharp resize failed (Bun ${Bun.version}): ${error instanceof Error ? error.message : String(error)}`,
     );
   }
-  try {
-    const ImageCtor = (Bun as BunWithImagePipeline).Image;
-    if (typeof ImageCtor === "function") {
-      const encoded = new ImageCtor(bytes).resize(targetWidth).jpeg();
-      const out = await encoded.bytes();
-      if (out && out.byteLength > 0) return out;
-      console.warn(
-        `[thumb] Bun.Image pipeline returned empty bytes (Bun ${Bun.version}, path Bun.Image)`,
-      );
-      return null;
-    }
-    console.warn(
-      `[thumb] Bun.Image constructor unavailable (Bun ${Bun.version}, path Bun.Image)`,
-    );
-  } catch (error) {
-    // Fall through to the file-backed pipeline.
-    console.warn(
-      `[thumb] Bun.Image resize failed (Bun ${Bun.version}, path Bun.Image): ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
+  // FALLBACK: file-backed pipeline.
   try {
     const probe = Bun.file("") as BunFileWithImagePipeline;
-    if (typeof probe.image !== "function") {
+    if (typeof probe.image === "function") {
+      const { mkdtempSync, rmSync } = await import("node:fs");
+      const { tmpdir } = await import("node:os");
+      const dir = mkdtempSync(join(tmpdir(), "caliber-thumb-"));
+      try {
+        const tmpPath = join(dir, "cover");
+        await Bun.write(tmpPath, bytes);
+        const fileImage = Bun.file(tmpPath) as BunFileWithImagePipeline;
+        const image = await fileImage.image?.();
+        if (!image) {
+          console.warn(
+            `[thumb] file-backed resize returned no image (Bun ${Bun.version}, path Bun.file().image)`,
+          );
+        } else {
+          const out = await encodeResizedImage(image, targetWidth, "Bun.file().image");
+          if (out && out.byteLength > 0) return out;
+          console.warn(
+            `[thumb] file-backed pipeline returned empty bytes (Bun ${Bun.version}, path Bun.file().image)`,
+          );
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    } else {
       console.warn(
         `[thumb] file-backed image pipeline unavailable (Bun ${Bun.version}, path Bun.file().image)`,
       );
-      return null;
-    }
-    const { mkdtempSync, rmSync } = await import("node:fs");
-    const { tmpdir } = await import("node:os");
-    const dir = mkdtempSync(join(tmpdir(), "caliber-thumb-"));
-    try {
-      const tmpPath = join(dir, "cover");
-      await Bun.write(tmpPath, bytes);
-      const fileImage = Bun.file(tmpPath) as BunFileWithImagePipeline;
-      const encoded = (await fileImage.image?.())?.resize(targetWidth).jpeg();
-      if (!encoded) {
-        console.warn(
-          `[thumb] file-backed resize returned no encoder (Bun ${Bun.version}, path Bun.file().image)`,
-        );
-        return null;
-      }
-      const out = await encoded.bytes();
-      if (out && out.byteLength > 0) return out;
-      console.warn(
-        `[thumb] file-backed pipeline returned empty bytes (Bun ${Bun.version}, path Bun.file().image)`,
-      );
-      return null;
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
     }
   } catch (error) {
     console.warn(
       `[thumb] file-backed resize failed (Bun ${Bun.version}, path Bun.file().image): ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  // FALLBACK: in-memory constructor.
+  try {
+    const ImageCtor = (Bun as BunWithImagePipeline).Image;
+    if (typeof ImageCtor !== "function") {
+      console.warn(
+        `[thumb] Bun.Image constructor unavailable (Bun ${Bun.version}, path Bun.Image)`,
+      );
+      return null;
+    }
+    const out = await encodeResizedImage(new ImageCtor(bytes), targetWidth, "Bun.Image");
+    if (out && out.byteLength > 0) return out;
+    console.warn(
+      `[thumb] Bun.Image pipeline returned empty bytes (Bun ${Bun.version}, path Bun.Image)`,
+    );
+    return null;
+  } catch (error) {
+    console.warn(
+      `[thumb] Bun.Image resize failed (Bun ${Bun.version}, path Bun.Image): ${error instanceof Error ? error.message : String(error)}`,
     );
     return null;
   }
@@ -1226,204 +1280,446 @@ type RouteHandler = (req: Bun.BunRequest<string>) => Response | Promise<Response
 type RouteTable = Record<string, RouteHandler | { [method: string]: RouteHandler } | typeof index>;
 
 const routes: RouteTable = {
-    // Health check
-    "/api/health": {
-      GET: () => Response.json({ status: "ok", timestamp: Date.now() }),
-    },
+  // Health check
+  "/api/health": {
+    GET: () => Response.json({ status: "ok", timestamp: Date.now() }),
+  },
 
-    // Local setup/configuration surface. The server binds to loopback by
-    // default; deployments exposing it beyond the host should add auth.
-    "/api/config/library": {
-      GET: () => {
-        const snapshot = getSnapshotStatus();
+  // Local setup/configuration surface. The server binds to loopback by
+  // default; deployments exposing it beyond the host should add auth.
+  "/api/config/library": {
+    GET: () => {
+      const snapshot = getSnapshotStatus();
+      return Response.json(
+        {
+          ...getLibraryConfigStatus(),
+          // Canonical scope id (same value as resolveLibraryId); clients
+          // send it back as expectedLibraryId. libraryPath stays display only.
+          libraryId: resolveLibraryId(),
+          ready: libraryReady,
+          // Snapshot generation status (F15): stale while a refresh is
+          // pending/deferred, refreshing during publish, failed with the
+          // last publish error (null when healthy).
+          stale: snapshot.stale,
+          refreshing: snapshot.refreshing,
+          failed: snapshot.failed,
+          generation: snapshot.generation,
+          revision: snapshot.revision,
+        },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    },
+    PUT: async (req) => {
+      if (!LOCAL_SETUP_HOSTS.has(HOST.toLowerCase())) {
         return Response.json(
           {
-            ...getLibraryConfigStatus(),
-            ready: libraryReady,
-            // Snapshot generation status (F15): stale while a refresh is
-            // pending/deferred, refreshing during publish, failed with the
-            // last publish error (null when healthy).
-            stale: snapshot.stale,
-            refreshing: snapshot.refreshing,
-            failed: snapshot.failed,
-            generation: snapshot.generation,
-            revision: snapshot.revision,
+            error:
+              "Library selection is available only when Caliber is bound to loopback; configure CALIBRE_LIBRARY_PATH instead",
           },
+          { status: 403, headers: { "Cache-Control": "no-store" } },
+        );
+      }
+      const rawBody = await readJsonBodyOr400(req);
+      if (rawBody instanceof Response) return rawBody;
+      if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
+        return Response.json({ error: "Request body must be an object" }, { status: 400 });
+      }
+
+      const body = rawBody as {
+        databasePath?: unknown;
+        libraryPath?: unknown;
+        dbName?: unknown;
+      };
+      try {
+        const status = saveLibraryConfig({
+          databasePath: typeof body.databasePath === "string" ? body.databasePath : undefined,
+          libraryPath: typeof body.libraryPath === "string" ? body.libraryPath : undefined,
+          dbName: typeof body.dbName === "string" ? body.dbName : undefined,
+        });
+        reconfigureLibraryDatabase();
+        libraryReady = true;
+        apiCache.clear();
+        return Response.json(
+          { ...status, ready: libraryReady, applied: true },
           { headers: { "Cache-Control": "no-store" } },
         );
-      },
-      PUT: async (req) => {
-        if (!LOCAL_SETUP_HOSTS.has(HOST.toLowerCase())) {
-          return Response.json(
-            { error: "Library selection is available only when Caliber is bound to loopback; configure CALIBRE_LIBRARY_PATH instead" },
-            { status: 403, headers: { "Cache-Control": "no-store" } },
-          );
+      } catch (error) {
+        if (error instanceof LibraryConfigError) {
+          return Response.json({ error: error.message }, { status: 400 });
         }
-        const rawBody = await readJsonBodyOr400(req);
-        if (rawBody instanceof Response) return rawBody;
-        if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
-          return Response.json({ error: "Request body must be an object" }, { status: 400 });
-        }
+        console.error("Error changing Calibre library:", error);
+        return Response.json({ error: "Could not change the Calibre library" }, { status: 500 });
+      }
+    },
+  },
 
-        const body = rawBody as {
-          databasePath?: unknown;
-          libraryPath?: unknown;
-          dbName?: unknown;
-        };
+  // Library stats
+  "/api/stats": {
+    GET: (req) => {
+      return getCachedResponse("stats", () => getLibraryStats(), req);
+    },
+  },
+
+  // --- Auth configuration & account management (Settings UI) ---
+
+  // Auth status for the Settings panel. The account list is only included
+  // for operators allowed to manage auth.
+  "/api/config/auth": {
+    GET: async (req) => {
+      const canManage = await canManageAuth(req);
+      return Response.json(
+        {
+          authEnabled: AUTH_ENABLED,
+          hasAccounts: countUsersWithPassword() > 0,
+          canManage,
+          envControlled: AUTH_ENV_CONTROLLED,
+          users: canManage
+            ? listAuthUsers().map((user) => ({
+                id: user.id,
+                username: user.username,
+                hasPassword: user.hasPassword,
+              }))
+            : undefined,
+        },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    },
+    PUT: async (req) => {
+      if (!(await canManageAuth(req))) {
+        return Response.json(
+          {
+            error:
+              "Authentication settings are available only when Caliber runs on loopback or while signed in",
+          },
+          { status: 403, headers: { "Cache-Control": "no-store" } },
+        );
+      }
+
+      const rawBody = await readJsonBodyOr400(req);
+      if (rawBody instanceof Response) return rawBody;
+      if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
+        return Response.json({ error: "Request body must be an object" }, { status: 400 });
+      }
+      const body = rawBody as { enabled?: unknown; username?: unknown; password?: unknown };
+      if (typeof body.enabled !== "boolean") {
+        return Response.json({ error: "enabled must be a boolean" }, { status: 400 });
+      }
+
+      if (body.enabled === AUTH_ENABLED) {
+        return Response.json(
+          { authEnabled: AUTH_ENABLED, changed: false },
+          { headers: { "Cache-Control": "no-store" } },
+        );
+      }
+
+      // When turning auth on with no accounts yet, the operator creates the
+      // first account in the same request and is signed in immediately.
+      // Prepare-then-commit: the credential is validated with the shared
+      // isValidPassword (min + max) and prepared BEFORE authEnabled is
+      // persisted, so a weak/oversized password can never leave auth
+      // enabled with no usable account.
+      const needsAccount = body.enabled && countUsersWithPassword() === 0;
+      const username = typeof body.username === "string" ? body.username : "";
+      const password = typeof body.password === "string" ? body.password : "";
+      if (needsAccount && !isValidUsername(username)) {
+        return Response.json({ error: "Invalid username" }, { status: 400 });
+      }
+      if (needsAccount && !isValidPassword(password)) {
+        return Response.json(
+          { error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` },
+          { status: 400 },
+        );
+      }
+
+      let preparedUser: User | null = null;
+      if (needsAccount) {
         try {
-          const status = saveLibraryConfig({
-            databasePath: typeof body.databasePath === "string" ? body.databasePath : undefined,
-            libraryPath: typeof body.libraryPath === "string" ? body.libraryPath : undefined,
-            dbName: typeof body.dbName === "string" ? body.dbName : undefined,
-          });
-          reconfigureLibraryDatabase();
-          libraryReady = true;
-          apiCache.clear();
-          return Response.json(
-            { ...status, ready: libraryReady, applied: true },
-            { headers: { "Cache-Control": "no-store" } },
-          );
+          preparedUser = await setPasswordForUser(username, password);
         } catch (error) {
-          if (error instanceof LibraryConfigError) {
+          if (error instanceof PasswordError) {
             return Response.json({ error: error.message }, { status: 400 });
-          }
-          console.error("Error changing Calibre library:", error);
-          return Response.json({ error: "Could not change the Calibre library" }, { status: 500 });
-        }
-      },
-    },
-
-    // Library stats
-    "/api/stats": {
-      GET: (req) => {
-        return getCachedResponse("stats", () => getLibraryStats(), req);
-      },
-    },
-
-    // --- Auth configuration & account management (Settings UI) ---
-
-    // Auth status for the Settings panel. The account list is only included
-    // for operators allowed to manage auth.
-    "/api/config/auth": {
-      GET: async (req) => {
-        const canManage = await canManageAuth(req);
-        return Response.json(
-          {
-            authEnabled: AUTH_ENABLED,
-            hasAccounts: countUsersWithPassword() > 0,
-            canManage,
-            envControlled: AUTH_ENV_CONTROLLED,
-            users: canManage
-              ? listAuthUsers().map((user) => ({
-                  id: user.id,
-                  username: user.username,
-                  hasPassword: user.hasPassword,
-                }))
-              : undefined,
-          },
-          { headers: { "Cache-Control": "no-store" } },
-        );
-      },
-      PUT: async (req) => {
-        if (!(await canManageAuth(req))) {
-          return Response.json(
-            {
-              error:
-                "Authentication settings are available only when Caliber runs on loopback or while signed in",
-            },
-            { status: 403, headers: { "Cache-Control": "no-store" } },
-          );
-        }
-
-        const rawBody = await readJsonBodyOr400(req);
-        if (rawBody instanceof Response) return rawBody;
-        if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
-          return Response.json({ error: "Request body must be an object" }, { status: 400 });
-        }
-        const body = rawBody as { enabled?: unknown; username?: unknown; password?: unknown };
-        if (typeof body.enabled !== "boolean") {
-          return Response.json({ error: "enabled must be a boolean" }, { status: 400 });
-        }
-
-        if (body.enabled === AUTH_ENABLED) {
-          return Response.json(
-            { authEnabled: AUTH_ENABLED, changed: false },
-            { headers: { "Cache-Control": "no-store" } },
-          );
-        }
-
-        // When turning auth on with no accounts yet, the operator creates the
-        // first account in the same request and is signed in immediately.
-        // Prepare-then-commit: the credential is validated with the shared
-        // isValidPassword (min + max) and prepared BEFORE authEnabled is
-        // persisted, so a weak/oversized password can never leave auth
-        // enabled with no usable account.
-        const needsAccount = body.enabled && countUsersWithPassword() === 0;
-        const username = typeof body.username === "string" ? body.username : "";
-        const password = typeof body.password === "string" ? body.password : "";
-        if (needsAccount && !isValidUsername(username)) {
-          return Response.json({ error: "Invalid username" }, { status: 400 });
-        }
-        if (needsAccount && !isValidPassword(password)) {
-          return Response.json(
-            { error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` },
-            { status: 400 },
-          );
-        }
-
-        let preparedUser: User | null = null;
-        if (needsAccount) {
-          try {
-            preparedUser = await setPasswordForUser(username, password);
-          } catch (error) {
-            if (error instanceof PasswordError) {
-              return Response.json({ error: error.message }, { status: 400 });
-            }
-            throw error;
-          }
-        }
-
-        try {
-          setAuthEnabled(body.enabled);
-        } catch (error) {
-          if (error instanceof AuthConfigError) {
-            return Response.json(
-              { error: error.message },
-              { status: 400, headers: { "Cache-Control": "no-store" } },
-            );
           }
           throw error;
         }
+      }
 
-        if (preparedUser) {
-          purgeExpiredSessions();
-          const session = createSessionToken(preparedUser.id);
+      try {
+        setAuthEnabled(body.enabled);
+      } catch (error) {
+        if (error instanceof AuthConfigError) {
           return Response.json(
-            { authEnabled: true, changed: true, user: publicUser(preparedUser) },
-            {
-              headers: {
-                "Set-Cookie": sessionCookieHeader(session.token),
-                "Cache-Control": "no-store",
-              },
-            },
+            { error: error.message },
+            { status: 400, headers: { "Cache-Control": "no-store" } },
           );
         }
+        throw error;
+      }
 
+      if (preparedUser) {
+        purgeExpiredSessions();
+        const session = createSessionToken(preparedUser.id);
         return Response.json(
-          { authEnabled: AUTH_ENABLED, changed: true },
+          { authEnabled: true, changed: true, user: publicUser(preparedUser) },
+          {
+            headers: {
+              "Set-Cookie": sessionCookieHeader(session.token),
+              "Cache-Control": "no-store",
+            },
+          },
+        );
+      }
+
+      return Response.json(
+        { authEnabled: AUTH_ENABLED, changed: true },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    },
+  },
+
+  // Account administration for the Settings panel. Same operator rules as
+  // the auth toggle above; the guard additionally requires a session
+  // whenever auth is enabled.
+  "/api/auth/users": {
+    POST: async (req) => {
+      if (!(await canManageAuth(req))) {
+        return Response.json(
+          { error: "Account management is available only on loopback or while signed in" },
+          { status: 403, headers: { "Cache-Control": "no-store" } },
+        );
+      }
+
+      const rawBody = await readJsonBodyOr400(req);
+      if (rawBody instanceof Response) return rawBody;
+      if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
+        return Response.json({ error: "Request body must be an object" }, { status: 400 });
+      }
+      const body = rawBody as { username?: unknown; password?: unknown };
+      const username = typeof body.username === "string" ? body.username : "";
+      const password = typeof body.password === "string" ? body.password : "";
+      if (!isValidUsername(username)) {
+        return Response.json({ error: "Invalid username" }, { status: 400 });
+      }
+      if (!isValidPassword(password)) {
+        return Response.json(
+          { error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` },
+          { status: 400 },
+        );
+      }
+
+      const existing = getCredentialByUsername(username);
+      if (existing?.passwordHash) {
+        return Response.json(
+          { error: `${existing.username} already has a password` },
+          { status: 409 },
+        );
+      }
+
+      try {
+        const user = await setPasswordForUser(username, password);
+        return Response.json(
+          { user: publicUser(user) },
           { headers: { "Cache-Control": "no-store" } },
         );
-      },
+      } catch (error) {
+        if (error instanceof PasswordError) {
+          return Response.json({ error: error.message }, { status: 400 });
+        }
+        throw error;
+      }
     },
+  },
 
-    // Account administration for the Settings panel. Same operator rules as
-    // the auth toggle above; the guard additionally requires a session
-    // whenever auth is enabled.
-    "/api/auth/users": {
-      POST: async (req) => {
-        if (!(await canManageAuth(req))) {
+  "/api/auth/users/:username": {
+    DELETE: async (req) => {
+      if (!(await canManageAuth(req))) {
+        return Response.json(
+          { error: "Account management is available only on loopback or while signed in" },
+          { status: 403, headers: { "Cache-Control": "no-store" } },
+        );
+      }
+      const username = decodeURIComponent(req.params.username ?? "");
+      const target = getCredentialByUsername(username);
+      if (!target) {
+        return Response.json({ error: "User not found" }, { status: 404 });
+      }
+      // Never delete the last account that can log in.
+      if (target.passwordHash && countUsersWithPassword() <= 1) {
+        return Response.json(
+          { error: "Cannot delete the last user with a password" },
+          { status: 409, headers: { "Cache-Control": "no-store" } },
+        );
+      }
+      const removed = deleteUser(username);
+      if (!removed) {
+        return Response.json({ error: "User not found" }, { status: 404 });
+      }
+      return Response.json(
+        { removed: removed.username },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    },
+  },
+
+  "/api/auth/users/:username/password": {
+    POST: async (req) => {
+      if (!(await canManageAuth(req))) {
+        return Response.json(
+          { error: "Account management is available only on loopback or while signed in" },
+          { status: 403, headers: { "Cache-Control": "no-store" } },
+        );
+      }
+      const username = decodeURIComponent(req.params.username ?? "");
+      const target = getUserByUsername(username);
+      if (!target) {
+        return Response.json({ error: "User not found" }, { status: 404 });
+      }
+
+      const rawBody = await readJsonBodyOr400(req);
+      if (rawBody instanceof Response) return rawBody;
+      if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
+        return Response.json({ error: "Request body must be an object" }, { status: 400 });
+      }
+      const body = rawBody as { password?: unknown };
+      const password = typeof body.password === "string" ? body.password : "";
+      if (!isValidPassword(password)) {
+        return Response.json(
+          { error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` },
+          { status: 400 },
+        );
+      }
+
+      try {
+        const user = await setPasswordForUser(target.username, password);
+        return Response.json(
+          { user: publicUser(user) },
+          { headers: { "Cache-Control": "no-store" } },
+        );
+      } catch (error) {
+        if (error instanceof PasswordError) {
+          return Response.json({ error: error.message }, { status: 400 });
+        }
+        throw error;
+      }
+    },
+  },
+
+  // All tags with book counts (for the tag filter UI)
+  "/api/tags": {
+    GET: (req) => {
+      return getCachedResponse("tags", () => listAllTags(), req);
+    },
+  },
+
+  // Book count (lightweight)
+  "/api/books/count": {
+    GET: (req) => {
+      return getCachedResponse("count", () => ({ count: getBookCount() }), req);
+    },
+  },
+
+  // --- Users & reading progress (local profile cookie, not authentication) ---
+
+  // Who am I? (reads the cookie or session). Public so the SPA can render
+  // a login screen when auth is enabled.
+  "/api/user/me": {
+    GET: async (req) => {
+      const user = await currentUser(req);
+      return Response.json(
+        {
+          user: user ? publicUser(user) : null,
+          authRequired: AUTH_ENABLED,
+          needsSetup: needsInitialSetup(),
+        },
+        { headers: { "Cache-Control": "private, no-store" } },
+      );
+    },
+  },
+
+  // Log in. With auth enabled this verifies a password and starts a
+  // server-side session; without auth it just remembers a username for
+  // reading progress.
+  "/api/user/login": {
+    POST: async (req) => {
+      const rawBody = await readJsonBodyOr400(req);
+      if (rawBody instanceof Response) return rawBody;
+      if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
+        return Response.json({ error: "Request body must be an object" }, { status: 400 });
+      }
+      const body = rawBody as { username?: unknown; password?: unknown };
+      const username = typeof body.username === "string" ? body.username : "";
+      if (!isValidUsername(username)) {
+        return Response.json({ error: "Invalid username" }, { status: 400 });
+      }
+
+      if (AUTH_ENABLED) {
+        const password = typeof body.password === "string" ? body.password : "";
+        if (loginRateLimited(req, username)) {
           return Response.json(
-            { error: "Account management is available only on loopback or while signed in" },
+            { error: "Too many failed attempts; try again later" },
+            { status: 429, headers: { "Cache-Control": "no-store" } },
+          );
+        }
+        const user = await authenticateWithPassword(req, username, password);
+        if (!user) {
+          return Response.json(
+            { error: "Invalid username or password" },
+            { status: 401, headers: { "Cache-Control": "no-store" } },
+          );
+        }
+        purgeExpiredSessions();
+        const session = createSessionToken(user.id);
+        return Response.json(
+          { user: publicUser(user) },
+          {
+            headers: {
+              "Set-Cookie": sessionCookieHeader(session.token),
+              "Cache-Control": "private, no-store",
+            },
+          },
+        );
+      }
+
+      const user = getOrCreateUser(username);
+      if (!user) {
+        return Response.json({ error: "Could not create user" }, { status: 500 });
+      }
+      return Response.json(
+        { user: publicUser(user) },
+        {
+          headers: {
+            "Set-Cookie": userCookieHeader(user.username),
+            "Cache-Control": "private, no-store",
+          },
+        },
+      );
+    },
+  },
+
+  // First-run account creation: allowed only while auth is enabled and no
+  // user can log in yet, so an exposed instance cannot be claimed later.
+  "/api/auth/setup": {
+    POST: async (req) => {
+      // Serialize bootstrap: recheck inside the mutex so concurrent
+      // requests cannot both create the first account.
+      const previous = setupMutex;
+      let release!: () => void;
+      setupMutex = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      await previous;
+      try {
+        if (!AUTH_ENABLED) {
+          return Response.json(
+            { error: "Authentication is disabled" },
+            { status: 403, headers: { "Cache-Control": "no-store" } },
+          );
+        }
+        if (!needsInitialSetup()) {
+          return Response.json(
+            {
+              error:
+                "Setup is already complete; ask an existing user or use the CLI to add accounts",
+            },
             { status: 403, headers: { "Cache-Control": "no-store" } },
           );
         }
@@ -1445,168 +1741,27 @@ const routes: RouteTable = {
             { status: 400 },
           );
         }
-
-        const existing = getCredentialByUsername(username);
-        if (existing?.passwordHash) {
+        if (loginRateLimited(req, username)) {
           return Response.json(
-            { error: `${existing.username} already has a password` },
-            { status: 409 },
+            { error: "Too many failed attempts; try again later" },
+            { status: 429, headers: { "Cache-Control": "no-store" } },
+          );
+        }
+
+        // Recheck after validation: another request may have completed setup
+        // while this one was awaiting the mutex or hashing inputs.
+        if (!needsInitialSetup()) {
+          return Response.json(
+            {
+              error:
+                "Setup is already complete; ask an existing user or use the CLI to add accounts",
+            },
+            { status: 403, headers: { "Cache-Control": "no-store" } },
           );
         }
 
         try {
           const user = await setPasswordForUser(username, password);
-          return Response.json(
-            { user: publicUser(user) },
-            { headers: { "Cache-Control": "no-store" } },
-          );
-        } catch (error) {
-          if (error instanceof PasswordError) {
-            return Response.json({ error: error.message }, { status: 400 });
-          }
-          throw error;
-        }
-      },
-    },
-
-    "/api/auth/users/:username": {
-      DELETE: async (req) => {
-        if (!(await canManageAuth(req))) {
-          return Response.json(
-            { error: "Account management is available only on loopback or while signed in" },
-            { status: 403, headers: { "Cache-Control": "no-store" } },
-          );
-        }
-        const username = decodeURIComponent(req.params.username ?? "");
-        const target = getCredentialByUsername(username);
-        if (!target) {
-          return Response.json({ error: "User not found" }, { status: 404 });
-        }
-        // Never delete the last account that can log in.
-        if (target.passwordHash && countUsersWithPassword() <= 1) {
-          return Response.json(
-            { error: "Cannot delete the last user with a password" },
-            { status: 409, headers: { "Cache-Control": "no-store" } },
-          );
-        }
-        const removed = deleteUser(username);
-        if (!removed) {
-          return Response.json({ error: "User not found" }, { status: 404 });
-        }
-        return Response.json(
-          { removed: removed.username },
-          { headers: { "Cache-Control": "no-store" } },
-        );
-      },
-    },
-
-    "/api/auth/users/:username/password": {
-      POST: async (req) => {
-        if (!(await canManageAuth(req))) {
-          return Response.json(
-            { error: "Account management is available only on loopback or while signed in" },
-            { status: 403, headers: { "Cache-Control": "no-store" } },
-          );
-        }
-        const username = decodeURIComponent(req.params.username ?? "");
-        const target = getUserByUsername(username);
-        if (!target) {
-          return Response.json({ error: "User not found" }, { status: 404 });
-        }
-
-        const rawBody = await readJsonBodyOr400(req);
-        if (rawBody instanceof Response) return rawBody;
-        if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
-          return Response.json({ error: "Request body must be an object" }, { status: 400 });
-        }
-        const body = rawBody as { password?: unknown };
-        const password = typeof body.password === "string" ? body.password : "";
-        if (!isValidPassword(password)) {
-          return Response.json(
-            { error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` },
-            { status: 400 },
-          );
-        }
-
-        try {
-          const user = await setPasswordForUser(target.username, password);
-          return Response.json(
-            { user: publicUser(user) },
-            { headers: { "Cache-Control": "no-store" } },
-          );
-        } catch (error) {
-          if (error instanceof PasswordError) {
-            return Response.json({ error: error.message }, { status: 400 });
-          }
-          throw error;
-        }
-      },
-    },
-
-    // All tags with book counts (for the tag filter UI)
-    "/api/tags": {
-      GET: (req) => {
-        return getCachedResponse("tags", () => listAllTags(), req);
-      },
-    },
-
-    // Book count (lightweight)
-    "/api/books/count": {
-      GET: (req) => {
-        return getCachedResponse("count", () => ({ count: getBookCount() }), req);
-      },
-    },
-
-    // --- Users & reading progress (local profile cookie, not authentication) ---
-
-    // Who am I? (reads the cookie or session). Public so the SPA can render
-    // a login screen when auth is enabled.
-    "/api/user/me": {
-      GET: async (req) => {
-        const user = await currentUser(req);
-        return Response.json(
-          {
-            user: user ? publicUser(user) : null,
-            authRequired: AUTH_ENABLED,
-            needsSetup: needsInitialSetup(),
-          },
-          { headers: { "Cache-Control": "private, no-store" } },
-        );
-      },
-    },
-
-    // Log in. With auth enabled this verifies a password and starts a
-    // server-side session; without auth it just remembers a username for
-    // reading progress.
-    "/api/user/login": {
-      POST: async (req) => {
-        const rawBody = await readJsonBodyOr400(req);
-        if (rawBody instanceof Response) return rawBody;
-        if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
-          return Response.json({ error: "Request body must be an object" }, { status: 400 });
-        }
-        const body = rawBody as { username?: unknown; password?: unknown };
-        const username = typeof body.username === "string" ? body.username : "";
-        if (!isValidUsername(username)) {
-          return Response.json({ error: "Invalid username" }, { status: 400 });
-        }
-
-        if (AUTH_ENABLED) {
-          const password = typeof body.password === "string" ? body.password : "";
-          if (loginRateLimited(req, username)) {
-            return Response.json(
-              { error: "Too many failed attempts; try again later" },
-              { status: 429, headers: { "Cache-Control": "no-store" } },
-            );
-          }
-          const user = await authenticateWithPassword(req, username, password);
-          if (!user) {
-            return Response.json(
-              { error: "Invalid username or password" },
-              { status: 401, headers: { "Cache-Control": "no-store" } },
-            );
-          }
-          purgeExpiredSessions();
           const session = createSessionToken(user.id);
           return Response.json(
             { user: publicUser(user) },
@@ -1617,330 +1772,259 @@ const routes: RouteTable = {
               },
             },
           );
+        } catch (error) {
+          if (error instanceof PasswordError) {
+            return Response.json({ error: error.message }, { status: 400 });
+          }
+          throw error;
         }
-
-        const user = getOrCreateUser(username);
-        if (!user) {
-          return Response.json({ error: "Could not create user" }, { status: 500 });
-        }
-        return Response.json(
-          { user: publicUser(user) },
-          {
-            headers: {
-              "Set-Cookie": userCookieHeader(user.username),
-              "Cache-Control": "private, no-store",
-            },
-          },
-        );
-      },
+      } finally {
+        release();
+      }
     },
+  },
 
-    // First-run account creation: allowed only while auth is enabled and no
-    // user can log in yet, so an exposed instance cannot be claimed later.
-    "/api/auth/setup": {
-      POST: async (req) => {
-        // Serialize bootstrap: recheck inside the mutex so concurrent
-        // requests cannot both create the first account.
-        const previous = setupMutex;
-        let release!: () => void;
-        setupMutex = new Promise<void>((resolve) => {
-          release = resolve;
+  // Forget the current user (clear cookie / revoke session)
+  "/api/user/logout": {
+    POST: (req) => {
+      const headers = new Headers({ "Cache-Control": "no-store" });
+      if (AUTH_ENABLED) {
+        revokeSessionToken(sessionTokenFromRequest(req));
+        headers.append("Set-Cookie", sessionCookieHeader(null));
+      }
+      headers.append("Set-Cookie", userCookieHeader(null));
+      return Response.json({ ok: true }, { headers });
+    },
+  },
+
+  // Recently-read shelf: progress rows enriched with book metadata for cards.
+  "/api/user/reading": {
+    DELETE: async (req) => {
+      const user = await currentUser(req);
+      if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
+      const libraryId = resolveLibraryId(req);
+      const removed = clearProgress(user.id, libraryId);
+      return Response.json(
+        { removed, deletionSeq: getLibraryDeletion(user.id, libraryId).seq },
+        { headers: { "Cache-Control": "private, no-store" } },
+      );
+    },
+    GET: async (req) => {
+      const user = await currentUser(req);
+      if (!user) return Response.json({ items: [] });
+      const url = new URL(req.url);
+      const limit = parseBoundedInt(url.searchParams.get("limit"), 200, { min: 1, max: 500 });
+      const libraryId = resolveLibraryId(req);
+      const rows = listProgress(user.id, libraryId, limit);
+      // Per-format rows collapse to one shelf item per book: finished
+      // wins, then furthest progress, then most recent. Enrichment reads
+      // the same server library, so foreign-library rows never resolve.
+      const bestByBook = new Map<number, (typeof rows)[number]>();
+      for (const row of rows) {
+        const prev = bestByBook.get(row.bookId);
+        if (
+          !prev ||
+          Number(row.finished) > Number(prev.finished) ||
+          (Number(row.finished) === Number(prev.finished) &&
+            (row.furthestPercentage > prev.furthestPercentage ||
+              (row.furthestPercentage === prev.furthestPercentage &&
+                row.updatedAt > prev.updatedAt)))
+        ) {
+          bestByBook.set(row.bookId, row);
+        }
+      }
+      // Batch enrichment: one WHERE id IN (...) lookup instead of one
+      // getBookByIdOptimized round-trip per row.
+      const scoped = [...bestByBook.values()];
+      const booksById = getBooksByIdsOptimized(scoped.map((row) => row.bookId));
+      const items = [];
+      for (const row of scoped) {
+        const book = booksById.get(row.bookId);
+        if (!book) continue; // book removed from library — skip
+        items.push({
+          book: {
+            id: book.id,
+            title: book.title,
+            authors: book.authors,
+            series: book.series,
+            series_index: book.series_index,
+            formats: book.formats,
+            has_cover: book.has_cover,
+          },
+          progress: {
+            format: row.format,
+            percentage: row.percentage,
+            finished: row.finished,
+            updatedAt: row.updatedAt,
+          },
         });
-        await previous;
-        try {
-          if (!AUTH_ENABLED) {
-            return Response.json(
-              { error: "Authentication is disabled" },
-              { status: 403, headers: { "Cache-Control": "no-store" } },
-            );
-          }
-          if (!needsInitialSetup()) {
-            return Response.json(
-              { error: "Setup is already complete; ask an existing user or use the CLI to add accounts" },
-              { status: 403, headers: { "Cache-Control": "no-store" } },
-            );
-          }
-
-          const rawBody = await readJsonBodyOr400(req);
-          if (rawBody instanceof Response) return rawBody;
-          if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
-            return Response.json({ error: "Request body must be an object" }, { status: 400 });
-          }
-          const body = rawBody as { username?: unknown; password?: unknown };
-          const username = typeof body.username === "string" ? body.username : "";
-          const password = typeof body.password === "string" ? body.password : "";
-          if (!isValidUsername(username)) {
-            return Response.json({ error: "Invalid username" }, { status: 400 });
-          }
-          if (!isValidPassword(password)) {
-            return Response.json(
-              { error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` },
-              { status: 400 },
-            );
-          }
-          if (loginRateLimited(req, username)) {
-            return Response.json(
-              { error: "Too many failed attempts; try again later" },
-              { status: 429, headers: { "Cache-Control": "no-store" } },
-            );
-          }
-
-          // Recheck after validation: another request may have completed setup
-          // while this one was awaiting the mutex or hashing inputs.
-          if (!needsInitialSetup()) {
-            return Response.json(
-              { error: "Setup is already complete; ask an existing user or use the CLI to add accounts" },
-              { status: 403, headers: { "Cache-Control": "no-store" } },
-            );
-          }
-
-          try {
-            const user = await setPasswordForUser(username, password);
-            const session = createSessionToken(user.id);
-            return Response.json(
-              { user: publicUser(user) },
-              {
-                headers: {
-                  "Set-Cookie": sessionCookieHeader(session.token),
-                  "Cache-Control": "private, no-store",
-                },
-              },
-            );
-          } catch (error) {
-            if (error instanceof PasswordError) {
-              return Response.json({ error: error.message }, { status: 400 });
-            }
-            throw error;
-          }
-        } finally {
-          release();
-        }
-      },
+      }
+      return Response.json({ items });
     },
+  },
 
-    // Forget the current user (clear cookie / revoke session)
-    "/api/user/logout": {
-      POST: (req) => {
-        const headers = new Headers({ "Cache-Control": "no-store" });
-        if (AUTH_ENABLED) {
-          revokeSessionToken(sessionTokenFromRequest(req));
-          headers.append("Set-Cookie", sessionCookieHeader(null));
-        }
-        headers.append("Set-Cookie", userCookieHeader(null));
-        return Response.json({ ok: true }, { headers });
-      },
-    },
-
-    // Recently-read shelf: progress rows enriched with book metadata for cards.
-    "/api/user/reading": {
-      DELETE: async (req) => {
-        const user = await currentUser(req);
-        if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
-        return Response.json({ removed: clearProgress(user.id, resolveLibraryId(req)) });
-      },
-      GET: async (req) => {
-        const user = await currentUser(req);
-        if (!user) return Response.json({ items: [] });
-        const url = new URL(req.url);
-        const limit = parseBoundedInt(url.searchParams.get("limit"), 200, { min: 1, max: 500 });
-        const libraryId = resolveLibraryId(req);
-        const rows = listProgress(user.id, libraryId, limit);
-        // Per-format rows collapse to one shelf item per book: finished
-        // wins, then furthest progress, then most recent. Enrichment reads
-        // the same server library, so foreign-library rows never resolve.
-        const bestByBook = new Map<number, (typeof rows)[number]>();
-        for (const row of rows) {
-          const prev = bestByBook.get(row.bookId);
-          if (
-            !prev ||
-            Number(row.finished) > Number(prev.finished) ||
-            (Number(row.finished) === Number(prev.finished) &&
-              (row.furthestPercentage > prev.furthestPercentage ||
-                (row.furthestPercentage === prev.furthestPercentage &&
-                  row.updatedAt > prev.updatedAt)))
-          ) {
-            bestByBook.set(row.bookId, row);
-          }
-        }
-        // Batch enrichment: one WHERE id IN (...) lookup instead of one
-        // getBookByIdOptimized round-trip per row.
-        const scoped = [...bestByBook.values()];
-        const booksById = getBooksByIdsOptimized(scoped.map((row) => row.bookId));
-        const items = [];
-        for (const row of scoped) {
-          const book = booksById.get(row.bookId);
-          if (!book) continue; // book removed from library — skip
-          items.push({
-            book: {
-              id: book.id,
-              title: book.title,
-              authors: book.authors,
-              series: book.series,
-              series_index: book.series_index,
-              formats: book.formats,
-              has_cover: book.has_cover,
-            },
-            progress: {
-              format: row.format,
-              percentage: row.percentage,
-              finished: row.finished,
-              updatedAt: row.updatedAt,
-            },
-          });
-        }
-        return Response.json({ items });
-      },
-    },
-
-    // Per-book progress for the active reader
-    "/api/user/progress/:bookId": {
-      GET: async (req) => {
-        const bookId = parseBookId(req.params.bookId ?? "");
-        if (bookId === null) {
-          return Response.json({ error: "Invalid book id" }, { status: 400 });
-        }
-        const user = await currentUser(req);
-        if (!user) {
-          return Response.json(
-            { progress: null },
-            { headers: { "Cache-Control": "private, no-store" } },
-          );
-        }
-        const libraryId = resolveLibraryId(req);
-        const format = parseFormatQuery(new URL(req.url).searchParams.get("format"));
-        if (format === null) {
-          return Response.json({ error: "Invalid format" }, { status: 400 });
-        }
-        const progress = getProgress(user.id, libraryId, bookId, format);
+  // Per-book progress for the active reader
+  "/api/user/progress/:bookId": {
+    GET: async (req) => {
+      const bookId = parseBookId(req.params.bookId ?? "");
+      if (bookId === null) {
+        return Response.json({ error: "Invalid book id" }, { status: 400 });
+      }
+      const user = await currentUser(req);
+      if (!user) {
         return Response.json(
-          {
-            progress,
-            formats: listProgressFormats(user.id, libraryId, bookId),
-            serverSeq: progress?.serverSeq ?? null,
-          },
+          { progress: null },
           { headers: { "Cache-Control": "private, no-store" } },
         );
-      },
-      PUT: async (req) => {
-        const bookId = parseBookId(req.params.bookId ?? "");
-        if (bookId === null) {
-          return Response.json({ error: "Invalid book id" }, { status: 400 });
-        }
-        const user = await currentUser(req);
-        if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
-        // S3: catalog context captured BEFORE the body is awaited.
-        const libraryId = resolveLibraryId(req);
-        const book = getBookByIdOptimized(bookId);
-        if (!book) return Response.json({ error: "Book not found" }, { status: 404 });
-        return handleProgressWrite(req, bookId, user, libraryId, book);
-      },
-      // POST alias for PUT: navigator.sendBeacon can only POST, and the
-      // client treats beacon queueing as unacked until a PUT/POST returns ok.
-      POST: async (req) => {
-        const bookId = parseBookId(req.params.bookId ?? "");
-        if (bookId === null) {
-          return Response.json({ error: "Invalid book id" }, { status: 400 });
-        }
-        const user = await currentUser(req);
-        if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
-        // S3: catalog context captured BEFORE the body is awaited.
-        const libraryId = resolveLibraryId(req);
-        const book = getBookByIdOptimized(bookId);
-        if (!book) return Response.json({ error: "Book not found" }, { status: 404 });
-        return handleProgressWrite(req, bookId, user, libraryId, book);
-      },
-      DELETE: async (req) => {
-        const bookId = parseBookId(req.params.bookId ?? "");
-        if (bookId === null) {
-          return Response.json({ error: "Invalid book id" }, { status: 400 });
-        }
-        const user = await currentUser(req);
-        if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
-        const format = parseFormatQuery(new URL(req.url).searchParams.get("format"));
-        if (format === null) {
-          return Response.json({ error: "Invalid format" }, { status: 400 });
-        }
-        return Response.json(
-          { removed: deleteProgress(user.id, resolveLibraryId(req), bookId, format) },
-          { headers: { "Cache-Control": "private, no-store" } },
+      }
+      const libraryId = resolveLibraryId(req);
+      const format = parseFormatQuery(new URL(req.url).searchParams.get("format"));
+      if (format === null) {
+        return Response.json({ error: "Invalid format" }, { status: 400 });
+      }
+      const progress = getProgress(user.id, libraryId, bookId, format);
+      return Response.json(
+        {
+          progress,
+          formats: listProgressFormats(user.id, libraryId, bookId),
+          serverSeq: progress?.serverSeq ?? null,
+          // T5: writers acknowledge this generation via baseDeletionSeq; a
+          // fresh value resurrects, a stale/absent one is rejected on write.
+          deletionSeq: getProgressDeletion(user.id, libraryId, bookId, format).seq,
+        },
+        { headers: { "Cache-Control": "private, no-store" } },
+      );
+    },
+    PUT: async (req) => {
+      const bookId = parseBookId(req.params.bookId ?? "");
+      if (bookId === null) {
+        return Response.json({ error: "Invalid book id" }, { status: 400 });
+      }
+      const user = await currentUser(req);
+      if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
+      // S3: catalog context captured BEFORE the body is awaited.
+      const libraryId = resolveLibraryId(req);
+      const book = getBookByIdOptimized(bookId);
+      if (!book) return Response.json({ error: "Book not found" }, { status: 404 });
+      return handleProgressWrite(req, bookId, user, libraryId, book);
+    },
+    // POST alias for PUT: navigator.sendBeacon can only POST, and the
+    // client treats beacon queueing as unacked until a PUT/POST returns ok.
+    POST: async (req) => {
+      const bookId = parseBookId(req.params.bookId ?? "");
+      if (bookId === null) {
+        return Response.json({ error: "Invalid book id" }, { status: 400 });
+      }
+      const user = await currentUser(req);
+      if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
+      // S3: catalog context captured BEFORE the body is awaited.
+      const libraryId = resolveLibraryId(req);
+      const book = getBookByIdOptimized(bookId);
+      if (!book) return Response.json({ error: "Book not found" }, { status: 404 });
+      return handleProgressWrite(req, bookId, user, libraryId, book);
+    },
+    DELETE: async (req) => {
+      const bookId = parseBookId(req.params.bookId ?? "");
+      if (bookId === null) {
+        return Response.json({ error: "Invalid book id" }, { status: 400 });
+      }
+      const user = await currentUser(req);
+      if (!user) return Response.json({ error: "Not signed in" }, { status: 401 });
+      const format = parseFormatQuery(new URL(req.url).searchParams.get("format"));
+      if (format === null) {
+        return Response.json({ error: "Invalid format" }, { status: 400 });
+      }
+      const libraryId = resolveLibraryId(req);
+      const removed = deleteProgress(user.id, libraryId, bookId, format);
+      return Response.json(
+        {
+          removed,
+          deletionSeq: getProgressDeletion(user.id, libraryId, bookId, format).seq,
+        },
+        { headers: { "Cache-Control": "private, no-store" } },
+      );
+    },
+  },
+
+  // OPDS catalog root
+  "/opds": {
+    GET: (req) => {
+      try {
+        const baseUrl = getPublicBaseUrl(req);
+        const pathPrefix = opdsPathPrefix(req);
+        const updated = opdsCatalogUpdated();
+        const selfPath = getRequestPath(req);
+
+        return getCachedTextResponse(
+          `opds:root:${baseUrl}:${pathPrefix}:${selfPath}`,
+          () =>
+            renderNavigationFeed({
+              baseUrl,
+              pathPrefix,
+              updated,
+              totalBooks: getBookCount(),
+            }),
+          req,
+          `${OPDS_NAVIGATION_TYPE}; charset=utf-8`,
         );
-      },
+      } catch (error) {
+        console.error("Error rendering OPDS root:", error);
+        return Response.json({ error: "Failed to render OPDS root" }, { status: 500 });
+      }
     },
+  },
 
-    // OPDS catalog root
-    "/opds": {
-      GET: (req) => {
-        try {
-          const baseUrl = getPublicBaseUrl(req);
-          const pathPrefix = opdsPathPrefix(req);
-          const updated = opdsCatalogUpdated();
-          const selfPath = getRequestPath(req);
+  // OpenSearch descriptor used by OPDS clients
+  "/opds/search.xml": {
+    GET: (req) => {
+      try {
+        const baseUrl = getPublicBaseUrl(req);
+        const pathPrefix = opdsPathPrefix(req);
+        const selfPath = getRequestPath(req);
 
-          return getCachedTextResponse(
-            `opds:root:${baseUrl}:${pathPrefix}:${selfPath}`,
-            () =>
-              renderNavigationFeed({
-                baseUrl,
-                pathPrefix,
-                updated,
-                totalBooks: getBookCount(),
-              }),
-            req,
-            `${OPDS_NAVIGATION_TYPE}; charset=utf-8`,
-          );
-        } catch (error) {
-          console.error("Error rendering OPDS root:", error);
-          return Response.json({ error: "Failed to render OPDS root" }, { status: 500 });
-        }
-      },
+        return getCachedTextResponse(
+          `opds:search-description:${baseUrl}:${pathPrefix}:${selfPath}`,
+          () => renderOpenSearchDescription(baseUrl, pathPrefix),
+          req,
+          `${OPENSEARCH_TYPE}; charset=utf-8`,
+          "public, max-age=3600",
+        );
+      } catch (error) {
+        console.error("Error rendering OPDS search descriptor:", error);
+        return Response.json({ error: "Failed to render OPDS search descriptor" }, { status: 500 });
+      }
     },
+  },
 
-    // OpenSearch descriptor used by OPDS clients
-    "/opds/search.xml": {
-      GET: (req) => {
-        try {
-          const baseUrl = getPublicBaseUrl(req);
-          const pathPrefix = opdsPathPrefix(req);
-          const selfPath = getRequestPath(req);
-
-          return getCachedTextResponse(
-            `opds:search-description:${baseUrl}:${pathPrefix}:${selfPath}`,
-            () => renderOpenSearchDescription(baseUrl, pathPrefix),
-            req,
-            `${OPENSEARCH_TYPE}; charset=utf-8`,
-            "public, max-age=3600",
-          );
-        } catch (error) {
-          console.error("Error rendering OPDS search descriptor:", error);
-          return Response.json(
-            { error: "Failed to render OPDS search descriptor" },
-            { status: 500 },
-          );
-        }
-      },
+  // Paged OPDS acquisition feed
+  "/opds/books": {
+    GET: (req) => {
+      try {
+        const params = parseOpdsPageParams(req);
+        const title = params.sortBy === "added" ? "Recently added" : "All books";
+        return opdsAcquisitionResponse(req, title, "/opds/books", () =>
+          listBooksCursor({ ...params, requireFormats: true }),
+        );
+      } catch (error) {
+        return routeErrorResponse(
+          error,
+          "Error rendering OPDS books:",
+          "Failed to render OPDS books",
+        );
+      }
     },
+  },
 
-    // Paged OPDS acquisition feed
-    "/opds/books": {
-      GET: (req) => {
-        try {
-          const params = parseOpdsPageParams(req);
-          const title = params.sortBy === "added" ? "Recently added" : "All books";
-          return opdsAcquisitionResponse(req, title, "/opds/books", () =>
-            listBooksCursor({ ...params, requireFormats: true }),
-          );
-        } catch (error) {
-          return routeErrorResponse(error, "Error rendering OPDS books:", "Failed to render OPDS books");
-        }
-      },
-    },
-
-    // Recently-added OPDS acquisition feed
-    "/opds/recent": {
-      GET: (req) => {
-        try {
-          const params = parseOpdsPageParams(req);
-          return opdsAcquisitionResponse(req, "Recently added", "/opds/recent", () =>
+  // Recently-added OPDS acquisition feed
+  "/opds/recent": {
+    GET: (req) => {
+      try {
+        const params = parseOpdsPageParams(req);
+        return opdsAcquisitionResponse(
+          req,
+          "Recently added",
+          "/opds/recent",
+          () =>
             listBooksCursor({
               cursor: params.cursor,
               limit: params.limit,
@@ -1951,851 +2035,940 @@ const routes: RouteTable = {
           {
             sortBy: "added",
             sortOrder: "desc",
-          });
-        } catch (error) {
-          return routeErrorResponse(error, "Error rendering OPDS recent books:", "Failed to render OPDS recent books");
-        }
-      },
+          },
+        );
+      } catch (error) {
+        return routeErrorResponse(
+          error,
+          "Error rendering OPDS recent books:",
+          "Failed to render OPDS recent books",
+        );
+      }
     },
+  },
 
-    // OPDS author navigation feed
-    "/opds/authors": {
-      GET: (req) => {
-        try {
-          const params = parseOpdsCatalogParams(req);
-          return opdsCatalogResponse(req, "Authors", "/opds/authors", () => listAuthorsCursor(params), (entry) =>
-            `/opds/authors/${encodeURIComponent(String(entry.id))}/books`
-          );
-        } catch (error) {
-          return routeErrorResponse(error, "Error rendering OPDS authors:", "Failed to render OPDS authors");
-        }
-      },
+  // OPDS author navigation feed
+  "/opds/authors": {
+    GET: (req) => {
+      try {
+        const params = parseOpdsCatalogParams(req);
+        return opdsCatalogResponse(
+          req,
+          "Authors",
+          "/opds/authors",
+          () => listAuthorsCursor(params),
+          (entry) => `/opds/authors/${encodeURIComponent(String(entry.id))}/books`,
+        );
+      } catch (error) {
+        return routeErrorResponse(
+          error,
+          "Error rendering OPDS authors:",
+          "Failed to render OPDS authors",
+        );
+      }
     },
+  },
 
-    "/opds/authors/:id/books": {
-      GET: (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-          if (id === null) {
-            return Response.json({ error: "Invalid author ID" }, { status: 400 });
-          }
-
-          const entry = getCatalogEntry("authors", id);
-          if (!entry) {
-            return Response.json({ error: "Author not found" }, { status: 404 });
-          }
-
-          const params = parseOpdsPageParams(req);
-          return opdsAcquisitionResponse(req, `Author: ${entry.title}`, `/opds/authors/${id}/books`, () =>
-            listBooksByAuthorCursor(id, { ...params, requireFormats: true }),
-          );
-        } catch (error) {
-          return routeErrorResponse(error, "Error rendering OPDS author books:", "Failed to render OPDS author books");
+  "/opds/authors/:id/books": {
+    GET: (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+        if (id === null) {
+          return Response.json({ error: "Invalid author ID" }, { status: 400 });
         }
-      },
+
+        const entry = getCatalogEntry("authors", id);
+        if (!entry) {
+          return Response.json({ error: "Author not found" }, { status: 404 });
+        }
+
+        const params = parseOpdsPageParams(req);
+        return opdsAcquisitionResponse(
+          req,
+          `Author: ${entry.title}`,
+          `/opds/authors/${id}/books`,
+          () => listBooksByAuthorCursor(id, { ...params, requireFormats: true }),
+        );
+      } catch (error) {
+        return routeErrorResponse(
+          error,
+          "Error rendering OPDS author books:",
+          "Failed to render OPDS author books",
+        );
+      }
     },
+  },
 
-    // OPDS series navigation feed
-    "/opds/series": {
-      GET: (req) => {
-        try {
-          const params = parseOpdsCatalogParams(req);
-          return opdsCatalogResponse(req, "Series", "/opds/series", () => listSeriesCursor(params), (entry) =>
-            `/opds/series/${encodeURIComponent(String(entry.id))}/books`
-          );
-        } catch (error) {
-          return routeErrorResponse(error, "Error rendering OPDS series:", "Failed to render OPDS series");
-        }
-      },
+  // OPDS series navigation feed
+  "/opds/series": {
+    GET: (req) => {
+      try {
+        const params = parseOpdsCatalogParams(req);
+        return opdsCatalogResponse(
+          req,
+          "Series",
+          "/opds/series",
+          () => listSeriesCursor(params),
+          (entry) => `/opds/series/${encodeURIComponent(String(entry.id))}/books`,
+        );
+      } catch (error) {
+        return routeErrorResponse(
+          error,
+          "Error rendering OPDS series:",
+          "Failed to render OPDS series",
+        );
+      }
     },
+  },
 
-    "/opds/series/:id/books": {
-      GET: (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-          if (id === null) {
-            return Response.json({ error: "Invalid series ID" }, { status: 400 });
-          }
-
-          const entry = getCatalogEntry("series", id);
-          if (!entry) {
-            return Response.json({ error: "Series not found" }, { status: 404 });
-          }
-
-          const params = parseOpdsPageParams(req);
-          // F25: series books default to series_index order unless the caller
-          // passes an explicit sortBy.
-          const explicitSortBy = new URL(req.url).searchParams.get("sortBy");
-          const seriesSortBy = explicitSortBy ? params.sortBy : "series_index";
-          return opdsAcquisitionResponse(
-            req,
-            `Series: ${entry.title}`,
-            `/opds/series/${id}/books`,
-            () => listBooksBySeriesCursor(id, { ...params, sortBy: seriesSortBy, requireFormats: true }),
-            { sortBy: seriesSortBy, sortOrder: params.sortOrder },
-          );
-        } catch (error) {
-          return routeErrorResponse(error, "Error rendering OPDS series books:", "Failed to render OPDS series books");
+  "/opds/series/:id/books": {
+    GET: (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+        if (id === null) {
+          return Response.json({ error: "Invalid series ID" }, { status: 400 });
         }
-      },
+
+        const entry = getCatalogEntry("series", id);
+        if (!entry) {
+          return Response.json({ error: "Series not found" }, { status: 404 });
+        }
+
+        const params = parseOpdsPageParams(req);
+        // F25: series books default to series_index order unless the caller
+        // passes an explicit sortBy.
+        const explicitSortBy = new URL(req.url).searchParams.get("sortBy");
+        const seriesSortBy = explicitSortBy ? params.sortBy : "series_index";
+        return opdsAcquisitionResponse(
+          req,
+          `Series: ${entry.title}`,
+          `/opds/series/${id}/books`,
+          () =>
+            listBooksBySeriesCursor(id, { ...params, sortBy: seriesSortBy, requireFormats: true }),
+          { sortBy: seriesSortBy, sortOrder: params.sortOrder },
+        );
+      } catch (error) {
+        return routeErrorResponse(
+          error,
+          "Error rendering OPDS series books:",
+          "Failed to render OPDS series books",
+        );
+      }
     },
+  },
 
-    // OPDS tag navigation feed
-    "/opds/tags": {
-      GET: (req) => {
-        try {
-          const params = parseOpdsCatalogParams(req);
-          return opdsCatalogResponse(req, "Tags", "/opds/tags", () => listTagsCursor(params), (entry) =>
-            `/opds/tags/${encodeURIComponent(String(entry.id))}/books`
-          );
-        } catch (error) {
-          return routeErrorResponse(error, "Error rendering OPDS tags:", "Failed to render OPDS tags");
-        }
-      },
+  // OPDS tag navigation feed
+  "/opds/tags": {
+    GET: (req) => {
+      try {
+        const params = parseOpdsCatalogParams(req);
+        return opdsCatalogResponse(
+          req,
+          "Tags",
+          "/opds/tags",
+          () => listTagsCursor(params),
+          (entry) => `/opds/tags/${encodeURIComponent(String(entry.id))}/books`,
+        );
+      } catch (error) {
+        return routeErrorResponse(
+          error,
+          "Error rendering OPDS tags:",
+          "Failed to render OPDS tags",
+        );
+      }
     },
+  },
 
-    "/opds/tags/:id/books": {
-      GET: (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-          if (id === null) {
-            return Response.json({ error: "Invalid tag ID" }, { status: 400 });
-          }
-
-          const entry = getCatalogEntry("tags", id);
-          if (!entry) {
-            return Response.json({ error: "Tag not found" }, { status: 404 });
-          }
-
-          const params = parseOpdsPageParams(req);
-          return opdsAcquisitionResponse(req, `Tag: ${entry.title}`, `/opds/tags/${id}/books`, () =>
-            listBooksByTagCursor(id, { ...params, requireFormats: true }),
-          );
-        } catch (error) {
-          return routeErrorResponse(error, "Error rendering OPDS tag books:", "Failed to render OPDS tag books");
+  "/opds/tags/:id/books": {
+    GET: (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+        if (id === null) {
+          return Response.json({ error: "Invalid tag ID" }, { status: 400 });
         }
-      },
+
+        const entry = getCatalogEntry("tags", id);
+        if (!entry) {
+          return Response.json({ error: "Tag not found" }, { status: 404 });
+        }
+
+        const params = parseOpdsPageParams(req);
+        return opdsAcquisitionResponse(req, `Tag: ${entry.title}`, `/opds/tags/${id}/books`, () =>
+          listBooksByTagCursor(id, { ...params, requireFormats: true }),
+        );
+      } catch (error) {
+        return routeErrorResponse(
+          error,
+          "Error rendering OPDS tag books:",
+          "Failed to render OPDS tag books",
+        );
+      }
     },
+  },
 
-    // OPDS format navigation feed
-    "/opds/formats": {
-      GET: (req) => {
-        try {
-          const params = parseOpdsCatalogParams(req);
-          return opdsCatalogResponse(req, "Formats", "/opds/formats", () => listFormatsCursor(params), (entry) =>
-            `/opds/formats/${encodeURIComponent(String(entry.id))}/books`
-          );
-        } catch (error) {
-          return routeErrorResponse(error, "Error rendering OPDS formats:", "Failed to render OPDS formats");
-        }
-      },
+  // OPDS format navigation feed
+  "/opds/formats": {
+    GET: (req) => {
+      try {
+        const params = parseOpdsCatalogParams(req);
+        return opdsCatalogResponse(
+          req,
+          "Formats",
+          "/opds/formats",
+          () => listFormatsCursor(params),
+          (entry) => `/opds/formats/${encodeURIComponent(String(entry.id))}/books`,
+        );
+      } catch (error) {
+        return routeErrorResponse(
+          error,
+          "Error rendering OPDS formats:",
+          "Failed to render OPDS formats",
+        );
+      }
     },
+  },
 
-    "/opds/formats/:format/books": {
-      GET: (req) => {
-        try {
-          const format = decodeURIComponent(req.params.format ?? "").toUpperCase();
-          const entry = getCatalogEntry("formats", format);
-          if (!entry) {
-            return Response.json({ error: "Format not found" }, { status: 404 });
-          }
-
-          const params = parseOpdsPageParams(req);
-          return opdsAcquisitionResponse(
-            req,
-            `Format: ${entry.title}`,
-            `/opds/formats/${encodeURIComponent(format)}/books`,
-            () => listBooksByFormatCursor(format, { ...params, requireFormats: true }),
-          );
-        } catch (error) {
-          return routeErrorResponse(error, "Error rendering OPDS format books:", "Failed to render OPDS format books");
+  "/opds/formats/:format/books": {
+    GET: (req) => {
+      try {
+        const format = decodeURIComponent(req.params.format ?? "").toUpperCase();
+        const entry = getCatalogEntry("formats", format);
+        if (!entry) {
+          return Response.json({ error: "Format not found" }, { status: 404 });
         }
-      },
+
+        const params = parseOpdsPageParams(req);
+        return opdsAcquisitionResponse(
+          req,
+          `Format: ${entry.title}`,
+          `/opds/formats/${encodeURIComponent(format)}/books`,
+          () => listBooksByFormatCursor(format, { ...params, requireFormats: true }),
+        );
+      } catch (error) {
+        return routeErrorResponse(
+          error,
+          "Error rendering OPDS format books:",
+          "Failed to render OPDS format books",
+        );
+      }
     },
+  },
 
-    // Paged OPDS search feed
-    "/opds/search": {
-      GET: (req) => {
-        try {
-          const url = new URL(req.url);
-          const baseUrl = getPublicBaseUrl(req);
-          const pathPrefix = opdsPathPrefix(req);
-          const query = url.searchParams.get("q") || "";
-          const cursor = url.searchParams.get("cursor") || undefined;
-          const limit = parseBoundedInt(url.searchParams.get("limit"), 50, {
-            min: 1,
-            max: MAX_QUERY_LIMIT,
-          });
-          const sortBy = parseSortField(url.searchParams.get("sortBy"));
-          const sortOrder = parseSortOrder(url.searchParams.get("sortOrder"));
-          const result = searchBooksCursor({ query, cursor, limit, sortBy, sortOrder, requireFormats: true });
-          const nextPath = result.nextCursor
-            ? buildPath("/opds/search", {
-                q: query,
-                cursor: result.nextCursor,
-                limit,
-                sortBy,
-                sortOrder,
-              })
-            : undefined;
-          const selfPath = getRequestPath(req);
-          const title = query.trim() ? `Search: ${query.trim()}` : "Search";
-          const feed = renderAcquisitionFeed({
-            baseUrl,
-            pathPrefix,
-            selfPath,
-            title,
-            id: new URL(selfPath, baseUrl).toString(),
-            updated: opdsCatalogUpdated(),
-            result,
-            nextPath,
-          });
-
-          return new Response(feed, {
-            headers: {
-              "Content-Type": `${OPDS_ACQUISITION_TYPE}; charset=utf-8`,
-              "Cache-Control": "no-store",
-            },
-          });
-        } catch (error) {
-          return routeErrorResponse(error, "Error rendering OPDS search:", "Failed to render OPDS search");
-        }
-      },
-    },
-
-    // OPDS single-book acquisition feed
-    "/opds/book/:id": {
-      GET: (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-
-          const baseUrl = getPublicBaseUrl(req);
-          const pathPrefix = opdsPathPrefix(req);
-          const selfPath = getRequestPath(req);
-
-          return getCachedTextResponse(
-            `opds:book:${baseUrl}:${pathPrefix}:${selfPath}`,
-            () => {
-              const book = getBookByIdOptimized(id);
-              if (!book) {
-                return Response.json({ error: "Book not found" }, { status: 404 });
-              }
-              return renderSingleBookFeed({
-                baseUrl,
-                pathPrefix,
-                selfPath,
-                updated: opdsCatalogUpdated(),
-                book,
-              });
-            },
-            req,
-            `${OPDS_ACQUISITION_TYPE}; charset=utf-8`,
-          );
-        } catch (error) {
-          console.error("Error rendering OPDS book:", error);
-          return Response.json({ error: "Failed to render OPDS book" }, { status: 500 });
-        }
-      },
-    },
-
-    // F23: compat alias for the single-book acquisition feed (see
-    // /opds/book/:id/complete for the bare entry document).
-    "/opds/book/:id/feed": {
-      GET: (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-
-          const baseUrl = getPublicBaseUrl(req);
-          const pathPrefix = opdsPathPrefix(req);
-          const selfPath = getRequestPath(req);
-
-          return getCachedTextResponse(
-            `opds:book-feed:${baseUrl}:${pathPrefix}:${selfPath}`,
-            () => {
-              const book = getBookByIdOptimized(id);
-              if (!book) {
-                return Response.json({ error: "Book not found" }, { status: 404 });
-              }
-              return renderSingleBookFeed({
-                baseUrl,
-                pathPrefix,
-                selfPath,
-                updated: opdsCatalogUpdated(),
-                book,
-              });
-            },
-            req,
-            `${OPDS_ACQUISITION_TYPE}; charset=utf-8`,
-          );
-        } catch (error) {
-          console.error("Error rendering OPDS book feed:", error);
-          return Response.json({ error: "Failed to render OPDS book" }, { status: 500 });
-        }
-      },
-    },
-
-    // F23: complete-entry document for a single book: a bare <entry> served
-    // with `application/atom+xml;type=entry;profile=opds-catalog`.
-    "/opds/book/:id/complete": {
-      GET: (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-
-          const baseUrl = getPublicBaseUrl(req);
-          const pathPrefix = opdsPathPrefix(req);
-          const selfPath = getRequestPath(req);
-
-          return getCachedTextResponse(
-            `opds:book-complete:${baseUrl}:${pathPrefix}:${selfPath}`,
-            () => {
-              const book = getBookByIdOptimized(id);
-              if (!book) {
-                return Response.json({ error: "Book not found" }, { status: 404 });
-              }
-              return renderBookCompleteEntry({ baseUrl, pathPrefix, book });
-            },
-            req,
-            `${OPDS_ENTRY_TYPE}; charset=utf-8`,
-          );
-        } catch (error) {
-          console.error("Error rendering OPDS complete book:", error);
-          return Response.json({ error: "Failed to render OPDS book" }, { status: 500 });
-        }
-      },
-    },
-
-    // F24: OPDS acquisition/artwork routes. Challenge-capable (matched by the
-    // /opds auth guard) proxies to the same file handlers as /api.
-    "/opds/book/:id/download/:format": {
-      GET: async (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-          return await serveBookFile(req, id, req.params.format ?? "", "attachment");
-        } catch (error) {
-          console.error("Error downloading OPDS book:", error);
-          return Response.json({ error: "Failed to download book" }, { status: 500 });
-        }
-      },
-      HEAD: async (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-          return await serveBookFile(req, id, req.params.format ?? "", "attachment");
-        } catch (error) {
-          console.error("Error downloading OPDS book:", error);
-          return Response.json({ error: "Failed to download book" }, { status: 500 });
-        }
-      },
-    },
-
-    "/opds/book/:id/file/:format": {
-      GET: async (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-          return await serveBookFile(req, id, req.params.format ?? "", "inline");
-        } catch (error) {
-          console.error("Error streaming OPDS book:", error);
-          return Response.json({ error: "Failed to stream book" }, { status: 500 });
-        }
-      },
-      HEAD: async (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-          return await serveBookFile(req, id, req.params.format ?? "", "inline");
-        } catch (error) {
-          console.error("Error streaming OPDS book:", error);
-          return Response.json({ error: "Failed to stream book" }, { status: 500 });
-        }
-      },
-    },
-
-    "/opds/book/:id/cover": {
-      GET: async (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-          return await serveCoverById(req, id);
-        } catch (error) {
-          console.error("Error getting OPDS cover:", error);
-          return Response.json({ error: "Failed to get cover" }, { status: 500 });
-        }
-      },
-    },
-
-    "/opds/book/:id/thumb": {
-      GET: async (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-          return await serveThumbById(req, id);
-        } catch (error) {
-          console.error("Error getting OPDS thumb:", error);
-          return Response.json({ error: "Failed to get thumbnail" }, { status: 500 });
-        }
-      },
-    },
-
-    // Stream all books (for massive datasets). Pull-driven: each pull()
-    // awaits the next DB batch (streamBooks checks out and releases a pool
-    // connection per batch), backpressure propagates to the database cursor,
-    // a generation lease pins the snapshot for the export duration, and a
-    // client abort stops iteration immediately.
-    "/api/books/stream": {
-      GET: async (req) => {
+  // Paged OPDS search feed
+  "/opds/search": {
+    GET: (req) => {
+      try {
         const url = new URL(req.url);
-        const batchSize = parseBoundedInt(url.searchParams.get("batchSize"), 1000, {
+        const baseUrl = getPublicBaseUrl(req);
+        const pathPrefix = opdsPathPrefix(req);
+        const query = url.searchParams.get("q") || "";
+        const cursor = url.searchParams.get("cursor") || undefined;
+        const limit = parseBoundedInt(url.searchParams.get("limit"), 50, {
           min: 1,
-          max: MAX_STREAM_BATCH_SIZE,
+          max: MAX_QUERY_LIMIT,
+        });
+        const sortBy = parseSortField(url.searchParams.get("sortBy"));
+        const sortOrder = parseSortOrder(url.searchParams.get("sortOrder"));
+        const result = searchBooksCursor({
+          query,
+          cursor,
+          limit,
+          sortBy,
+          sortOrder,
+          requireFormats: true,
+        });
+        const nextPath = result.nextCursor
+          ? buildPath("/opds/search", {
+              q: query,
+              cursor: result.nextCursor,
+              limit,
+              sortBy,
+              sortOrder,
+            })
+          : undefined;
+        const selfPath = getRequestPath(req);
+        const title = query.trim() ? `Search: ${query.trim()}` : "Search";
+        const feed = renderAcquisitionFeed({
+          baseUrl,
+          pathPrefix,
+          selfPath,
+          title,
+          id: new URL(selfPath, baseUrl).toString(),
+          updated: opdsCatalogUpdated(),
+          result,
+          nextPath,
         });
 
-        const releaseLease = acquireSnapshotLease();
-        let leaseReleased = false;
-        const finishLease = () => {
-          if (!leaseReleased) {
-            leaseReleased = true;
-            releaseLease();
-          }
-        };
-        const jsonGen = streamBooksJSON(streamBooks(batchSize));
+        return new Response(feed, {
+          headers: {
+            "Content-Type": `${OPDS_ACQUISITION_TYPE}; charset=utf-8`,
+            "Cache-Control": "no-store",
+          },
+        });
+      } catch (error) {
+        return routeErrorResponse(
+          error,
+          "Error rendering OPDS search:",
+          "Failed to render OPDS search",
+        );
+      }
+    },
+  },
 
-        const stream = new ReadableStream({
-          async pull(controller) {
-            if (req.signal.aborted) {
+  // OPDS single-book acquisition feed
+  "/opds/book/:id": {
+    GET: (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+
+        const baseUrl = getPublicBaseUrl(req);
+        const pathPrefix = opdsPathPrefix(req);
+        const selfPath = getRequestPath(req);
+
+        return getCachedTextResponse(
+          `opds:book:${baseUrl}:${pathPrefix}:${selfPath}`,
+          () => {
+            const book = getBookByIdOptimized(id);
+            if (!book) {
+              return Response.json({ error: "Book not found" }, { status: 404 });
+            }
+            return renderSingleBookFeed({
+              baseUrl,
+              pathPrefix,
+              selfPath,
+              updated: opdsCatalogUpdated(),
+              book,
+            });
+          },
+          req,
+          `${OPDS_ACQUISITION_TYPE}; charset=utf-8`,
+        );
+      } catch (error) {
+        console.error("Error rendering OPDS book:", error);
+        return Response.json({ error: "Failed to render OPDS book" }, { status: 500 });
+      }
+    },
+  },
+
+  // F23: compat alias for the single-book acquisition feed (see
+  // /opds/book/:id/complete for the bare entry document).
+  "/opds/book/:id/feed": {
+    GET: (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+
+        const baseUrl = getPublicBaseUrl(req);
+        const pathPrefix = opdsPathPrefix(req);
+        const selfPath = getRequestPath(req);
+
+        return getCachedTextResponse(
+          `opds:book-feed:${baseUrl}:${pathPrefix}:${selfPath}`,
+          () => {
+            const book = getBookByIdOptimized(id);
+            if (!book) {
+              return Response.json({ error: "Book not found" }, { status: 404 });
+            }
+            return renderSingleBookFeed({
+              baseUrl,
+              pathPrefix,
+              selfPath,
+              updated: opdsCatalogUpdated(),
+              book,
+            });
+          },
+          req,
+          `${OPDS_ACQUISITION_TYPE}; charset=utf-8`,
+        );
+      } catch (error) {
+        console.error("Error rendering OPDS book feed:", error);
+        return Response.json({ error: "Failed to render OPDS book" }, { status: 500 });
+      }
+    },
+  },
+
+  // F23: complete-entry document for a single book: a bare <entry> served
+  // with `application/atom+xml;type=entry;profile=opds-catalog`.
+  "/opds/book/:id/complete": {
+    GET: (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+
+        const baseUrl = getPublicBaseUrl(req);
+        const pathPrefix = opdsPathPrefix(req);
+        const selfPath = getRequestPath(req);
+
+        return getCachedTextResponse(
+          `opds:book-complete:${baseUrl}:${pathPrefix}:${selfPath}`,
+          () => {
+            const book = getBookByIdOptimized(id);
+            if (!book) {
+              return Response.json({ error: "Book not found" }, { status: 404 });
+            }
+            return renderBookCompleteEntry({ baseUrl, pathPrefix, book });
+          },
+          req,
+          `${OPDS_ENTRY_TYPE}; charset=utf-8`,
+        );
+      } catch (error) {
+        console.error("Error rendering OPDS complete book:", error);
+        return Response.json({ error: "Failed to render OPDS book" }, { status: 500 });
+      }
+    },
+  },
+
+  // F24: OPDS acquisition/artwork routes. Challenge-capable (matched by the
+  // /opds auth guard) proxies to the same file handlers as /api.
+  "/opds/book/:id/download/:format": {
+    GET: async (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+        return await serveBookFile(req, id, req.params.format ?? "", "attachment");
+      } catch (error) {
+        console.error("Error downloading OPDS book:", error);
+        return Response.json({ error: "Failed to download book" }, { status: 500 });
+      }
+    },
+    HEAD: async (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+        return await serveBookFile(req, id, req.params.format ?? "", "attachment");
+      } catch (error) {
+        console.error("Error downloading OPDS book:", error);
+        return Response.json({ error: "Failed to download book" }, { status: 500 });
+      }
+    },
+  },
+
+  "/opds/book/:id/file/:format": {
+    GET: async (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+        return await serveBookFile(req, id, req.params.format ?? "", "inline");
+      } catch (error) {
+        console.error("Error streaming OPDS book:", error);
+        return Response.json({ error: "Failed to stream book" }, { status: 500 });
+      }
+    },
+    HEAD: async (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+        return await serveBookFile(req, id, req.params.format ?? "", "inline");
+      } catch (error) {
+        console.error("Error streaming OPDS book:", error);
+        return Response.json({ error: "Failed to stream book" }, { status: 500 });
+      }
+    },
+  },
+
+  "/opds/book/:id/cover": {
+    GET: async (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+        return await serveCoverById(req, id);
+      } catch (error) {
+        console.error("Error getting OPDS cover:", error);
+        return Response.json({ error: "Failed to get cover" }, { status: 500 });
+      }
+    },
+  },
+
+  "/opds/book/:id/thumb": {
+    GET: async (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+        return await serveThumbById(req, id);
+      } catch (error) {
+        console.error("Error getting OPDS thumb:", error);
+        return Response.json({ error: "Failed to get thumbnail" }, { status: 500 });
+      }
+    },
+  },
+
+  // Stream all books (for massive datasets). Pull-driven: each pull()
+  // awaits the next DB batch (streamBooks checks out and releases a pool
+  // connection per batch), backpressure propagates to the database cursor,
+  // a generation lease pins the snapshot for the export duration, and a
+  // client abort stops iteration immediately.
+  "/api/books/stream": {
+    GET: async (req) => {
+      const url = new URL(req.url);
+      const batchSize = parseBoundedInt(url.searchParams.get("batchSize"), 1000, {
+        min: 1,
+        max: MAX_STREAM_BATCH_SIZE,
+      });
+
+      const releaseLease = acquireSnapshotLease();
+      let leaseReleased = false;
+      const finishLease = () => {
+        if (!leaseReleased) {
+          leaseReleased = true;
+          releaseLease();
+        }
+      };
+      const jsonGen = streamBooksJSON(streamBooks(batchSize));
+
+      const stream = new ReadableStream({
+        async pull(controller) {
+          if (req.signal.aborted) {
+            finishLease();
+            controller.close();
+            return;
+          }
+          try {
+            const next = await jsonGen.next();
+            if (req.signal.aborted || next.done) {
               finishLease();
               controller.close();
               return;
             }
-            try {
-              const next = await jsonGen.next();
-              if (req.signal.aborted || next.done) {
-                finishLease();
-                controller.close();
-                return;
-              }
-              controller.enqueue(streamEncoder.encode(next.value));
-            } catch (error) {
-              finishLease();
-              controller.error(error);
-            }
-          },
-          async cancel() {
+            controller.enqueue(streamEncoder.encode(next.value));
+          } catch (error) {
             finishLease();
-            try {
-              await jsonGen.return(undefined);
-            } catch {
-              // ignore teardown errors
-            }
-          },
-        });
-        req.signal.addEventListener("abort", finishLease, { once: true });
+            controller.error(error);
+          }
+        },
+        async cancel() {
+          finishLease();
+          try {
+            await jsonGen.return(undefined);
+          } catch {
+            // ignore teardown errors
+          }
+        },
+      });
+      req.signal.addEventListener("abort", finishLease, { once: true });
 
-        return new Response(stream, {
-          headers: {
-            "Content-Type": "application/json",
-            "Cache-Control": "no-cache",
-          },
-        });
-      },
+      return new Response(stream, {
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-cache",
+        },
+      });
     },
+  },
 
-    // Cursor-based paginated list
-    "/api/books": {
-      GET: (req) => {
-        try {
-          const url = new URL(req.url);
-          const cursor = url.searchParams.get("cursor") || undefined;
-          const limit = parseBoundedInt(url.searchParams.get("limit"), 50, {
-            min: 1,
-            max: MAX_QUERY_LIMIT,
-          });
-          const sortBy = parseSortField(url.searchParams.get("sortBy"));
-          const sortOrder = parseSortOrder(url.searchParams.get("sortOrder"));
-          const tagIds = parseTagIds(url);
-          // S7: cheap first-page total. Explicit ?includeTotal=0/false opts
-          // out; otherwise the first page (cursor == null) includes total via
-          // COUNT(*) with the same filters and later pages omit it.
-          const includeParam = url.searchParams.get("includeTotal");
-          const wantTotal =
-            includeParam === null
-              ? !cursor
-              : includeParam === "1" || includeParam.toLowerCase() === "true";
+  // Cursor-based paginated list
+  "/api/books": {
+    GET: (req) => {
+      try {
+        const url = new URL(req.url);
+        const cursor = url.searchParams.get("cursor") || undefined;
+        const limit = parseBoundedInt(url.searchParams.get("limit"), 50, {
+          min: 1,
+          max: MAX_QUERY_LIMIT,
+        });
+        const sortBy = parseSortField(url.searchParams.get("sortBy"));
+        const sortOrder = parseSortOrder(url.searchParams.get("sortOrder"));
+        const tagIds = parseTagIds(url);
+        // S7: cheap first-page total. Explicit ?includeTotal=0/false opts
+        // out; otherwise the first page (cursor == null) includes total via
+        // COUNT(*) with the same filters and later pages omit it.
+        const includeParam = url.searchParams.get("includeTotal");
+        const wantTotal =
+          includeParam === null
+            ? !cursor
+            : includeParam === "1" || includeParam.toLowerCase() === "true";
 
-          const cacheKey = `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}:tags:${tagIds.join(",")}:total:${wantTotal ? 1 : 0}`;
+        const cacheKey = `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}:tags:${tagIds.join(",")}:total:${wantTotal ? 1 : 0}`;
+        return getCachedResponse(
+          cacheKey,
+          () =>
+            listBooksCursor({ cursor, limit, sortBy, sortOrder, tagIds, includeTotal: wantTotal }),
+          req,
+        );
+      } catch (error) {
+        return routeErrorResponse(error, "Error listing books:", "Failed to list books");
+      }
+    },
+  },
+
+  // Search with cursor pagination
+  "/api/books/search": {
+    GET: (req) => {
+      try {
+        const url = new URL(req.url);
+        const query = url.searchParams.get("q") || "";
+        const cursor = url.searchParams.get("cursor") || undefined;
+        const limit = parseBoundedInt(url.searchParams.get("limit"), 50, {
+          min: 1,
+          max: MAX_QUERY_LIMIT,
+        });
+        const sortBy = parseSortField(url.searchParams.get("sortBy"));
+        const sortOrder = parseSortOrder(url.searchParams.get("sortOrder"));
+        const tagIds = parseTagIds(url);
+        // S7: same first-page-total contract as /api/books (see above).
+        const includeParam = url.searchParams.get("includeTotal");
+        const wantTotal =
+          includeParam === null
+            ? !cursor
+            : includeParam === "1" || includeParam.toLowerCase() === "true";
+
+        if (!query.trim()) {
           return getCachedResponse(
-            cacheKey,
-            () => listBooksCursor({ cursor, limit, sortBy, sortOrder, tagIds, includeTotal: wantTotal }),
+            `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}:tags:${tagIds.join(",")}:total:${wantTotal ? 1 : 0}`,
+            () =>
+              listBooksCursor({
+                cursor,
+                limit,
+                sortBy,
+                sortOrder,
+                tagIds,
+                includeTotal: wantTotal,
+              }),
             req,
           );
-        } catch (error) {
-          return routeErrorResponse(error, "Error listing books:", "Failed to list books");
         }
-      },
+
+        const result = searchBooksCursor({
+          query,
+          cursor,
+          limit,
+          sortBy,
+          sortOrder,
+          tagIds,
+          includeTotal: wantTotal,
+        });
+
+        // Don't cache search results
+        return Response.json(result, {
+          headers: {
+            "Cache-Control": "no-store",
+          },
+        });
+      } catch (error) {
+        return routeErrorResponse(error, "Error searching books:", "Failed to search books");
+      }
     },
+  },
 
-    // Search with cursor pagination
-    "/api/books/search": {
-      GET: (req) => {
-        try {
-          const url = new URL(req.url);
-          const query = url.searchParams.get("q") || "";
-          const cursor = url.searchParams.get("cursor") || undefined;
-          const limit = parseBoundedInt(url.searchParams.get("limit"), 50, {
-            min: 1,
-            max: MAX_QUERY_LIMIT,
-          });
-          const sortBy = parseSortField(url.searchParams.get("sortBy"));
-          const sortOrder = parseSortOrder(url.searchParams.get("sortOrder"));
-          const tagIds = parseTagIds(url);
-          // S7: same first-page-total contract as /api/books (see above).
-          const includeParam = url.searchParams.get("includeTotal");
-          const wantTotal =
-            includeParam === null
-              ? !cursor
-              : includeParam === "1" || includeParam.toLowerCase() === "true";
+  // Get single book
+  "/api/books/:id": {
+    GET: (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
 
-          if (!query.trim()) {
-            return getCachedResponse(
-              `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}:tags:${tagIds.join(",")}:total:${wantTotal ? 1 : 0}`,
-              () => listBooksCursor({ cursor, limit, sortBy, sortOrder, tagIds, includeTotal: wantTotal }),
-              req,
-            );
-          }
-
-          const result = searchBooksCursor({ query, cursor, limit, sortBy, sortOrder, tagIds, includeTotal: wantTotal });
-
-          // Don't cache search results
-          return Response.json(result, {
-            headers: {
-              "Cache-Control": "no-store",
-            },
-          });
-        } catch (error) {
-          return routeErrorResponse(error, "Error searching books:", "Failed to search books");
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
         }
-      },
-    },
 
-    // Get single book
-    "/api/books/:id": {
-      GET: (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-
-          return getCachedResponse(`book:${id}`, () => {
+        return getCachedResponse(
+          `book:${id}`,
+          () => {
             const book = getBookByIdOptimized(id);
             if (!book) {
               return Response.json({ error: "Book not found" }, { status: 404 });
             }
             return book;
-          }, req);
-        } catch (error) {
-          console.error("Error getting book:", error);
-          return Response.json({ error: "Failed to get book" }, { status: 500 });
-        }
-      },
-    },
-
-    // Download book
-    "/api/books/:id/download/:format": {
-      GET: async (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-
-          return await serveBookFile(req, id, req.params.format ?? "", "attachment");
-        } catch (error) {
-          console.error("Error downloading book:", error);
-          return Response.json({ error: "Failed to download book" }, { status: 500 });
-        }
-      },
-      HEAD: async (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-
-          return await serveBookFile(req, id, req.params.format ?? "", "attachment");
-        } catch (error) {
-          console.error("Error downloading book:", error);
-          return Response.json({ error: "Failed to download book" }, { status: 500 });
-        }
-      },
-    },
-
-    // Stream/open a book file inline with byte-range support
-    "/api/books/:id/file/:format": {
-      GET: async (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-
-          return await serveBookFile(req, id, req.params.format ?? "", "inline");
-        } catch (error) {
-          console.error("Error streaming book:", error);
-          return Response.json({ error: "Failed to stream book" }, { status: 500 });
-        }
-      },
-      HEAD: async (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-
-          return await serveBookFile(req, id, req.params.format ?? "", "inline");
-        } catch (error) {
-          console.error("Error streaming book:", error);
-          return Response.json({ error: "Failed to stream book" }, { status: 500 });
-        }
-      },
-    },
-
-    // Serve unpacked EPUB entries for true page/resource streaming in epub.js
-    "/api/books/:id/epub": {
-      GET: (req) => {
-        const url = new URL(req.url);
-        url.pathname = `/api/books/${req.params.id ?? ""}/epub/`;
-        return Response.redirect(url, 308);
-      },
-      HEAD: (req) => {
-        const url = new URL(req.url);
-        url.pathname = `/api/books/${req.params.id ?? ""}/epub/`;
-        return Response.redirect(url, 308);
-      },
-    },
-
-    "/api/books/:id/epub/**": {
-      GET: async (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-
-          return await serveEpubEntry(req, id);
-        } catch (error) {
-          return epubEntryErrorResponse(error);
-        }
-      },
-      HEAD: async (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-
-          return await serveEpubEntry(req, id);
-        } catch (error) {
-          return epubEntryErrorResponse(error);
-        }
-      },
-    },
-
-    // Page manifests and rendered/extracted page images for comics and PDFs
-    "/api/books/:id/pages/:format/manifest": {
-      GET: async (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-          if (!FORMAT_PATTERN.test(req.params.format ?? "")) {
-            return Response.json({ error: "Invalid format" }, { status: 400 });
-          }
-
-          const manifest = await getPageManifest(id, req.params.format ?? "");
-          return Response.json(manifest, {
-            headers: {
-              "Cache-Control": "no-cache",
-            },
-          });
-        } catch (error) {
-          return pageStreamingErrorResponse(error);
-        }
-      },
-      HEAD: async (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-          if (!FORMAT_PATTERN.test(req.params.format ?? "")) {
-            return Response.json({ error: "Invalid format" }, { status: 400 });
-          }
-
-          await getPageManifest(id, req.params.format ?? "");
-          return new Response(null, {
-            headers: {
-              "Content-Type": "application/json",
-              "Cache-Control": "no-cache",
-            },
-          });
-        } catch (error) {
-          return pageStreamingErrorResponse(error);
-        }
-      },
-    },
-
-    "/api/books/:id/pages/:format/:page": {
-      GET: async (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-          const page = parseBookId(req.params.page ?? "");
-          if (id === null || page === null) {
-            return Response.json({ error: "Invalid page request" }, { status: 400 });
-          }
-          if (!FORMAT_PATTERN.test(req.params.format ?? "")) {
-            return Response.json({ error: "Invalid format" }, { status: 400 });
-          }
-
-          const pageFile = await getPageFile(id, req.params.format ?? "", page);
-          return serveLocalFile(req, pageFile.path, {
-            contentType: pageFile.contentType,
-            cacheControl: "no-cache",
-            // Defense in depth now that SVG pages are filtered upstream: pages
-            // render in <img>, never as documents. Sandbox + nosniff (set by
-            // serveLocalFile) limits damage if a hostile image is mislabeled.
-            contentSecurityPolicy: "sandbox; default-src 'none'; style-src 'unsafe-inline'",
-          });
-        } catch (error) {
-          return pageStreamingErrorResponse(error);
-        }
-      },
-      HEAD: async (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-          const page = parseBookId(req.params.page ?? "");
-          if (id === null || page === null) {
-            return Response.json({ error: "Invalid page request" }, { status: 400 });
-          }
-          if (!FORMAT_PATTERN.test(req.params.format ?? "")) {
-            return Response.json({ error: "Invalid format" }, { status: 400 });
-          }
-
-          const pageFile = await getPageFile(id, req.params.format ?? "", page);
-          return serveLocalFile(req, pageFile.path, {
-            contentType: pageFile.contentType,
-            cacheControl: "no-cache",
-            contentSecurityPolicy: "sandbox; default-src 'none'; style-src 'unsafe-inline'",
-          });
-        } catch (error) {
-          return pageStreamingErrorResponse(error);
-        }
-      },
-    },
-
-    // Get cover (full size)
-    "/api/books/:id/cover": {
-      GET: async (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-
-          return await serveCoverById(req, id);
-        } catch (error) {
-          console.error("Error getting cover:", error);
-          return Response.json({ error: "Failed to get cover" }, { status: 500 });
-        }
-      },
-    },
-
-    // Get cover thumbnail (resized for list/grid views)
-    "/api/books/:id/thumb": {
-      GET: async (req) => {
-        try {
-          const id = parseBookId(req.params.id ?? "");
-          if (id === null) {
-            return Response.json({ error: "Invalid book ID" }, { status: 400 });
-          }
-
-          return await serveThumbById(req, id);
-        } catch (error) {
-          console.error("Error getting thumb:", error);
-          return Response.json({ error: "Failed to get thumbnail" }, { status: 500 });
-        }
-      },
-    },
-
-    // Serve PDF.js worker
-    "/pdfjs/pdf.worker.min.mjs": {
-      GET: async () => {
-        const workerPath = join(
-          import.meta.dir,
-          "..",
-          "node_modules",
-          "pdfjs-dist",
-          "build",
-          "pdf.worker.min.mjs",
+          },
+          req,
         );
-        const file = Bun.file(workerPath);
-        return new Response(file, {
+      } catch (error) {
+        console.error("Error getting book:", error);
+        return Response.json({ error: "Failed to get book" }, { status: 500 });
+      }
+    },
+  },
+
+  // Download book
+  "/api/books/:id/download/:format": {
+    GET: async (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+
+        return await serveBookFile(req, id, req.params.format ?? "", "attachment");
+      } catch (error) {
+        console.error("Error downloading book:", error);
+        return Response.json({ error: "Failed to download book" }, { status: 500 });
+      }
+    },
+    HEAD: async (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+
+        return await serveBookFile(req, id, req.params.format ?? "", "attachment");
+      } catch (error) {
+        console.error("Error downloading book:", error);
+        return Response.json({ error: "Failed to download book" }, { status: 500 });
+      }
+    },
+  },
+
+  // Stream/open a book file inline with byte-range support
+  "/api/books/:id/file/:format": {
+    GET: async (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+
+        return await serveBookFile(req, id, req.params.format ?? "", "inline");
+      } catch (error) {
+        console.error("Error streaming book:", error);
+        return Response.json({ error: "Failed to stream book" }, { status: 500 });
+      }
+    },
+    HEAD: async (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+
+        return await serveBookFile(req, id, req.params.format ?? "", "inline");
+      } catch (error) {
+        console.error("Error streaming book:", error);
+        return Response.json({ error: "Failed to stream book" }, { status: 500 });
+      }
+    },
+  },
+
+  // Serve unpacked EPUB entries for true page/resource streaming in epub.js
+  "/api/books/:id/epub": {
+    GET: (req) => {
+      const url = new URL(req.url);
+      url.pathname = `/api/books/${req.params.id ?? ""}/epub/`;
+      return Response.redirect(url, 308);
+    },
+    HEAD: (req) => {
+      const url = new URL(req.url);
+      url.pathname = `/api/books/${req.params.id ?? ""}/epub/`;
+      return Response.redirect(url, 308);
+    },
+  },
+
+  "/api/books/:id/epub/**": {
+    GET: async (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+
+        return await serveEpubEntry(req, id);
+      } catch (error) {
+        return epubEntryErrorResponse(error);
+      }
+    },
+    HEAD: async (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+
+        return await serveEpubEntry(req, id);
+      } catch (error) {
+        return epubEntryErrorResponse(error);
+      }
+    },
+  },
+
+  // Page manifests and rendered/extracted page images for comics and PDFs
+  "/api/books/:id/pages/:format/manifest": {
+    GET: async (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+        if (!FORMAT_PATTERN.test(req.params.format ?? "")) {
+          return Response.json({ error: "Invalid format" }, { status: 400 });
+        }
+
+        const manifest = await getPageManifest(id, req.params.format ?? "");
+        return Response.json(manifest, {
           headers: {
-            "Content-Type": "application/javascript",
             "Cache-Control": "no-cache",
           },
         });
-      },
+      } catch (error) {
+        return pageStreamingErrorResponse(error);
+      }
     },
+    HEAD: async (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+        if (!FORMAT_PATTERN.test(req.params.format ?? "")) {
+          return Response.json({ error: "Invalid format" }, { status: 400 });
+        }
 
-    // MCP endpoint for AI tool integration
-    "/mcp": {
-      POST: async (req) => {
-        if (!MCP_ENABLED) {
-          return Response.json({ error: "MCP is disabled" }, { status: 404 });
-        }
-        try {
-          const result = await handleMCPRequest(req);
-          return result;
-        } catch (error) {
-          console.error("MCP error:", error);
-          return Response.json({ error: "MCP request failed" }, { status: 500 });
-        }
-      },
+        await getPageManifest(id, req.params.format ?? "");
+        return new Response(null, {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-cache",
+          },
+        });
+      } catch (error) {
+        return pageStreamingErrorResponse(error);
+      }
     },
+  },
 
-    // Serve index.html for all unmatched routes
-    "/*": index,
+  "/api/books/:id/pages/:format/:page": {
+    GET: async (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+        const page = parseBookId(req.params.page ?? "");
+        if (id === null || page === null) {
+          return Response.json({ error: "Invalid page request" }, { status: 400 });
+        }
+        if (!FORMAT_PATTERN.test(req.params.format ?? "")) {
+          return Response.json({ error: "Invalid format" }, { status: 400 });
+        }
+
+        const pageFile = await getPageFile(id, req.params.format ?? "", page);
+        return serveLocalFile(req, pageFile.path, {
+          contentType: pageFile.contentType,
+          cacheControl: "no-cache",
+          // Defense in depth now that SVG pages are filtered upstream: pages
+          // render in <img>, never as documents. Sandbox + nosniff (set by
+          // serveLocalFile) limits damage if a hostile image is mislabeled.
+          contentSecurityPolicy: "sandbox; default-src 'none'; style-src 'unsafe-inline'",
+        });
+      } catch (error) {
+        return pageStreamingErrorResponse(error);
+      }
+    },
+    HEAD: async (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+        const page = parseBookId(req.params.page ?? "");
+        if (id === null || page === null) {
+          return Response.json({ error: "Invalid page request" }, { status: 400 });
+        }
+        if (!FORMAT_PATTERN.test(req.params.format ?? "")) {
+          return Response.json({ error: "Invalid format" }, { status: 400 });
+        }
+
+        const pageFile = await getPageFile(id, req.params.format ?? "", page);
+        return serveLocalFile(req, pageFile.path, {
+          contentType: pageFile.contentType,
+          cacheControl: "no-cache",
+          contentSecurityPolicy: "sandbox; default-src 'none'; style-src 'unsafe-inline'",
+        });
+      } catch (error) {
+        return pageStreamingErrorResponse(error);
+      }
+    },
+  },
+
+  // Get cover (full size)
+  "/api/books/:id/cover": {
+    GET: async (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+
+        return await serveCoverById(req, id);
+      } catch (error) {
+        console.error("Error getting cover:", error);
+        return Response.json({ error: "Failed to get cover" }, { status: 500 });
+      }
+    },
+  },
+
+  // Get cover thumbnail (resized for list/grid views)
+  "/api/books/:id/thumb": {
+    GET: async (req) => {
+      try {
+        const id = parseBookId(req.params.id ?? "");
+        if (id === null) {
+          return Response.json({ error: "Invalid book ID" }, { status: 400 });
+        }
+
+        return await serveThumbById(req, id);
+      } catch (error) {
+        console.error("Error getting thumb:", error);
+        return Response.json({ error: "Failed to get thumbnail" }, { status: 500 });
+      }
+    },
+  },
+
+  // Serve PDF.js worker
+  "/pdfjs/pdf.worker.min.mjs": {
+    GET: async () => {
+      const workerPath = join(
+        import.meta.dir,
+        "..",
+        "node_modules",
+        "pdfjs-dist",
+        "build",
+        "pdf.worker.min.mjs",
+      );
+      const file = Bun.file(workerPath);
+      return new Response(file, {
+        headers: {
+          "Content-Type": "application/javascript",
+          "Cache-Control": "no-cache",
+        },
+      });
+    },
+  },
+
+  // MCP endpoint for AI tool integration
+  "/mcp": {
+    POST: async (req) => {
+      if (!MCP_ENABLED) {
+        return Response.json({ error: "MCP is disabled" }, { status: 404 });
+      }
+      try {
+        const result = await handleMCPRequest(req);
+        return result;
+      } catch (error) {
+        console.error("MCP error:", error);
+        return Response.json({ error: "MCP request failed" }, { status: 500 });
+      }
+    },
+  },
+
+  // Serve index.html for all unmatched routes
+  "/*": index,
 } satisfies RouteTable;
 
 // --- Host header validation --------------------------------------------------
@@ -2865,9 +3038,7 @@ function withHostValidation(routeTable: Record<string, unknown>): Record<string,
       continue;
     }
     const wrapped: { [method: string]: RouteHandler } = {};
-    for (const [method, handler] of Object.entries(
-      route as { [method: string]: RouteHandler },
-    )) {
+    for (const [method, handler] of Object.entries(route as { [method: string]: RouteHandler })) {
       wrapped[method] = async (req) => {
         if (!isRequestHostAllowed(req)) return hostValidationErrorResponse();
         return handler(req);
@@ -2922,9 +3093,7 @@ function withAuthGuard(routeTable: RouteTable): Record<string, unknown> {
       continue;
     }
     const wrapped: { [method: string]: RouteHandler } = {};
-    for (const [method, handler] of Object.entries(
-      route as { [method: string]: RouteHandler },
-    )) {
+    for (const [method, handler] of Object.entries(route as { [method: string]: RouteHandler })) {
       wrapped[method] = async (req) => {
         if (!AUTH_ENABLED) return handler(req);
         const pathname = new URL(req.url).pathname;

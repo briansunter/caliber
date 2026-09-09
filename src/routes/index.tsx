@@ -69,8 +69,9 @@ export const Route = createFileRoute("/")({
         ? (pick(search.sortBy) as SortField)
         : "added",
       sortOrder: pick(search.sortOrder) === "asc" ? "asc" : "desc",
-      tag: tagList
-        .filter((t): t is string => typeof t === "string" && /^\d+$/.test(t) && Number(t) > 0),
+      tag: tagList.filter(
+        (t): t is string => typeof t === "string" && /^\d+$/.test(t) && Number(t) > 0,
+      ),
     };
   },
   component: IndexComponent,
@@ -79,7 +80,8 @@ export const Route = createFileRoute("/")({
 function IndexComponent() {
   const search = Route.useSearch();
   const navigate = useNavigate();
-  const defaultView: ViewMode = typeof window !== "undefined" && window.innerWidth < 768 ? "grid" : "list";
+  const defaultView: ViewMode =
+    typeof window !== "undefined" && window.innerWidth < 768 ? "grid" : "list";
   // Stable numeric tag ids for query keys.
   const tagNumbers = useMemo(() => {
     const list: unknown[] = Array.isArray(search.tag) ? search.tag : [];
@@ -90,7 +92,9 @@ function IndexComponent() {
       view: search.view === "grid" ? "grid" : search.view === "list" ? "list" : defaultView,
       search: typeof search.q === "string" ? search.q : "",
       sort: {
-        field: SORT_FIELDS.includes(search.sortBy as SortField) ? (search.sortBy as SortField) : "added",
+        field: SORT_FIELDS.includes(search.sortBy as SortField)
+          ? (search.sortBy as SortField)
+          : "added",
         order: search.sortOrder === "asc" ? "asc" : "desc",
       },
       tags: tagNumbers,
@@ -119,7 +123,10 @@ function IndexComponent() {
     [navigate, uiState],
   );
 
-  const setSearchQuery = useCallback((q: string) => updateCanonical({ search: q }), [updateCanonical]);
+  const setSearchQuery = useCallback(
+    (q: string) => updateCanonical({ search: q }),
+    [updateCanonical],
+  );
   const setViewMode = useCallback((v: ViewMode) => updateCanonical({ view: v }), [updateCanonical]);
   const setSortConfig = useCallback(
     (config: SortConfig) => updateCanonical({ sort: config }),
@@ -141,21 +148,39 @@ function IndexComponent() {
   // Anchor-based scroll restore lives in BookGridInfinite/BookTableInfinite
   // (they fetch the required window, then scroll to the stored book anchor).
 
-  const { data: libraryConfig, error: libraryConfigError, isLoading: libraryConfigLoading, refetch: refetchLibraryConfig } = useLibraryConfig();
+  const {
+    data: libraryConfig,
+    error: libraryConfigError,
+    isLoading: libraryConfigLoading,
+    refetch: refetchLibraryConfig,
+  } = useLibraryConfig();
   const libraryReady = libraryConfig?.ready === true;
   const { data: stats, isLoading: statsLoading } = useLibraryStats(libraryReady);
   const { data: tags, isLoading: tagsLoading } = useTags(libraryReady);
 
   if (libraryConfigLoading || !libraryConfig) {
-    return <LibraryOnboarding isLoading error={libraryConfigError instanceof Error ? libraryConfigError.message : null} onRetry={() => refetchLibraryConfig()} />;
+    return (
+      <LibraryOnboarding
+        isLoading
+        error={libraryConfigError instanceof Error ? libraryConfigError.message : null}
+        onRetry={() => refetchLibraryConfig()}
+      />
+    );
   }
 
   if (!libraryReady) {
-    return <LibraryOnboarding error={libraryConfigError instanceof Error ? libraryConfigError.message : null} onRetry={() => refetchLibraryConfig()} />;
+    return (
+      <LibraryOnboarding
+        error={libraryConfigError instanceof Error ? libraryConfigError.message : null}
+        onRetry={() => refetchLibraryConfig()}
+      />
+    );
   }
 
   return (
-    <div className={`min-h-screen bg-parchment paper-texture${density === "compact" ? " density-compact" : ""}`}>
+    <div
+      className={`min-h-screen bg-parchment paper-texture${density === "compact" ? " density-compact" : ""}`}
+    >
       {/* Main Content - Unified Scroll */}
       <main id="main-content" className="max-w-7xl mx-auto px-3 sm:px-6 pt-4 sm:pt-8 pb-10">
         {/* Welcome Section */}
@@ -217,7 +242,10 @@ function IndexComponent() {
               onChange={setTags}
               isLoading={tagsLoading}
             />
-            <fieldset aria-label="View mode" className="m-0 p-0 flex-shrink-0 flex items-center border border-ink rounded-lg overflow-hidden">
+            <fieldset
+              aria-label="View mode"
+              className="m-0 p-0 flex-shrink-0 flex items-center border border-ink rounded-lg overflow-hidden"
+            >
               <button
                 type="button"
                 onClick={() => setViewMode("list")}
@@ -247,7 +275,9 @@ function IndexComponent() {
               title="Toggle compact density"
               className={`p-2 transition-colors flex-shrink-0 border border-ink rounded-lg ${density === "compact" ? "bg-ink text-white" : "bg-surface text-ink-muted hover:text-ink"}`}
             >
-              <span aria-hidden="true" className="block text-xs font-semibold leading-none px-0.5">≡</span>
+              <span aria-hidden="true" className="block text-xs font-semibold leading-none px-0.5">
+                ≡
+              </span>
             </button>
           </div>
           {viewMode === "grid" && (
@@ -333,9 +363,12 @@ function LibraryOnboarding({
           </div>
         </div>
         <div className="mb-5">
-          <h2 className="text-3xl sm:text-4xl font-semibold text-ink tracking-tight">Connect your library</h2>
+          <h2 className="text-3xl sm:text-4xl font-semibold text-ink tracking-tight">
+            Connect your library
+          </h2>
           <p className="text-sm text-ink-tertiary mt-2 max-w-lg">
-            Caliber reads your Calibre library without changing it. Choose a database to get started, and Caliber will keep its local copy in sync while it is running.
+            Caliber reads your Calibre library without changing it. Choose a database to get
+            started, and Caliber will keep its local copy in sync while it is running.
           </p>
         </div>
         {isLoading && (
@@ -344,14 +377,21 @@ function LibraryOnboarding({
           </output>
         )}
         {error && (
-          <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" role="alert">
+          <div
+            className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800"
+            role="alert"
+          >
             {error}
-            <button type="button" className="ml-2 underline" onClick={onRetry}>Try again</button>
+            <button type="button" className="ml-2 underline" onClick={onRetry}>
+              Try again
+            </button>
           </div>
         )}
         <LibraryConfigPanel onboarding />
         <p className="text-xs text-ink-tertiary mt-4">
-          Looking for the default? Calibre usually stores it at <span className="font-mono">~/Calibre Library/metadata.db</span> on macOS and Linux, and in your user Documents folder on Windows.
+          Looking for the default? Calibre usually stores it at{" "}
+          <span className="font-mono">~/Calibre Library/metadata.db</span> on macOS and Linux, and
+          in your user Documents folder on Windows.
         </p>
       </main>
     </div>

@@ -30,11 +30,14 @@ import {
 } from "./ReaderChrome";
 import { stored } from "@/lib/utils";
 import { useFullscreen } from "@/lib/use-fullscreen";
-import { flushBookProgress, fetchBookProgress, saveBookProgress, progressPosKey, readScopedPos } from "@/lib/reading-progress";
 import {
-  getNextReaderLoadMode,
-  type ReaderLoadMode,
-} from "./reader-types";
+  flushBookProgress,
+  fetchBookProgress,
+  saveBookProgress,
+  progressPosKey,
+  readScopedPos,
+} from "@/lib/reading-progress";
+import { getNextReaderLoadMode, type ReaderLoadMode } from "./reader-types";
 
 // Cap on waiting for the initial server-progress restore; a stalled request
 // must not keep suppressing server saves for the whole session.
@@ -120,7 +123,11 @@ function isZipArchive(data: ArrayBuffer): boolean {
   return bytes[0] === 0x50 && bytes[1] === 0x4b;
 }
 
-async function fetchFileBytes(url: string, range?: string, signal?: AbortSignal): Promise<ArrayBuffer> {
+async function fetchFileBytes(
+  url: string,
+  range?: string,
+  signal?: AbortSignal,
+): Promise<ArrayBuffer> {
   const response = await fetch(url, {
     ...(range ? { headers: { Range: range } } : {}),
     ...(signal ? { signal } : {}),
@@ -239,7 +246,10 @@ interface EpubPageInfo {
   total: number;
 }
 
-function getEpubPageInfo(location: Location | null | undefined, book: Book | null): EpubPageInfo | null {
+function getEpubPageInfo(
+  location: Location | null | undefined,
+  book: Book | null,
+): EpubPageInfo | null {
   const total = book?.locations?.length() ?? 0;
   const cfi = location?.start?.cfi;
   if (!total || !cfi) return null;
@@ -879,7 +889,10 @@ export function EpubReader({
                 onClick={toggleUI}
               />
             ) : (
-              <div aria-hidden="true" className="absolute left-[15%] top-0 bottom-0 z-[105] w-[70%] pointer-events-none" />
+              <div
+                aria-hidden="true"
+                className="absolute left-[15%] top-0 bottom-0 z-[105] w-[70%] pointer-events-none"
+              />
             )}
             <button
               type="button"

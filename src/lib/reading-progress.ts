@@ -39,16 +39,31 @@ export type ReadingSort = "recent" | "title" | "progress";
 
 // F04: scope local position keys by library so switching libraries never
 // restores another library's page. Cached synchronously; refreshed from
-// /api/config/library when available, else falls back to 'default'.
+// /api/config/library's canonical `libraryId` when available, else falls back
+// to 'default'. Legacy scopes stored the filesystem path — those are never
+// surfaced (the server only accepts canonical `lib-<hash>` ids, so a path
+// would 409 every write).
 const LIB_SCOPE_KEY = "caliber-library-id";
 
-export function getLibraryScopeId(): string {
+function isPathLikeLibraryId(value: string): boolean {
+  return value.includes("/");
+}
+
+function readStoredScopeRaw(): string | null {
   try {
-    if (typeof localStorage === "undefined") return "default";
-    return localStorage.getItem(LIB_SCOPE_KEY) || "default";
+    if (typeof localStorage === "undefined") return null;
+    return localStorage.getItem(LIB_SCOPE_KEY);
   } catch {
-    return "default";
+    return null;
   }
+}
+
+export function getLibraryScopeId(): string {
+  const stored = readStoredScopeRaw();
+  if (!stored) return "default";
+  // Never send a path as the scope/expectedLibraryId.
+  if (isPathLikeLibraryId(stored)) return "default";
+  return stored;
 }
 
 export function progressPosKey(bookId: number, kind: string): string {
@@ -72,26 +87,98 @@ export function readScopedPos<T>(bookId: number, kind: string, fallback: T): T {
   }
 }
 
-let libScopeRefreshInFlight = false;
-export function refreshLibraryScopeId(): void {
-  if (typeof window === "undefined" || libScopeRefreshInFlight) return;
-  libScopeRefreshInFlight = true;
-  fetch("/api/config/library", { headers: { Accept: "application/json" } })
-    .then((res) => (res.ok ? res.json() : null))
-    .then((data: { libraryPath?: unknown } | null) => {
-      const p = typeof data?.libraryPath === "string" ? data.libraryPath : "";
-      if (p) {
-        try {
-          localStorage.setItem(LIB_SCOPE_KEY, p);
-        } catch {}
+// T1 migration: queued outbox entries stamped with a filesystem path (or the
+// unresolved "default"/"legacy" placeholder) cannot drain under the canonical
+// scope. Placeholders carry no foreign-library claim, so they adopt the newly
+// resolved scope; path-stamped entries are remapped ONLY when the stamped path
+// equals the server's current libraryPath, otherwise they belong to a
+// different library and are dropped (never silently relabeled). Logs when it
+// changes anything.
+function migrateOutboxToScope(canonical: string, serverPath: string): void {
+  try {
+    if (typeof localStorage === "undefined") return;
+    const entries = readOutbox();
+    let remapped = 0;
+    let dropped = 0;
+    const next: OutboxEntry[] = [];
+    for (const entry of entries) {
+      if (entry.libraryId === canonical) {
+        next.push(entry);
+        continue;
       }
-    })
-    .catch(() => {})
-    .finally(() => {
-      libScopeRefreshInFlight = false;
-    });
+      if (entry.libraryId === "default" || entry.libraryId === "legacy" || entry.libraryId === "") {
+        next.push({ ...entry, libraryId: canonical });
+        remapped += 1;
+        continue;
+      }
+      if (isPathLikeLibraryId(entry.libraryId)) {
+        if (serverPath && entry.libraryId === serverPath) {
+          next.push({ ...entry, libraryId: canonical });
+          remapped += 1;
+        } else {
+          dropped += 1;
+        }
+        continue;
+      }
+      next.push(entry);
+    }
+    if (remapped > 0 || dropped > 0) {
+      writeOutbox(next);
+      console.info(
+        `[reading-progress] library scope migration to ${canonical}: remapped=${remapped} dropped=${dropped}`,
+      );
+    }
+  } catch {}
 }
-refreshLibraryScopeId();
+
+let libScopeRefreshPromise: Promise<string | null> | null = null;
+export function refreshLibraryScopeId(): Promise<string | null> {
+  if (typeof window === "undefined") return Promise.resolve(null);
+  if (libScopeRefreshPromise) return libScopeRefreshPromise;
+  libScopeRefreshPromise = fetch("/api/config/library", { headers: { Accept: "application/json" } })
+    .then((res) => (res.ok ? res.json() : null))
+    .then((data: { libraryId?: unknown; libraryPath?: unknown } | null) => {
+      const rawId = typeof data?.libraryId === "string" ? data.libraryId.trim() : "";
+      // No canonical id (unreachable/legacy server): leave the stored scope
+      // alone; getLibraryScopeId keeps returning "default", never a path.
+      if (!rawId) return null;
+      const canonical = rawId.slice(0, 200);
+      const serverPath = typeof data?.libraryPath === "string" ? data.libraryPath : "";
+      const prevRaw = readStoredScopeRaw();
+      try {
+        if (
+          prevRaw !== null &&
+          prevRaw !== "" &&
+          prevRaw !== canonical &&
+          isPathLikeLibraryId(prevRaw)
+        ) {
+          console.info("[reading-progress] replacing legacy path library scope with canonical id");
+        }
+        localStorage.setItem(LIB_SCOPE_KEY, canonical);
+      } catch {}
+      // Adopt queued checkpoints into the resolved scope (runs on every
+      // successful refresh: pre-resolution captures land here as placeholders).
+      migrateOutboxToScope(canonical, serverPath);
+      const hadResolvedScope =
+        prevRaw !== null &&
+        prevRaw !== "" &&
+        prevRaw !== "default" &&
+        prevRaw !== "legacy" &&
+        !isPathLikeLibraryId(prevRaw);
+      if (hadResolvedScope && prevRaw !== canonical) {
+        // Genuine mid-session library switch (boot's first drain is handled by
+        // the boot block awaiting this refresh): drain remapped entries.
+        void retryOutbox();
+      }
+      return canonical;
+    })
+    .catch(() => null)
+    .finally(() => {
+      libScopeRefreshPromise = null;
+    });
+  return libScopeRefreshPromise;
+}
+void refreshLibraryScopeId();
 
 // --- Reader-side helpers (plain async, no hooks) -------------------------
 
@@ -105,14 +192,24 @@ export async function fetchBookProgress(
   format: ProgressFormat,
 ): Promise<ProgressRecord | null> {
   try {
-    const res = await fetchJson<{ progress: ProgressRecord | null; serverSeq?: unknown }>(
-      `/api/user/progress/${bookId}?format=${encodeURIComponent(format)}`,
-    );
+    const res = await fetchJson<{
+      progress: ProgressRecord | null;
+      serverSeq?: unknown;
+      deletionSeq?: unknown;
+    }>(`/api/user/progress/${bookId}?format=${encodeURIComponent(format)}`);
     const progress = res.progress ?? null;
     // S2: persist last known server_seq per identity for baseRevision.
-    const seq = serverSeqOfProgress(progress) ?? (typeof res.serverSeq === "number" ? res.serverSeq : null);
+    const seq =
+      serverSeqOfProgress(progress) ?? (typeof res.serverSeq === "number" ? res.serverSeq : null);
     if (progress && seq !== null) {
       setKnownServerSeq(lastKnownUserId, getLibraryScopeId(), bookId, format, seq);
+    }
+    // T5: persist last known deletion generation for baseDeletionSeq. A
+    // fresh value (seen via re-read after a DELETE/clear) lets an
+    // intentional post-deletion write resurrect; stale/absent is rejected.
+    const delSeq = typeof res.deletionSeq === "number" ? Math.floor(res.deletionSeq) : null;
+    if (delSeq !== null && Number.isFinite(delSeq)) {
+      setKnownDeletionSeq(lastKnownUserId, getLibraryScopeId(), bookId, format, delSeq);
     }
     return progress;
   } catch {
@@ -138,6 +235,7 @@ export interface ProgressOp {
   libraryId: string;
   ts: number;
   baseRevision: number | null;
+  baseDeletionSeq: number | null;
 }
 
 export interface PutProgressResult {
@@ -156,7 +254,12 @@ const timers = new Map<number, ReturnType<typeof setTimeout>>();
 // run in parallel for the same identity.
 const opChains = new Map<string, Promise<void>>();
 
-function identityKey(userId: number | null, libraryId: string, bookId: number, format: string): string {
+function identityKey(
+  userId: number | null,
+  libraryId: string,
+  bookId: number,
+  format: string,
+): string {
   return `${userId ?? "anon"}:${libraryId}:${bookId}:${format}`;
 }
 
@@ -183,7 +286,12 @@ function chainIdentityResult<T>(key: string, fn: () => Promise<T>): Promise<T> {
 const SEQ_KEY = "caliber-progress-seq";
 const seqCache = new Map<string, number>();
 
-function seqStoreKey(userId: number | null, libraryId: string, bookId: number, format: string): string {
+function seqStoreKey(
+  userId: number | null,
+  libraryId: string,
+  bookId: number,
+  format: string,
+): string {
   return identityKey(userId, libraryId, bookId, format);
 }
 
@@ -251,6 +359,73 @@ function serverSeqOfProgress(p: unknown): number | null {
   const r = p as Record<string, unknown>;
   const raw = (r.serverSeq ?? r.server_seq) as unknown;
   return typeof raw === "number" && Number.isFinite(raw) ? Math.floor(raw) : null;
+}
+
+// T5: last known deletion generation per identity, persisted client-side so
+// baseDeletionSeq survives reloads. Updated from every GET progress response
+// (deletionSeq) and every PUT/POST response. A fresh value acknowledges a
+// DELETE/clear and permits resurrection; stale/absent is rejected server-side
+// with applied:false reason:"deleted".
+const DELETION_SEQ_KEY = "caliber-progress-deletion-seq";
+const deletionSeqCache = new Map<string, number>();
+
+function loadDeletionSeqStore(): Record<string, number> {
+  try {
+    if (typeof localStorage === "undefined") return {};
+    const raw = localStorage.getItem(DELETION_SEQ_KEY);
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return {};
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof v === "number" && Number.isFinite(v)) out[k] = Math.floor(v);
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+let deletionSeqLoaded = false;
+function ensureDeletionSeqLoaded(): void {
+  if (deletionSeqLoaded) return;
+  deletionSeqLoaded = true;
+  try {
+    for (const [k, v] of Object.entries(loadDeletionSeqStore())) deletionSeqCache.set(k, v);
+  } catch {}
+}
+
+function persistDeletionSeqStore(): void {
+  try {
+    if (typeof localStorage === "undefined") return;
+    const obj: Record<string, number> = {};
+    for (const [k, v] of deletionSeqCache) obj[k] = v;
+    localStorage.setItem(DELETION_SEQ_KEY, JSON.stringify(obj));
+  } catch {}
+}
+
+export function getKnownDeletionSeq(
+  userId: number | null,
+  libraryId: string,
+  bookId: number,
+  format: string,
+): number | null {
+  ensureDeletionSeqLoaded();
+  const v = deletionSeqCache.get(seqStoreKey(userId, libraryId, bookId, format));
+  return typeof v === "number" ? v : null;
+}
+
+export function setKnownDeletionSeq(
+  userId: number | null,
+  libraryId: string,
+  bookId: number,
+  format: string,
+  seq: number | null | undefined,
+): void {
+  if (typeof seq !== "number" || !Number.isFinite(seq)) return;
+  ensureDeletionSeqLoaded();
+  deletionSeqCache.set(seqStoreKey(userId, libraryId, bookId, format), Math.floor(seq));
+  persistDeletionSeqStore();
 }
 
 // S4: deletion tombstones. DELETE progress / clear reading-list records
@@ -393,9 +568,7 @@ export function recordReadingListClear(userId: number | null, libraryId: string)
     }
   }
   writeOutbox(
-    readOutbox().filter(
-      (e) => !(e.userId === userId && e.libraryId === libraryId && e.ts < now),
-    ),
+    readOutbox().filter((e) => !(e.userId === userId && e.libraryId === libraryId && e.ts < now)),
   );
 }
 
@@ -421,6 +594,7 @@ export interface OutboxEntry {
   attempts: number;
   ts: number;
   baseRevision: number | null;
+  baseDeletionSeq: number | null;
 }
 
 export interface RejectedProgressEntry extends OutboxEntry {
@@ -471,14 +645,14 @@ function normalizeOutboxEntry(raw: unknown): OutboxEntry | null {
   const data: PendingSave = {
     format: String(rawData.format),
     location: rawData.location == null ? null : String(rawData.location),
-    percentage: typeof rawData.percentage === "number" && Number.isFinite(rawData.percentage)
-      ? rawData.percentage
-      : 0,
+    percentage:
+      typeof rawData.percentage === "number" && Number.isFinite(rawData.percentage)
+        ? rawData.percentage
+        : 0,
     finished: rawData.finished === true,
   };
   return {
-    mutationId:
-      typeof e.mutationId === "string" && e.mutationId ? e.mutationId : newMutationId(),
+    mutationId: typeof e.mutationId === "string" && e.mutationId ? e.mutationId : newMutationId(),
     userId: typeof e.userId === "number" && Number.isInteger(e.userId) ? e.userId : null,
     libraryId: typeof e.libraryId === "string" && e.libraryId ? e.libraryId : "legacy",
     bookId: e.bookId,
@@ -489,6 +663,10 @@ function normalizeOutboxEntry(raw: unknown): OutboxEntry | null {
     baseRevision:
       typeof e.baseRevision === "number" && Number.isFinite(e.baseRevision)
         ? Math.floor(e.baseRevision)
+        : null,
+    baseDeletionSeq:
+      typeof e.baseDeletionSeq === "number" && Number.isFinite(e.baseDeletionSeq)
+        ? Math.floor(e.baseDeletionSeq)
         : null,
   };
 }
@@ -571,18 +749,26 @@ function pickEvictionIndex(entries: OutboxEntry[], newestIdx: number): number {
 export function enqueueProgressOutbox(
   bookId: number,
   data: PendingSave,
-  opts?: { mutationId?: string; userId?: number | null; libraryId?: string; ts?: number; baseRevision?: number | null },
+  opts?: {
+    mutationId?: string;
+    userId?: number | null;
+    libraryId?: string;
+    ts?: number;
+    baseRevision?: number | null;
+    baseDeletionSeq?: number | null;
+  },
 ): string {
   const mutationId = opts?.mutationId ?? newMutationId();
-  const userId =
-    opts && "userId" in opts
-      ? opts.userId ?? null
-      : lastKnownUserId;
+  const userId = opts && "userId" in opts ? (opts.userId ?? null) : lastKnownUserId;
   const libraryId = opts?.libraryId ?? getLibraryScopeId();
   const ts = typeof opts?.ts === "number" && Number.isFinite(opts.ts) ? opts.ts : Date.now();
   const baseRevision =
     typeof opts?.baseRevision === "number" && Number.isFinite(opts.baseRevision)
       ? Math.floor(opts.baseRevision)
+      : null;
+  const baseDeletionSeq =
+    typeof opts?.baseDeletionSeq === "number" && Number.isFinite(opts?.baseDeletionSeq)
+      ? Math.floor(opts.baseDeletionSeq as number)
       : null;
   const entries = readOutbox().filter((e) => e.mutationId !== mutationId);
   entries.push({
@@ -595,6 +781,7 @@ export function enqueueProgressOutbox(
     attempts: 0,
     ts,
     baseRevision,
+    baseDeletionSeq,
   });
   while (entries.length > OUTBOX_MAX_ENTRIES) {
     entries.splice(pickEvictionIndex(entries, entries.length - 1), 1);
@@ -643,18 +830,38 @@ export async function retryOutbox(): Promise<void> {
   // Foreign entries stay queued for their own principal/library.
   if (currentUserId === null) return;
   // S4: drop entries predating a recorded deletion before draining.
-  const afterTombstones = snapshot.filter((e) => {
-    if (e.userId !== currentUserId || e.libraryId !== currentLibrary) return true;
-    return !isOpSupersededByDeletion({ userId: e.userId, libraryId: e.libraryId, bookId: e.bookId, format: e.format, ts: e.ts });
-  });
-  if (afterTombstones.length !== snapshot.length) {
-    const liveIds = new Set(afterTombstones.map((e) => e.mutationId));
-    writeOutbox(readOutbox().filter((e) => liveIds.has(e.mutationId) || e.userId !== currentUserId || e.libraryId !== currentLibrary));
+  // T4 exact-ID cleanup: compute the exact set of obsolete mutation IDs from
+  // the pre-drain snapshot (entries with ts < deletedAt for the matching
+  // identity) and remove ONLY those IDs from fresh storage. Newcomers that
+  // arrived after the snapshot (different IDs, ts >= deletedAt, or absent
+  // from the snapshot) are always preserved — never an allowlist filter.
+  const obsoleteIds = new Set<string>();
+  for (const e of snapshot) {
+    if (e.userId !== currentUserId || e.libraryId !== currentLibrary) continue;
+    if (
+      isOpSupersededByDeletion({
+        userId: e.userId,
+        libraryId: e.libraryId,
+        bookId: e.bookId,
+        format: e.format,
+        ts: e.ts,
+      })
+    ) {
+      obsoleteIds.add(e.mutationId);
+    }
   }
+  if (obsoleteIds.size > 0) {
+    writeOutbox(readOutbox().filter((e) => !obsoleteIds.has(e.mutationId)));
+  }
+  const afterTombstones = snapshot.filter((e) => !obsoleteIds.has(e.mutationId));
   const eligible = afterTombstones.filter(
     (e) => e.userId !== null && e.userId === currentUserId && e.libraryId === currentLibrary,
   );
   if (eligible.length === 0) return;
+  // T3 drain-start coalesce: per user:library:book:format identity keep only
+  // the newest ts; older unsent losers are dropped by exact mutationId
+  // (processed, not applied) and never sent.
+  const coalesced = coalesceEligibleQueue(eligible);
 
   type Outcome =
     | { kind: "acked" }
@@ -663,21 +870,36 @@ export async function retryOutbox(): Promise<void> {
     | { kind: "suspended" };
   const outcomes = new Map<string, Outcome>();
   let suspended = false;
-  // S2: ordered drain per identity — sorted by client ts so older mutations
-  // apply first; each send goes through the shared coordinator (which
-  // serializes per identity and rebases on conflict), so an offline queue of
-  // page10(ts1000)+page20(ts2000) ends at page20.
-  const queue = [...eligible].sort((a, b) => a.ts - b.ts);
+  // Mark T3-coalesced losers as processed (dropped by exact mutationId,
+  // never sent) before the sequential drain.
+  for (const id of coalesced.droppedIds) outcomes.set(id, { kind: "acked" });
+  // T2 causal ordering + sequential rebase: sorted by client ts so older
+  // mutations apply first; each send goes through the shared coordinator
+  // (which serializes per identity and rebases the newest on conflict).
+  // Offline page10(b7)+page20(b7) drains to page20 via sequential rebase:
+  // page10 applies (seq 7->8), page20 conflicts on stale base 7, refetches
+  // fresh base 8, retries once as newest, applies (seq 8->9). No wall-clock
+  // (op.ts vs server.updatedAt) comparison is used anywhere.
+  const queue = [...coalesced.kept].sort((a, b) => a.ts - b.ts);
   for (const entry of queue) {
     if (generation !== outboxGeneration) break; // principal switched: abort drain
     if (suspended) break;
     // S4: re-check the tombstone right before sending (a removal may have
     // landed mid-drain); tombstoned ops are dropped, never sent.
-    if (isOpSupersededByDeletion({ userId: entry.userId, libraryId: entry.libraryId, bookId: entry.bookId, format: entry.format, ts: entry.ts })) {
+    if (
+      isOpSupersededByDeletion({
+        userId: entry.userId,
+        libraryId: entry.libraryId,
+        bookId: entry.bookId,
+        format: entry.format,
+        ts: entry.ts,
+      })
+    ) {
       outcomes.set(entry.mutationId, { kind: "acked" });
       continue;
     }
     // S3: retry replays through the SAME coordinator, never direct fetch.
+    // T2: null-base upgrades to expected revision 0 when no known seq.
     const op: ProgressOp = {
       bookId: entry.bookId,
       data: { ...entry.data },
@@ -685,7 +907,13 @@ export async function retryOutbox(): Promise<void> {
       userId: entry.userId,
       libraryId: entry.libraryId,
       ts: entry.ts,
-      baseRevision: entry.baseRevision ?? getKnownServerSeq(entry.userId, entry.libraryId, entry.bookId, entry.format),
+      baseRevision:
+        entry.baseRevision ??
+        getKnownServerSeq(entry.userId, entry.libraryId, entry.bookId, entry.format) ??
+        0,
+      baseDeletionSeq:
+        entry.baseDeletionSeq ??
+        getKnownDeletionSeq(entry.userId, entry.libraryId, entry.bookId, entry.format),
     };
     try {
       const result = await sendProgressOp(op);
@@ -761,9 +989,7 @@ export async function retryOutbox(): Promise<void> {
   );
   if (remaining.length > 0) {
     const maxAttempts = remaining.reduce((m, e) => Math.max(m, e.attempts), 0);
-    scheduleOutboxRetry(
-      Math.min(RETRY_BASE_MS * 2 ** Math.min(maxAttempts, 5), RETRY_MAX_MS),
-    );
+    scheduleOutboxRetry(Math.min(RETRY_BASE_MS * 2 ** Math.min(maxAttempts, 5), RETRY_MAX_MS));
   } else if (merged.length === 0) {
     void queryClient.invalidateQueries({ queryKey: ["reading-list"] });
   }
@@ -773,9 +999,19 @@ if (typeof window !== "undefined") {
   window.addEventListener("online", () => {
     void retryOutbox();
   });
+  // Library-switch events (e.g. after PUT /api/config/library elsewhere):
+  // re-resolve the canonical scope; a changed scope migrates + drains.
+  window.addEventListener("caliber:library-changed", () => {
+    void refreshLibraryScopeId();
+  });
   // Seed the principal, then drain only entries that match the established
   // principal+library (no blind auto-drain of foreign entries).
   void (async () => {
+    // Resolve the canonical library scope BEFORE the first drain so queued
+    // checkpoints capture (and replay under) the server's library id.
+    try {
+      await refreshLibraryScopeId();
+    } catch {}
     try {
       const me = await fetchJson<{ user: { id: number } | null }>("/api/user/me");
       if (typeof me?.user?.id === "number") {
@@ -794,13 +1030,16 @@ if (typeof window !== "undefined") {
  * - Checks generation + principal/library match BEFORE each fetch attempt
  *   (including before the POST fallback).
  * - Sends expected {userId, libraryId} + baseRevision in the body.
+ *   T2: first writes send baseRevision 0 explicitly (not null); null is
+ *   legacy unconditional blind write only, deprecated.
  * - Persists returned server_seq per identity.
- * - On applied:false/conflict: refetches server state, rebases, and retries
- *   ONCE with a fresh baseRevision only when this op is the newest local
- *   mutation for the identity and its ts is newer than the server updatedAt.
- *   Older queued mutations for the same identity are dropped (exact
- *   mutationId only) so an offline queue of page10(ts1000)+page20(ts2000)
- *   drains sequentially to final=page20.
+ * - T2 causal ordering (no wall-clock): on applied:false/conflict, refetches
+ *   server {serverSeq, updatedAt} and retries ONCE with a fresh baseRevision
+ *   ONLY if this op is the newest local mutation for the identity
+ *   (newestLocalTsForIdentity). There is deliberately NO op.ts-vs-
+ *   server.updatedAt comparison. Older queued losers are dropped by exact
+ *   mutationId (processed, not applied). Offline page10(b7)+page20(b7)
+ *   drains to page20 via sequential rebase.
  */
 export async function sendProgressOp(op: ProgressOp): Promise<PutProgressResult> {
   const key = identityKey(op.userId, op.libraryId, op.bookId, op.data.format);
@@ -823,16 +1062,77 @@ function newestLocalTsForIdentity(
 ): number | null {
   let best: number | null = null;
   for (const p of pending.values()) {
-    if (p.userId === userId && p.libraryId === libraryId && p.bookId === bookId && p.data.format === format) {
+    if (
+      p.userId === userId &&
+      p.libraryId === libraryId &&
+      p.bookId === bookId &&
+      p.data.format === format
+    ) {
       best = best === null ? p.ts : Math.max(best, p.ts);
     }
   }
   for (const e of readOutbox()) {
-    if (e.userId === userId && e.libraryId === libraryId && e.bookId === bookId && e.format === format) {
+    if (
+      e.userId === userId &&
+      e.libraryId === libraryId &&
+      e.bookId === bookId &&
+      e.format === format
+    ) {
       best = best === null ? e.ts : Math.max(best, e.ts);
     }
   }
   return best;
+}
+
+// T3 predecessors + mutation history: coalesce older UNSENT ops for the same
+// user:library:book:format when a newer unsent op exists. Both ops must be
+// unacknowledged (still in pending/outbox); the newest ts wins and older
+// losers are removed by exact mutationId (never by payload match).
+// This runs at saveBookProgress time (new save drops older same-identity
+// outbox entries) AND at drain start (eligible queue keeps newest per
+// identity). The debounce Map still sends only its latest entry, so a
+// durable queue of page10->page20->page30 never replays page10/20 after
+// page30 succeeds.
+function coalesceOutboxForIdentity(
+  userId: number | null,
+  libraryId: string,
+  bookId: number,
+  format: string,
+  keepMutationId: string,
+): void {
+  const entries = readOutbox();
+  const kept = entries.filter((e) => {
+    if (
+      e.userId !== userId ||
+      e.libraryId !== libraryId ||
+      e.bookId !== bookId ||
+      e.format !== format
+    ) {
+      return true;
+    }
+    return e.mutationId === keepMutationId;
+  });
+  if (kept.length !== entries.length) writeOutbox(kept);
+}
+
+function coalesceEligibleQueue(entries: OutboxEntry[]): {
+  kept: OutboxEntry[];
+  droppedIds: string[];
+} {
+  const newestByIdentity = new Map<string, OutboxEntry>();
+  for (const e of entries) {
+    const k = identityKey(e.userId, e.libraryId, e.bookId, e.format);
+    const cur = newestByIdentity.get(k);
+    if (!cur || e.ts >= cur.ts) newestByIdentity.set(k, e);
+  }
+  const keepIds = new Set([...newestByIdentity.values()].map((e) => e.mutationId));
+  const kept: OutboxEntry[] = [];
+  const droppedIds: string[] = [];
+  for (const e of entries) {
+    if (keepIds.has(e.mutationId)) kept.push(e);
+    else droppedIds.push(e.mutationId);
+  }
+  return { kept, droppedIds };
 }
 
 async function attemptSend(
@@ -840,6 +1140,7 @@ async function attemptSend(
   method: "PUT" | "POST",
   baseRevision: number | null,
   generation: number,
+  baseDeletionSeq?: number | null,
 ): Promise<{ res: Response | null; networkError: boolean }> {
   // S3: re-check generation + principal match before EVERY attempt.
   if (generation !== outboxGeneration) return { res: null, networkError: false };
@@ -850,6 +1151,7 @@ async function attemptSend(
     mutationId: op.mutationId,
     clientTs: op.ts,
     baseRevision,
+    baseDeletionSeq: baseDeletionSeq ?? op.baseDeletionSeq ?? null,
     expectedUserId: op.userId,
     expectedLibraryId: op.libraryId,
   });
@@ -870,6 +1172,7 @@ interface ServerProgressBody {
   applied?: unknown;
   reason?: unknown;
   serverSeq?: unknown;
+  deletionSeq?: unknown;
   progress?: unknown;
 }
 
@@ -879,6 +1182,18 @@ function parseServerProgressBody(body: ServerProgressBody, op: ProgressOp): PutP
     (typeof body.serverSeq === "number" ? Math.floor(body.serverSeq) : null);
   if (seq !== null) {
     setKnownServerSeq(op.userId, op.libraryId, op.bookId, op.data.format, seq);
+  }
+  // T5: every write response carries the current deletion generation; persist
+  // it so a later intentional write can acknowledge (resurrect) with a fresh
+  // baseDeletionSeq.
+  if (typeof body.deletionSeq === "number" && Number.isFinite(body.deletionSeq)) {
+    setKnownDeletionSeq(
+      op.userId,
+      op.libraryId,
+      op.bookId,
+      op.data.format,
+      Math.floor(body.deletionSeq as number),
+    );
   }
   if (body && body.applied === false) {
     return {
@@ -891,14 +1206,29 @@ function parseServerProgressBody(body: ServerProgressBody, op: ProgressOp): PutP
   return { ok: true, applied: true, serverSeq: seq };
 }
 
-async function refetchServerState(op: ProgressOp): Promise<{ serverSeq: number | null; updatedAt: number | null }> {
+async function refetchServerState(
+  op: ProgressOp,
+): Promise<{ serverSeq: number | null; updatedAt: number | null }> {
   try {
-    const res = await fetchJson<{ progress: (ProgressRecord & { updatedAt?: number }) | null; serverSeq?: unknown }>(
-      `/api/user/progress/${op.bookId}?format=${encodeURIComponent(op.data.format)}`,
-    );
-    const seq = serverSeqOfProgress(res.progress) ?? (typeof res.serverSeq === "number" ? res.serverSeq : null);
+    const res = await fetchJson<{
+      progress: (ProgressRecord & { updatedAt?: number }) | null;
+      serverSeq?: unknown;
+      deletionSeq?: unknown;
+    }>(`/api/user/progress/${op.bookId}?format=${encodeURIComponent(op.data.format)}`);
+    const seq =
+      serverSeqOfProgress(res.progress) ??
+      (typeof res.serverSeq === "number" ? res.serverSeq : null);
     if (seq !== null) {
       setKnownServerSeq(op.userId, op.libraryId, op.bookId, op.data.format, seq);
+    }
+    if (typeof res.deletionSeq === "number" && Number.isFinite(res.deletionSeq)) {
+      setKnownDeletionSeq(
+        op.userId,
+        op.libraryId,
+        op.bookId,
+        op.data.format,
+        Math.floor(res.deletionSeq),
+      );
     }
     const updatedAt =
       res.progress && typeof res.progress.updatedAt === "number" ? res.progress.updatedAt : null;
@@ -911,16 +1241,38 @@ async function refetchServerState(op: ProgressOp): Promise<{ serverSeq: number |
 async function sendProgressOpInner(op: ProgressOp): Promise<PutProgressResult> {
   const generation = outboxGeneration;
   // S4: deletion tombstone — an op predating a removal is dropped, never sent.
-  if (isOpSupersededByDeletion({ userId: op.userId, libraryId: op.libraryId, bookId: op.bookId, format: op.data.format, ts: op.ts })) {
+  if (
+    isOpSupersededByDeletion({
+      userId: op.userId,
+      libraryId: op.libraryId,
+      bookId: op.bookId,
+      format: op.data.format,
+      ts: op.ts,
+    })
+  ) {
     return { ok: true, applied: false, reason: "deleted" };
   }
-  const baseRevision = op.baseRevision ?? getKnownServerSeq(op.userId, op.libraryId, op.bookId, op.data.format);
+  // T2: null-base upgrades to expected revision 0 when no known seq.
+  const baseRevision =
+    op.baseRevision ?? getKnownServerSeq(op.userId, op.libraryId, op.bookId, op.data.format) ?? 0;
+  // T5: acknowledge the last known deletion generation; stale/absent after a
+  // DELETE/clear is rejected server-side with applied:false reason:"deleted".
+  // A fresh value (from GET deletion info after re-read) resurrects.
+  const baseDeletionSeq =
+    op.baseDeletionSeq ?? getKnownDeletionSeq(op.userId, op.libraryId, op.bookId, op.data.format);
   // Server accepts both PUT and POST (beacon can only POST).
   let firstConflict: PutProgressResult | null = null;
   for (const method of ["PUT", "POST"] as const) {
-    const { res, networkError } = await attemptSend(op, method, baseRevision, generation);
+    const { res, networkError } = await attemptSend(
+      op,
+      method,
+      baseRevision,
+      generation,
+      baseDeletionSeq,
+    );
     if (!res) {
-      if (generation !== outboxGeneration || opBlockedByPrincipal(op)) return { ok: false, applied: false, reason: "superseded" };
+      if (generation !== outboxGeneration || opBlockedByPrincipal(op))
+        return { ok: false, applied: false, reason: "superseded" };
       if (networkError) {
         if (method === "PUT") continue; // fall through to POST attempt
         return { ok: false, applied: false };
@@ -940,14 +1292,19 @@ async function sendProgressOpInner(op: ProgressOp): Promise<PutProgressResult> {
       return parsed;
     }
     if (res.status === 401 || res.status === 409) {
-      return { ok: false, applied: false, reason: res.status === 401 ? "unauthorized" : "identity-mismatch" };
+      return {
+        ok: false,
+        applied: false,
+        reason: res.status === 401 ? "unauthorized" : "identity-mismatch",
+      };
     }
     // POST fallback only helps on 404/405 (old server without the alias).
     if (method === "PUT" && (res.status === 404 || res.status === 405)) continue;
     return { ok: false, applied: false };
   }
-  // S2 conflict path: refetch, rebase, retry once for the newest local
-  // mutation only. applied:false must NOT delete a newer queued mutation.
+  // T2 conflict path: refetch, rebase, retry once for the newest local
+  // mutation only. No wall-clock (op.ts vs server.updatedAt) comparison.
+  // applied:false must NOT delete a newer queued mutation.
   if (firstConflict) {
     if (generation !== outboxGeneration || opBlockedByPrincipal(op)) {
       return { ok: false, applied: false, reason: "superseded" };
@@ -955,11 +1312,21 @@ async function sendProgressOpInner(op: ProgressOp): Promise<PutProgressResult> {
     const server = await refetchServerState(op);
     const newestTs = newestLocalTsForIdentity(op.userId, op.libraryId, op.bookId, op.data.format);
     const isNewest = newestTs === null || op.ts >= newestTs;
-    const localNewer = server.updatedAt === null || op.ts > server.updatedAt;
-    if (isNewest && localNewer) {
-      const freshBase = server.serverSeq ?? getKnownServerSeq(op.userId, op.libraryId, op.bookId, op.data.format);
-      const { res, networkError } = await attemptSend(op, "POST", freshBase, generation);
-      if (!res) return { ok: false, applied: false, ...(networkError ? {} : { reason: "superseded" }) };
+    if (isNewest) {
+      const freshBase =
+        server.serverSeq ??
+        getKnownServerSeq(op.userId, op.libraryId, op.bookId, op.data.format) ??
+        0;
+      const freshDeletion = getKnownDeletionSeq(op.userId, op.libraryId, op.bookId, op.data.format);
+      const { res, networkError } = await attemptSend(
+        op,
+        "POST",
+        freshBase,
+        generation,
+        freshDeletion,
+      );
+      if (!res)
+        return { ok: false, applied: false, ...(networkError ? {} : { reason: "superseded" }) };
       if (res.ok) {
         let body: ServerProgressBody = {};
         try {
@@ -972,8 +1339,8 @@ async function sendProgressOpInner(op: ProgressOp): Promise<PutProgressResult> {
       }
       return { ok: false, applied: false };
     }
-    // Older queued mutation, or server is newer: drop exactly this mutation
-    // (caller removes by mutationId only); the newer state wins.
+    // Older queued loser: drop exactly this mutationId (processed, not
+    // applied); the newer local mutation wins via its own send/rebase.
     return firstConflict;
   }
   return { ok: false, applied: false };
@@ -988,20 +1355,30 @@ function flush(bookId: number, useBeacon = false): void {
     timers.delete(bookId);
   }
   // S4: deletion tombstone — drop locally without sending.
-  if (isOpSupersededByDeletion({ userId: op.userId, libraryId: op.libraryId, bookId: op.bookId, format: op.data.format, ts: op.ts })) {
+  if (
+    isOpSupersededByDeletion({
+      userId: op.userId,
+      libraryId: op.libraryId,
+      bookId: op.bookId,
+      format: op.data.format,
+      ts: op.ts,
+    })
+  ) {
     pending.delete(bookId);
     writeOutbox(readOutbox().filter((e) => e.mutationId !== op.mutationId));
     return;
   }
   // R3: capture generation at flush start; the completion callback aborts if
   // it changed (account switch) instead of enqueueing under a new principal.
+  // T2: beacon payload carries explicit 0 when no known revision.
   const generationAtStart = outboxGeneration;
   const url = `/api/user/progress/${bookId}`;
   const payload = JSON.stringify({
     ...op.data,
     mutationId: op.mutationId,
     clientTs: op.ts,
-    baseRevision: op.baseRevision,
+    baseRevision: op.baseRevision ?? 0,
+    baseDeletionSeq: op.baseDeletionSeq ?? null,
     expectedUserId: op.userId,
     expectedLibraryId: op.libraryId,
   });
@@ -1060,6 +1437,13 @@ function flush(bookId: number, useBeacon = false): void {
 // SYNCHRONOUSLY at creation (before the debounce timer), then the flush is
 // scheduled. R3: captures {userId, libraryId, mutationId, ts, baseRevision}
 // into the pending entry immediately (not at enqueue-after-failure).
+// T2 null-base = expected revision 0: a first write with no known server_seq
+// sends baseRevision 0 explicitly (not null). baseRevision null is legacy
+// unconditional blind write only, deprecated.
+// T3: on every new save, older unsent outbox entries for the same
+// user:library:book:format are dropped by exact mutationId (in-memory
+// pending for the same bookId is overwritten by the Map set below, so the
+// debounce still sends only the latest entry).
 export function saveBookProgress(bookId: number, data: PendingSave): void {
   const libraryId = getLibraryScopeId();
   const userId = lastKnownUserId;
@@ -1071,15 +1455,20 @@ export function saveBookProgress(bookId: number, data: PendingSave): void {
     userId,
     libraryId,
     ts: Date.now(),
-    baseRevision: getKnownServerSeq(userId, libraryId, bookId, format),
+    baseRevision: getKnownServerSeq(userId, libraryId, bookId, format) ?? 0,
+    baseDeletionSeq: getKnownDeletionSeq(userId, libraryId, bookId, format),
   };
   pending.set(bookId, op);
+  // T3 coalesce: drop older same-identity unsent ops before enqueueing the
+  // newest, so the durable queue never replays page10/20 after page30.
+  coalesceOutboxForIdentity(userId, libraryId, bookId, format, op.mutationId);
   enqueueProgressOutbox(bookId, op.data, {
     mutationId: op.mutationId,
     userId: op.userId,
     libraryId: op.libraryId,
     ts: op.ts,
     baseRevision: op.baseRevision,
+    baseDeletionSeq: op.baseDeletionSeq,
   });
   const existing = timers.get(bookId);
   if (existing) clearTimeout(existing);
@@ -1148,6 +1537,17 @@ export function useRemoveFromReadingList() {
       // resolves, so a concurrent flush cannot resurrect with a stale op.
       // Ops created after this instant (ts >= deletedAt) may still resurrect
       // the row — that is the documented last-writer-wins policy.
+      // T5 optimistic rollback: snapshot the purged outbox entries, the
+      // in-memory pending op, and the tombstone map so onError can restore
+      // exactly what was removed (and drop the tombstone we just wrote).
+      const prevOutbox = readOutbox();
+      const prevPending = pending.get(bookId);
+      let prevTombstones: TombstoneMap | null = null;
+      try {
+        prevTombstones = readTombstones();
+      } catch {
+        prevTombstones = null;
+      }
       try {
         recordProgressDeletion(lastKnownUserId, getLibraryScopeId(), bookId);
       } catch {}
@@ -1156,10 +1556,23 @@ export function useRemoveFromReadingList() {
           items: prev.items.filter((i) => i.book.id !== bookId),
         });
       }
-      return { prev };
+      return { prev, prevOutbox, prevPending, prevTombstones };
     },
     onError: (_e, _id, ctx) => {
       if (ctx?.prev) qc.setQueryData(["reading-list"], ctx.prev);
+      try {
+        if (ctx?.prevOutbox) writeOutbox(ctx.prevOutbox);
+        if (ctx?.prevTombstones) writeTombstones(ctx.prevTombstones);
+        if (ctx?.prevPending) {
+          pending.set(_id, ctx.prevPending);
+          if (!timers.has(_id)) {
+            timers.set(
+              _id,
+              setTimeout(() => flush(_id), SAVE_DEBOUNCE_MS),
+            );
+          }
+        }
+      } catch {}
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ["reading-list"] });
@@ -1170,20 +1583,45 @@ export function useRemoveFromReadingList() {
 export function useClearReadingList() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: () =>
-      fetchJson<{ removed: number }>("/api/user/reading", { method: "DELETE" }),
+    mutationFn: () => fetchJson<{ removed: number }>("/api/user/reading", { method: "DELETE" }),
     onMutate: async () => {
       await qc.cancelQueries({ queryKey: ["reading-list"] });
       const prev = qc.getQueryData<{ items: ReadingListItem[] }>(["reading-list"]);
       // S4: library-level tombstone; same resurrection policy as above.
+      // T5 optimistic rollback: snapshot outbox + pending + tombstones.
+      const prevOutbox = readOutbox();
+      const prevPending = new Map(pending);
+      let prevTombstones: TombstoneMap | null = null;
+      try {
+        prevTombstones = readTombstones();
+      } catch {
+        prevTombstones = null;
+      }
       try {
         recordReadingListClear(lastKnownUserId, getLibraryScopeId());
       } catch {}
       qc.setQueryData(["reading-list"], { items: [] });
-      return { prev };
+      return { prev, prevOutbox, prevPending, prevTombstones };
     },
     onError: (_e, _v, ctx) => {
       if (ctx?.prev) qc.setQueryData(["reading-list"], ctx.prev);
+      try {
+        if (ctx?.prevOutbox) writeOutbox(ctx.prevOutbox);
+        if (ctx?.prevTombstones) writeTombstones(ctx.prevTombstones);
+        if (ctx?.prevPending) {
+          for (const [id, op] of ctx.prevPending) {
+            if (!pending.has(id)) {
+              pending.set(id, op);
+              if (!timers.has(id)) {
+                timers.set(
+                  id,
+                  setTimeout(() => flush(id), SAVE_DEBOUNCE_MS),
+                );
+              }
+            }
+          }
+        }
+      } catch {}
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ["reading-list"] });

@@ -1,7 +1,16 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import * as pdfjsLib from "pdfjs-dist";
-import { ZoomIn, ZoomOut, ChevronLeft, ChevronRight, Maximize, Minimize } from "lucide-react";
+import {
+  ZoomIn,
+  ZoomOut,
+  ChevronLeft,
+  ChevronRight,
+  Maximize,
+  Minimize,
+  Expand,
+  MoveHorizontal,
+} from "lucide-react";
 import {
   ReaderErrorPanel,
   ReaderFooterShell,
@@ -15,12 +24,15 @@ import {
 import { stored } from "@/lib/utils";
 import { useReaderSettings } from "@/lib/reader-settings";
 import { useFullscreen } from "@/lib/use-fullscreen";
-import { flushBookProgress, fetchBookProgress, saveBookProgress, progressPosKey, readScopedPos, getLibraryScopeId } from "@/lib/reading-progress";
 import {
-  getNextReaderLoadMode,
-  prefetchOrder,
-  type ReaderLoadMode,
-} from "./reader-types";
+  flushBookProgress,
+  fetchBookProgress,
+  saveBookProgress,
+  progressPosKey,
+  readScopedPos,
+  getLibraryScopeId,
+} from "@/lib/reading-progress";
+import { getNextReaderLoadMode, prefetchOrder, type ReaderLoadMode } from "./reader-types";
 
 // Drop PDF.js's cached page operator lists this often (in page turns). Visiting
 // a page caches its parsed content; without periodic cleanup a long read grows
@@ -33,6 +45,9 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdfjs/pdf.worker.min.mjs?v=4.10.38";
 // Cap on waiting for the initial server-progress restore; a stalled request
 // must not keep suppressing server saves for the whole session.
 const RESTORE_TIMEOUT_MS = 5000;
+
+// True print size: PDF points are 1/72in, CSS px are 1/96in.
+const ACTUAL_SIZE_SCALE = 96 / 72;
 
 interface PdfReaderProps {
   url: string;
@@ -100,19 +115,79 @@ export function PdfReader({
   const visitsRef = useRef(0);
 
   const settings = useReaderSettings();
-  const { isFullscreen, supported: fullscreenSupported, toggle: toggleFullscreen } = useFullscreen();
+  const {
+    isFullscreen,
+    supported: fullscreenSupported,
+    toggle: toggleFullscreen,
+  } = useFullscreen();
 
   const posKey = progressPosKey(bookId, "pdf");
   const zoomKey = `caliber-zoom-${getLibraryScopeId()}-${bookId}-pdf`;
 
+  // Zoom modes: "width" fits the page width (default, historic behavior),
+  // "page" fits the whole page into the visible area (fit to screen),
+  // "actual" renders at true print size (1pt = 1/72in at 96 CSS dpi),
+  // "custom" is a manual multiplier on top of fit-width via +/- buttons.
+  type PdfFitMode = "width" | "page" | "actual" | "custom";
+
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loadMode, setLoadMode] = useState<ReaderLoadMode>(initialLoadMode);
-  const [currentPage, setCurrentPage] = useState(() => readScopedPos<{ page: number }>(bookId, "pdf", { page: 1 }).page as number);
+  const [currentPage, setCurrentPage] = useState(
+    () => readScopedPos<{ page: number }>(bookId, "pdf", { page: 1 }).page as number,
+  );
   const [totalPages, setTotalPages] = useState(0);
   const [showUI, setShowUI] = useState(true);
-  const [zoom, setZoom] = useState(() => stored(zoomKey, { zoom: 1 }).zoom as number);
+  const [zoom, setZoom] = useState(() => {
+    const saved = stored(zoomKey, { zoom: 1 }) as { zoom?: number; fitMode?: PdfFitMode };
+    const z = Number(saved.zoom);
+    return Number.isFinite(z) ? Math.min(3, Math.max(0.5, z)) : 1;
+  });
+  const [fitMode, setFitMode] = useState<PdfFitMode>(() => {
+    const saved = stored(zoomKey, {}) as { fitMode?: PdfFitMode };
+    return saved.fitMode === "page" || saved.fitMode === "actual" || saved.fitMode === "custom"
+      ? saved.fitMode
+      : "width";
+  });
+  const [zoomMenuOpen, setZoomMenuOpen] = useState(false);
   const [containerWidth, setContainerWidth] = useState(0);
+  const [containerHeight, setContainerHeight] = useState(0);
+  // Last rendered page size in PDF points; lets +/- zoom start from the
+  // current fit-page/actual-size scale instead of jumping back to fit-width.
+  const pageDimsRef = useRef<{ w: number; h: number } | null>(null);
+  // Manual zoom always drops into "custom" so the mode label stays truthful.
+  // Stepping from a fit mode starts at that mode's effective scale so the
+  // first tap doesn't jump back to fit-width.
+  const adjustZoom = useCallback(
+    (delta: number) => {
+      let start = zoom;
+      const container = containerRef.current;
+      const dims = pageDimsRef.current;
+      if (fitMode !== "custom" && container && dims && container.clientWidth > 0) {
+        const fitWidthScale = container.clientWidth / dims.w;
+        if (fitWidthScale > 0) {
+          const currentAbs =
+            fitMode === "actual"
+              ? ACTUAL_SIZE_SCALE
+              : Math.min(
+                  container.clientWidth / dims.w,
+                  (container.clientHeight || container.clientWidth) / dims.h,
+                );
+          if (Number.isFinite(currentAbs)) start = currentAbs / fitWidthScale;
+        }
+      }
+      setZoom(Math.min(3, Math.max(0.5, start + delta)));
+      setFitMode("custom");
+    },
+    [fitMode, zoom],
+  );
+  const applyFitMode = useCallback((mode: PdfFitMode) => {
+    setFitMode(mode);
+    setZoomMenuOpen(false);
+  }, []);
+  // Tap-to-turn zones only make sense when the page is not manually zoomed
+  // (fit modes keep them enabled so phones can still page through).
+  const isZoomed = fitMode === "custom" && zoom !== 1;
   const [, setRendering] = useState(false);
 
   const goToPdfDestination = useCallback(async (dest: unknown) => {
@@ -183,11 +258,15 @@ export function PdfReader({
     return () => {
       flushBookProgress(bookId);
       if (renderTaskRef.current) {
-        try { renderTaskRef.current.cancel(); } catch {}
+        try {
+          renderTaskRef.current.cancel();
+        } catch {}
         renderTaskRef.current = null;
       }
       if (pdfRef.current) {
-        try { pdfRef.current.destroy(); } catch {}
+        try {
+          pdfRef.current.destroy();
+        } catch {}
         pdfRef.current = null;
       }
     };
@@ -205,10 +284,12 @@ export function PdfReader({
       rafId = requestAnimationFrame(() => {
         rafId = null;
         setContainerWidth(entry.contentRect.width);
+        setContainerHeight(entry.contentRect.height);
       });
     });
     observer.observe(container);
     setContainerWidth(container.clientWidth);
+    setContainerHeight(container.clientHeight);
     return () => {
       if (rafId !== null) cancelAnimationFrame(rafId);
       observer.disconnect();
@@ -264,7 +345,7 @@ export function PdfReader({
   // Touch handling
   const onTouchStart = useCallback(
     (e: React.TouchEvent) => {
-      if (zoom !== 1 || isInteractiveTarget(e.target)) {
+      if (isZoomed || isInteractiveTarget(e.target)) {
         touchRef.current = null;
         return;
       }
@@ -277,12 +358,12 @@ export function PdfReader({
         t: Date.now(),
       };
     },
-    [zoom],
+    [isZoomed],
   );
 
   const onTouchEnd = useCallback(
     (e: React.TouchEvent) => {
-      if (zoom !== 1 || isInteractiveTarget(e.target)) {
+      if (isZoomed || isInteractiveTarget(e.target)) {
         touchRef.current = null;
         return;
       }
@@ -315,12 +396,12 @@ export function PdfReader({
         else toggleUI();
       }
     },
-    [goPrev, goNext, toggleUI, zoom],
+    [goPrev, goNext, toggleUI, isZoomed],
   );
 
   const onClick = useCallback(
     (e: React.MouseEvent) => {
-      if (zoom !== 1 || isInteractiveTarget(e.target)) return;
+      if (isZoomed || isInteractiveTarget(e.target)) return;
       // Ignore the click synthesized from a touch we already handled
       if (Date.now() - lastTouchEndRef.current < 700) return;
 
@@ -329,12 +410,15 @@ export function PdfReader({
       else if (e.clientX > w * 0.7) goNext();
       else toggleUI();
     },
-    [goPrev, goNext, toggleUI, zoom],
+    [goPrev, goNext, toggleUI, isZoomed],
   );
 
-  const onReaderKeyUp = useCallback((e: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (e.key === "Enter") toggleUI();
-  }, [toggleUI]);
+  const onReaderKeyUp = useCallback(
+    (e: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (e.key === "Enter") toggleUI();
+    },
+    [toggleUI],
+  );
 
   // Load PDF document. Stream mode lets PDF.js request byte ranges; full mode fetches once.
   useEffect(() => {
@@ -348,7 +432,9 @@ export function PdfReader({
       setTotalPages(0);
 
       if (renderTaskRef.current) {
-        try { renderTaskRef.current.cancel(); } catch {}
+        try {
+          renderTaskRef.current.cancel();
+        } catch {}
         renderTaskRef.current = null;
       }
 
@@ -464,89 +550,107 @@ export function PdfReader({
     void pdf
       .getPage(requestedPage)
       .then(async (page) => {
-      if (renderTokenRef.current !== token) return;
+        if (renderTokenRef.current !== token) return;
 
-      const unscaledViewport = page.getViewport({ scale: 1 });
-      const fitScale = effectiveWidth / unscaledViewport.width;
-      const viewport = page.getViewport({ scale: fitScale * zoom });
-      // Cap the pixel ratio so Retina pages don't allocate 2-3x oversized canvas
-      // backing stores — the main driver of Safari's per-tab memory crashes.
-      const deviceDpr = window.devicePixelRatio || 1;
-      const dpr =
-        settings.maxRenderScale > 0 ? Math.min(deviceDpr, settings.maxRenderScale) : deviceDpr;
+        const unscaledViewport = page.getViewport({ scale: 1 });
+        pageDimsRef.current = {
+          w: unscaledViewport.width,
+          h: unscaledViewport.height,
+        };
+        const fitWidthScale = effectiveWidth / unscaledViewport.width;
+        let scale: number;
+        if (fitMode === "actual") {
+          scale = ACTUAL_SIZE_SCALE;
+        } else if (fitMode === "page") {
+          const effectiveHeight = containerHeight > 0 ? containerHeight : container.clientHeight;
+          scale = Math.min(
+            effectiveWidth / unscaledViewport.width,
+            effectiveHeight / unscaledViewport.height,
+          );
+        } else {
+          // "width" and "custom" both build on fit-width; custom adds the
+          // manual +/- multiplier.
+          scale = fitWidthScale * (fitMode === "custom" ? zoom : 1);
+        }
+        const viewport = page.getViewport({ scale });
+        // Cap the pixel ratio so Retina pages don't allocate 2-3x oversized canvas
+        // backing stores — the main driver of Safari's per-tab memory crashes.
+        const deviceDpr = window.devicePixelRatio || 1;
+        const dpr =
+          settings.maxRenderScale > 0 ? Math.min(deviceDpr, settings.maxRenderScale) : deviceDpr;
 
-      // Double-buffer: render offscreen, then blit to the visible canvas in one
-      // step so the previous page stays on screen until the new one is ready.
-      const offscreen = document.createElement("canvas");
-      offscreen.width = viewport.width * dpr;
-      offscreen.height = viewport.height * dpr;
-      const offCtx = offscreen.getContext("2d");
-      if (!offCtx) return;
+        // Double-buffer: render offscreen, then blit to the visible canvas in one
+        // step so the previous page stays on screen until the new one is ready.
+        const offscreen = document.createElement("canvas");
+        offscreen.width = viewport.width * dpr;
+        offscreen.height = viewport.height * dpr;
+        const offCtx = offscreen.getContext("2d");
+        if (!offCtx) return;
 
-      const renderTask = page.render({
-        canvasContext: offCtx,
-        viewport,
-        transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
-      });
-      renderTaskRef.current = renderTask;
+        const renderTask = page.render({
+          canvasContext: offCtx,
+          viewport,
+          transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
+        });
+        renderTaskRef.current = renderTask;
 
-      renderTask.promise
-        .then(() => {
-          if (renderTokenRef.current !== token) return;
-          canvas.width = offscreen.width;
-          canvas.height = offscreen.height;
-          canvas.style.width = `${viewport.width}px`;
-          canvas.style.height = `${viewport.height}px`;
-          pageLayer.style.width = `${viewport.width}px`;
-          pageLayer.style.height = `${viewport.height}px`;
-          annotationLayer.style.setProperty("--scale-factor", String(viewport.scale));
-          canvas.getContext("2d")?.drawImage(offscreen, 0, 0);
-          // F06: release the offscreen backing store in a finally-equivalent
-          // path — both success and cancellation free the canvas.
-          offscreen.width = 0;
-          offscreen.height = 0;
-          // FUP4: checkpoint ONLY on successful swap with the latest-token
-          // guard. This is the sole writer of displayedPage.
-          displayedPageRef.current = requestedPage;
-          setDisplayedPage(requestedPage);
-          setRendering(false);
-        })
-        .catch(() => {
-          // Release even on cancellation/failure.
-          try {
+        renderTask.promise
+          .then(() => {
+            if (renderTokenRef.current !== token) return;
+            canvas.width = offscreen.width;
+            canvas.height = offscreen.height;
+            canvas.style.width = `${viewport.width}px`;
+            canvas.style.height = `${viewport.height}px`;
+            pageLayer.style.width = `${viewport.width}px`;
+            pageLayer.style.height = `${viewport.height}px`;
+            annotationLayer.style.setProperty("--scale-factor", String(viewport.scale));
+            canvas.getContext("2d")?.drawImage(offscreen, 0, 0);
+            // F06: release the offscreen backing store in a finally-equivalent
+            // path — both success and cancellation free the canvas.
             offscreen.width = 0;
             offscreen.height = 0;
-          } catch {}
-        }); // Ignore cancellation
+            // FUP4: checkpoint ONLY on successful swap with the latest-token
+            // guard. This is the sole writer of displayedPage.
+            displayedPageRef.current = requestedPage;
+            setDisplayedPage(requestedPage);
+            setRendering(false);
+          })
+          .catch(() => {
+            // Release even on cancellation/failure.
+            try {
+              offscreen.width = 0;
+              offscreen.height = 0;
+            } catch {}
+          }); // Ignore cancellation
 
-      try {
-        // Wait for the canvas swap so the layer renders against the new
-        // viewport/scale-factor, not the previous page's
-        await renderTask.promise;
-        const annotations = await page.getAnnotations({ intent: "display" });
-        if (renderTokenRef.current !== token) return;
-        annotationLayer.innerHTML = "";
+        try {
+          // Wait for the canvas swap so the layer renders against the new
+          // viewport/scale-factor, not the previous page's
+          await renderTask.promise;
+          const annotations = await page.getAnnotations({ intent: "display" });
+          if (renderTokenRef.current !== token) return;
+          annotationLayer.innerHTML = "";
 
-        const layer = new pdfjsLib.AnnotationLayer({
-          div: annotationLayer,
-          accessibilityManager: null,
-          annotationCanvasMap: null,
-          annotationEditorUIManager: null,
-          page,
-          viewport,
-          structTreeLayer: null,
-        });
-        await layer.render({
-          viewport,
-          div: annotationLayer,
-          annotations,
-          page,
-          linkService: pdfLinkService as never,
-          renderForms: false,
-        });
-      } catch {
-        annotationLayer.innerHTML = "";
-      }
+          const layer = new pdfjsLib.AnnotationLayer({
+            div: annotationLayer,
+            accessibilityManager: null,
+            annotationCanvasMap: null,
+            annotationEditorUIManager: null,
+            page,
+            viewport,
+            structTreeLayer: null,
+          });
+          await layer.render({
+            viewport,
+            div: annotationLayer,
+            annotations,
+            page,
+            linkService: pdfLinkService as never,
+            renderForms: false,
+          });
+        } catch {
+          annotationLayer.innerHTML = "";
+        }
       })
       .catch(() => {});
 
@@ -555,13 +659,15 @@ export function PdfReader({
     // canvas swap.
     // Save zoom
     try {
-      localStorage.setItem(zoomKey, JSON.stringify({ zoom, ts: Date.now() }));
+      localStorage.setItem(zoomKey, JSON.stringify({ zoom, fitMode, ts: Date.now() }));
     } catch {}
   }, [
     currentPage,
     isLoading,
     zoom,
+    fitMode,
     containerWidth,
+    containerHeight,
     zoomKey,
     pdfLinkService,
     settings.maxRenderScale,
@@ -749,19 +855,84 @@ export function PdfReader({
         </button>
         <button
           type="button"
-          onClick={() => setZoom((z) => Math.max(0.5, z - 0.25))}
+          onClick={() => adjustZoom(-0.25)}
           aria-label="Zoom out"
           title="Zoom out"
           className="p-2 rounded-lg text-white active:opacity-60"
         >
           <ZoomOut className="h-5 w-5" />
         </button>
-        <span className="text-xs text-white/60 w-10 text-center tabular-nums">
-          {Math.round(zoom * 100)}%
-        </span>
+        <div className="relative">
+          <button
+            type="button"
+            onClick={() => setZoomMenuOpen((v) => !v)}
+            aria-label="Reading size options"
+            aria-haspopup="menu"
+            aria-expanded={zoomMenuOpen}
+            title="Reading size: fit width, fit screen, or actual size"
+            className="text-xs text-white/60 w-10 text-center tabular-nums rounded py-1 active:opacity-60"
+          >
+            {fitMode === "width"
+              ? "Fit"
+              : fitMode === "page"
+                ? "Page"
+                : fitMode === "actual"
+                  ? "100%"
+                  : `${Math.round(zoom * 100)}%`}
+          </button>
+          {zoomMenuOpen && (
+            <>
+              <button
+                type="button"
+                aria-label="Close reading size options"
+                className="fixed inset-0 z-[118] cursor-default bg-transparent border-none p-0 m-0"
+                onClick={() => setZoomMenuOpen(false)}
+              />
+              <div
+                role="menu"
+                aria-label="Reading size"
+                className="absolute right-0 top-full z-[119] mt-1 w-44 overflow-hidden rounded-lg border border-white/10 bg-neutral-900 shadow-xl"
+              >
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={fitMode === "width"}
+                  onClick={() => applyFitMode("width")}
+                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-white/80 active:bg-white/10"
+                  title="Fit page width"
+                >
+                  <MoveHorizontal className="h-4 w-4 shrink-0" />
+                  Fit width{fitMode === "width" ? " ✓" : ""}
+                </button>
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={fitMode === "page"}
+                  onClick={() => applyFitMode("page")}
+                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-white/80 active:bg-white/10"
+                  title="Fit whole page on screen"
+                >
+                  <Expand className="h-4 w-4 shrink-0" />
+                  Fit screen{fitMode === "page" ? " ✓" : ""}
+                </button>
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={fitMode === "actual"}
+                  onClick={() => applyFitMode("actual")}
+                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-white/80 active:bg-white/10"
+                  title="True print size"
+                >
+                  <span className="w-4 shrink-0 text-center text-[10px] tabular-nums">1:1</span>
+                  Actual size{fitMode === "actual" ? " ✓" : ""}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
         <button
           type="button"
-          onClick={() => setZoom((z) => Math.min(3, z + 0.25))}
+          onClick={() => adjustZoom(0.25)}
           aria-label="Zoom in"
           title="Zoom in"
           className="p-2 -mr-1 rounded-lg text-white active:opacity-60"

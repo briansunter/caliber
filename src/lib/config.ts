@@ -1,5 +1,13 @@
 import { basename, dirname, join, resolve } from "node:path";
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { Database } from "bun:sqlite";
 
@@ -186,16 +194,12 @@ const config = loadConfig();
 // Environment variables override the optional config file. CALIBRE_* matches
 // Calibre's spelling; CALIBER_* is accepted for app-specific settings and as a
 // convenient alias for the library path.
-const libraryPath =
-  expandUserPath(
-    process.env.CALIBRE_LIBRARY_PATH ||
-      process.env.CALIBER_LIBRARY_PATH ||
-      readString(config.libraryPath, DEFAULTS.libraryPath),
-  );
-const dbName = sanitizeDbName(
-  process.env.CALIBRE_DB_NAME || config.dbName,
-  DEFAULTS.dbName,
+const libraryPath = expandUserPath(
+  process.env.CALIBRE_LIBRARY_PATH ||
+    process.env.CALIBER_LIBRARY_PATH ||
+    readString(config.libraryPath, DEFAULTS.libraryPath),
 );
+const dbName = sanitizeDbName(process.env.CALIBRE_DB_NAME || config.dbName, DEFAULTS.dbName);
 
 export let LIBRARY_PATH = libraryPath;
 export let DB_NAME = dbName;
@@ -262,6 +266,7 @@ export const CONFIG_DIR_PATH = CONFIG_DIR;
 export const CONFIG_FILE_PATH = CONFIG_PATH;
 
 export interface LibraryConfigStatus {
+  libraryId: string;
   libraryPath: string;
   dbName: string;
   databasePath: string;
@@ -277,19 +282,27 @@ function databasePathFor(libraryPath: string, dbName: string): string {
   return join(resolve(expandUserPath(libraryPath)), dbName);
 }
 
+// Canonical library identity shared with progress scoping (resolveLibraryId
+// in index.ts delegates here): CALIBER_LIBRARY_ID override or lib-<hash> of
+// the effective library path. libraryPath stays as display/config only.
+export function getCanonicalLibraryId(): string {
+  const override = process.env.CALIBER_LIBRARY_ID?.trim();
+  if (override) return override.slice(0, 200);
+  return `lib-${Bun.hash(LIBRARY_PATH).toString(36)}`;
+}
+
 export function getLibraryConfigStatus(): LibraryConfigStatus {
   const configuredLibraryPath = readString(config.libraryPath, DEFAULTS.libraryPath);
   const configuredDbName = sanitizeDbName(config.dbName, DEFAULTS.dbName);
   return {
+    libraryId: getCanonicalLibraryId(),
     libraryPath: LIBRARY_PATH,
     dbName: DB_NAME,
     databasePath: databasePathFor(LIBRARY_PATH, DB_NAME),
     configuredDatabasePath: databasePathFor(configuredLibraryPath, configuredDbName),
     defaultDatabasePath: databasePathFor(DEFAULTS.libraryPath, DEFAULTS.dbName),
     databaseExists: existsSync(databasePathFor(LIBRARY_PATH, DB_NAME)),
-    configuredDatabaseExists: existsSync(
-      databasePathFor(configuredLibraryPath, configuredDbName),
-    ),
+    configuredDatabaseExists: existsSync(databasePathFor(configuredLibraryPath, configuredDbName)),
     environmentOverride: Boolean(
       process.env.CALIBRE_LIBRARY_PATH ||
         process.env.CALIBER_LIBRARY_PATH ||
@@ -364,10 +377,7 @@ export function saveLibraryConfig(selection: {
 
   mkdirSync(CONFIG_DIR, { recursive: true });
   const temporaryPath = `${CONFIG_PATH}.tmp-${process.pid}`;
-  writeFileSync(
-    temporaryPath,
-    `${JSON.stringify({ ...config, libraryPath, dbName }, null, 2)}\n`,
-  );
+  writeFileSync(temporaryPath, `${JSON.stringify({ ...config, libraryPath, dbName }, null, 2)}\n`);
   replaceFile(temporaryPath, CONFIG_PATH);
   config.libraryPath = libraryPath;
   config.dbName = dbName;

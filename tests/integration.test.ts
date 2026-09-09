@@ -538,6 +538,13 @@ async function fetchText(path: string) {
 }
 
 beforeAll(async () => {
+  // Runtime probe: the resize path depends on the exact Bun executable, so
+  // log version + execPath in the TEST process (the spawned server logs the
+  // same pair at startup; waitForServer dumps those lines on failure).
+  console.log(
+    `[thumb-test] test runtime: Bun ${Bun.version} exec=${process.execPath} argv0=${process.argv0} ` +
+      `Image=${typeof (Bun as { Image?: unknown }).Image} file.image=${typeof (Bun.file("") as { image?: unknown }).image}`,
+  );
   tempDir = mkdtempSync(join(tmpdir(), "caliber-integration-"));
   libraryPath = join(tempDir, "library");
   homePath = join(tempDir, "home");
@@ -546,7 +553,11 @@ beforeAll(async () => {
 
   const port = await freePort();
   baseUrl = `http://localhost:${port}`;
-  serverProcess = Bun.spawn(["bun", "src/index.ts"], {
+  // Spawn via process.execPath (not bare "bun") so the server under test is
+  // byte-for-byte the same executable as this test process — PATH-resolved
+  // "bun" can drift (e.g. pinned 1.2.x vs local 1.4.x) and silently change
+  // whether Bun.Image exists.
+  serverProcess = Bun.spawn([process.execPath, "src/index.ts"], {
     cwd: process.cwd(),
     env: childEnv({
       HOME: homePath,
@@ -804,7 +815,7 @@ describe("format variant fixtures", () => {
     expect(thumb.headers.get("content-type")).toContain("image/jpeg");
     const degraded = thumb.headers.get("x-thumbnail-degraded");
     console.log(
-      `[thumb-test] resize path: status=${thumb.status} degraded=${degraded} (Bun ${Bun.version})`,
+      `[thumb-test] resize path: status=${thumb.status} degraded=${degraded} (Bun ${Bun.version} exec=${process.execPath})`,
     );
     // Require a real resize: the degraded fallback must NOT be present here.
     // Availability is covered by the degraded-path test below.
@@ -826,13 +837,13 @@ describe("format variant fixtures", () => {
     if (typeof ImageCtor === "function") {
       const metadata = await new ImageCtor(thumbBytes).metadata();
       console.log(
-        `[thumb-test] resize path decoded: width=${metadata.width} format=${metadata.format} (Bun ${Bun.version})`,
+        `[thumb-test] resize path decoded: width=${metadata.width} format=${metadata.format} (Bun ${Bun.version} exec=${process.execPath})`,
       );
       expect(metadata.width).toBeLessThanOrEqual(256);
       expect(metadata.format).toBe("jpeg");
     } else {
       console.log(
-        `[thumb-test] resize path: Bun.Image absent, skipping decode (Bun ${Bun.version})`,
+        `[thumb-test] resize path: Bun.Image absent, skipping decode (Bun ${Bun.version} exec=${process.execPath})`,
       );
     }
   });
@@ -841,7 +852,7 @@ describe("format variant fixtures", () => {
     const port = await freePort();
     const degradedBaseUrl = `http://localhost:${port}`;
     const degradedConfigDir = join(homePath, ".config", "caliber-degraded");
-    const proc = Bun.spawn(["bun", "src/index.ts"], {
+    const proc = Bun.spawn([process.execPath, "src/index.ts"], {
       cwd: process.cwd(),
       env: childEnv({
         HOME: homePath,
@@ -879,7 +890,7 @@ describe("format variant fixtures", () => {
       expect(thumb.headers.get("content-type")).toContain("image/jpeg");
       const degraded = thumb.headers.get("x-thumbnail-degraded");
       console.log(
-        `[thumb-test] degraded path: status=${thumb.status} degraded=${degraded} (Bun ${Bun.version})`,
+        `[thumb-test] degraded path: status=${thumb.status} degraded=${degraded} (Bun ${Bun.version} exec=${process.execPath})`,
       );
       expect(degraded).toBe("resize-unavailable");
       const thumbBytes = new Uint8Array(await thumb.arrayBuffer());

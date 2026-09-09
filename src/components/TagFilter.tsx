@@ -70,7 +70,9 @@ export const TagFilter = memo(function TagFilter({
   const RENDER_CAP = 300;
   const isFiltering = filter.trim().length > 0;
   const visibleTags =
-    !isFiltering && filteredTags.length > RENDER_CAP ? filteredTags.slice(0, RENDER_CAP) : filteredTags;
+    !isFiltering && filteredTags.length > RENDER_CAP
+      ? filteredTags.slice(0, RENDER_CAP)
+      : filteredTags;
   const hiddenCount = filteredTags.length - visibleTags.length;
 
   const toggle = (id: number) => {
@@ -233,9 +235,7 @@ export const TagFilter = memo(function TagFilter({
                               : "bg-surface text-ink-secondary border-ink hover:border-accent hover:text-ink",
                           )}
                         >
-                          {selected ? (
-                            <Check className="h-3.5 w-3.5" strokeWidth={2.5} />
-                          ) : null}
+                          {selected ? <Check className="h-3.5 w-3.5" strokeWidth={2.5} /> : null}
                           <span className="truncate max-w-[180px]">{tag.name}</span>
                           <span
                             className={cn(
@@ -252,7 +252,8 @@ export const TagFilter = memo(function TagFilter({
                   {hiddenCount > 0 && (
                     <p className="mt-3 text-xs text-ink-tertiary">
                       Showing the {visibleTags.length} most-used tags.{" "}
-                      {hiddenCount.toLocaleString()} more hidden — use the search box above to find them.
+                      {hiddenCount.toLocaleString()} more hidden — use the search box above to find
+                      them.
                     </p>
                   )}
                 </>

@@ -66,9 +66,24 @@ export const BookGridInfinite = memo(function BookGridInfinite({
   onClearFilters,
 }: BookGridInfiniteProps) {
   const {
-    books, totalCount, retainedCount, windowTruncated, hasNextPage, fetchNextPage,
-    isFetchingNextPage, isFetchNextPageError, isLoading, isError, error, errorStage,
-    isPlaceholder, emptyReason, isAuthExpired, isOffline, refetch, queryKey,
+    books,
+    totalCount,
+    retainedCount,
+    windowTruncated,
+    hasNextPage,
+    fetchNextPage,
+    isFetchingNextPage,
+    isFetchNextPageError,
+    isLoading,
+    isError,
+    error,
+    errorStage,
+    isPlaceholder,
+    emptyReason,
+    isAuthExpired,
+    isOffline,
+    refetch,
+    queryKey,
   } = useFlattenedBooks(searchQuery, sortConfig, tagIds);
   const queryClient = useQueryClient();
 
@@ -80,7 +95,10 @@ export const BookGridInfinite = memo(function BookGridInfinite({
     return Math.min(window.innerWidth - 48, 1280 - 48);
   });
   const [columns, setColumns] = useState(() => {
-    const available = Math.min(typeof window === "undefined" ? 1232 : window.innerWidth - 48, 1280 - 48);
+    const available = Math.min(
+      typeof window === "undefined" ? 1232 : window.innerWidth - 48,
+      1280 - 48,
+    );
     return Math.max(2, Math.floor((available + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP)));
   });
   const [cardHeight, setCardHeight] = useState(320);
@@ -88,7 +106,15 @@ export const BookGridInfinite = memo(function BookGridInfinite({
   // S7: REAL scrollMargin measurement. The callback ref (setContainerEl)
   // captures the list container; its document-relative origin (viewport top
   // + scroll offset, which is scroll-invariant) is measured at mount and
-  // re-measured on resize via ResizeObserver (+ a window resize fallback).
+  // re-measured whenever the origin can move:
+  // - ResizeObserver on the list container itself,
+  // - ResizeObserver on document.body (a sticky shelf/header above the list
+  //   resizing shifts the list origin without resizing the list),
+  // - window resize fallback,
+  // - MutationObserver on document.body (header/shelf DOM moves — filter row
+  //   mount, shelf expand — that shift the origin without a resize event),
+  // - explicit re-measure when books/columns/cardHeight change (the second
+  //   effect below).
   // The measured value is passed to the virtualizer as scrollMargin, which
   // the React adapter picks up dynamically on re-render — no constant
   // assertion.
@@ -105,13 +131,39 @@ export const BookGridInfinite = memo(function BookGridInfinite({
     if (typeof ResizeObserver !== "undefined") {
       ro = new ResizeObserver(measureOrigin);
       ro.observe(el);
+      try {
+        ro.observe(document.body);
+      } catch {}
     }
     window.addEventListener("resize", measureOrigin);
+    let mo: MutationObserver | null = null;
+    if (typeof MutationObserver !== "undefined") {
+      mo = new MutationObserver(measureOrigin);
+      try {
+        mo.observe(document.body, { childList: true, subtree: true, attributes: true });
+      } catch {}
+    }
     return () => {
       ro?.disconnect();
+      mo?.disconnect();
       window.removeEventListener("resize", measureOrigin);
     };
   }, [containerEl]);
+
+  // Re-measure the list origin when content above/around the list changes
+  // size (books appended, columns re-flowed, shelf/header state changed).
+  // The observer effect above owns the listeners; this just re-runs the same
+  // scroll-invariant origin math on state transitions the observers might
+  // miss.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional re-measure on content transitions observers may miss.
+  useEffect(() => {
+    if (!containerEl) return;
+    const origin = Math.max(
+      0,
+      Math.round(containerEl.getBoundingClientRect().top + window.scrollY),
+    );
+    setMeasuredScrollMargin((prev) => (prev === origin ? prev : origin));
+  }, [containerEl, books.length, columns, cardHeight]);
 
   // Measure the container (not the window) so grid sizing tracks the real
   // layout width, including sidebars and padding.
@@ -150,11 +202,14 @@ export const BookGridInfinite = memo(function BookGridInfinite({
 
   // scrollMargin is the MEASURED list origin (see above); it keeps the
   // restored/focused row from sliding under the sticky search + header.
-  // TanStack contract: keep scrollMargin on the virtualizer AND do NOT
-  // manually offset rows — rows use translateY(virtualRow.start) verbatim
-  // and the virtualizer applies the margin internally. scrollPaddingStart
-  // (200px below) is separate breathing room for scrollToIndex, NOT part of
-  // the measured origin.
+  // TanStack contract — margin applied ONCE: the virtualizer bakes
+  // scrollMargin into every measurement (first start = scrollMargin,
+  // totalSize excludes the margin), so rows render at
+  // translateY(start - scrollMargin) inside a container that sits AT the
+  // list origin in normal flow. Using translateY(start) verbatim would
+  // double-count the margin and push every row down by the sticky offset.
+  // scrollPaddingStart (200px below) is separate breathing room for
+  // scrollToIndex, NOT part of the measured origin.
   const virtualizer = useWindowVirtualizer({
     count: rowCount,
     estimateSize: useCallback(() => cardHeight, [cardHeight]),
@@ -208,7 +263,11 @@ export const BookGridInfinite = memo(function BookGridInfinite({
           if (anchor) {
             sessionStorage.setItem(
               "caliber-scroll",
-              JSON.stringify({ id: anchor.id, offset: window.scrollY % Math.max(cardHeight, 1), columns }),
+              JSON.stringify({
+                id: anchor.id,
+                offset: window.scrollY % Math.max(cardHeight, 1),
+                columns,
+              }),
             );
           }
         } catch {}
@@ -247,7 +306,9 @@ export const BookGridInfinite = memo(function BookGridInfinite({
         const saved = raw ? (JSON.parse(raw) as { id?: unknown; offset?: unknown }) : null;
         if (saved && typeof saved.id === "number") anchorId = saved.id;
         if (saved && typeof saved.offset === "number") anchorOffset = saved.offset;
-      } catch { anchorId = null; }
+      } catch {
+        anchorId = null;
+      }
       let fresh = readFreshBooks();
       if (anchorId === null || fresh.length === 0) return;
       const wanted = anchorId;
@@ -258,8 +319,13 @@ export const BookGridInfinite = memo(function BookGridInfinite({
         guard++;
         try {
           const result = await fetchNextPage();
-          latestHasNext = (result.data?.pages.length ?? 0) > 0 ? (result.hasNextPage ?? latestHasNext) : latestHasNext;
-        } catch { break; }
+          latestHasNext =
+            (result.data?.pages.length ?? 0) > 0
+              ? (result.hasNextPage ?? latestHasNext)
+              : latestHasNext;
+        } catch {
+          break;
+        }
         fresh = readFreshBooks();
         if (fresh.some((b) => b.id === wanted)) break;
       }
@@ -277,12 +343,17 @@ export const BookGridInfinite = memo(function BookGridInfinite({
             virtualizer.scrollToIndex(row, { align: "start" });
             if (off > 0) window.scrollBy({ top: off });
           } catch {}
-          try { sessionStorage.removeItem("caliber-scroll"); } catch {}
+          try {
+            sessionStorage.removeItem("caliber-scroll");
+          } catch {}
         });
       }
     };
     void run();
-    return () => { cancelled = true; cancelAnimationFrame(raf); };
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [restoreKey, books.length, hasNextPage, columns, queryClient, queryKey]);
 
@@ -301,12 +372,18 @@ export const BookGridInfinite = memo(function BookGridInfinite({
   }
 
   if (isError && errorStage === "initial") {
-    const title = isAuthExpired ? "Session expired" : isOffline ? "You're offline" : "Failed to load books";
+    const title = isAuthExpired
+      ? "Session expired"
+      : isOffline
+        ? "You're offline"
+        : "Failed to load books";
     const hint = isAuthExpired
       ? "Please sign in again to continue browsing."
       : isOffline
         ? "Check your connection and try again."
-        : error instanceof Error ? error.message : "Unknown error";
+        : error instanceof Error
+          ? error.message
+          : "Unknown error";
     return (
       <div className="flex flex-col items-center justify-center h-64 text-center px-8">
         <div className="w-14 h-14 rounded-full bg-error/10 flex items-center justify-center mb-3">
@@ -326,21 +403,28 @@ export const BookGridInfinite = memo(function BookGridInfinite({
   }
 
   // Refresh failure with retained data: keep the list, show an inline banner.
-  const refreshBanner = isError && errorStage === "refresh" ? (
-    <div className="mx-4 mt-3 rounded-lg border border-ink px-3 py-2 text-sm text-ink-tertiary flex items-center justify-between gap-2" role="alert">
-      <span>Couldn't refresh — showing saved results.</span>
-      <button type="button" onClick={() => refetch()} className="underline font-medium">Retry</button>
-    </div>
-  ) : null;
+  const refreshBanner =
+    isError && errorStage === "refresh" ? (
+      <div
+        className="mx-4 mt-3 rounded-lg border border-ink px-3 py-2 text-sm text-ink-tertiary flex items-center justify-between gap-2"
+        role="alert"
+      >
+        <span>Couldn't refresh — showing saved results.</span>
+        <button type="button" onClick={() => refetch()} className="underline font-medium">
+          Retry
+        </button>
+      </div>
+    ) : null;
 
   if (books.length === 0 && !isPlaceholder) {
-    const heading = emptyReason === "empty-library"
-      ? "Your library is empty"
-      : emptyReason === "offline"
-        ? "You're offline"
-        : emptyReason === "auth-expired"
-          ? "Session expired"
-          : "No books found";
+    const heading =
+      emptyReason === "empty-library"
+        ? "Your library is empty"
+        : emptyReason === "offline"
+          ? "You're offline"
+          : emptyReason === "auth-expired"
+            ? "Session expired"
+            : "No books found";
     return (
       <div className="flex flex-col items-center justify-center h-64 text-center px-8">
         <div className="w-14 h-14 rounded-full bg-parchment-dark flex items-center justify-center mb-3 border border-ink">
@@ -372,13 +456,27 @@ export const BookGridInfinite = memo(function BookGridInfinite({
     );
   }
 
-  const footerCount = totalCount !== null && windowTruncated
-    ? `Showing ${retainedCount.toLocaleString()} of ${totalCount.toLocaleString()} (retained window)`
-    : `${books.length.toLocaleString()} book${books.length !== 1 ? "s" : ""}`;
+  const footerCount =
+    totalCount !== null && windowTruncated
+      ? `Showing ${retainedCount.toLocaleString()} of ${totalCount.toLocaleString()} (retained window)`
+      : `${books.length.toLocaleString()} book${books.length !== 1 ? "s" : ""}`;
+  // Forward-only window: once maxPages evicts leading pages there is NO
+  // backward fetch, so a truncated window with an exhausted forward cursor
+  // must NOT claim "All books loaded" — the earlier books are simply outside
+  // the retained window.
+  const endStatus =
+    windowTruncated && !hasNextPage
+      ? "Earlier books unavailable — use search/filters"
+      : hasNextPage
+        ? "Scroll to load more"
+        : "All books loaded";
 
   return (
     <div ref={setContainerEl}>
       {refreshBanner}
+      {/* List-origin container: sits in normal flow at the measured origin;
+          rows below offset by (start - scrollMargin) so the margin applies
+          exactly once. */}
       <div style={{ height: `${totalSize}px`, position: "relative" }}>
         {virtualItems.map((virtualRow) => {
           const startIndex = virtualRow.index * columns;
@@ -392,7 +490,7 @@ export const BookGridInfinite = memo(function BookGridInfinite({
                 top: 0,
                 left: 0,
                 width: "100%",
-                transform: `translateY(${virtualRow.start}px)`,
+                transform: `translateY(${virtualRow.start - virtualizer.options.scrollMargin}px)`,
                 height: `${cardHeight}px`,
                 padding: `0 16px`,
               }}
@@ -414,7 +512,10 @@ export const BookGridInfinite = memo(function BookGridInfinite({
       </div>
 
       {isFetchingNextPage && (
-        <div className="flex items-center justify-center py-4 border-t border-parchment" aria-live="polite">
+        <div
+          className="flex items-center justify-center py-4 border-t border-parchment"
+          aria-live="polite"
+        >
           <div className="flex items-center gap-2 text-ink-muted">
             <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
             <span className="text-sm">Loading more…</span>
@@ -423,25 +524,26 @@ export const BookGridInfinite = memo(function BookGridInfinite({
       )}
 
       {isFetchNextPageError && !isFetchingNextPage && (
-        <div className="flex items-center justify-center gap-2 py-3 border-t border-parchment text-sm text-ink-tertiary" role="alert">
+        <div
+          className="flex items-center justify-center gap-2 py-3 border-t border-parchment text-sm text-ink-tertiary"
+          role="alert"
+        >
           <span>Couldn't load more books.</span>
-          <button type="button" onClick={() => fetchNextPage()} className="underline font-medium">Retry</button>
+          <button type="button" onClick={() => fetchNextPage()} className="underline font-medium">
+            Retry
+          </button>
         </div>
       )}
 
       <div className="px-3 sm:px-4 py-3 border-t border-ink bg-parchment-dark flex items-center justify-between gap-2 overflow-hidden">
         <div className="flex items-center gap-2 min-w-0">
           <BookOpen className="h-4 w-4 text-accent flex-shrink-0" strokeWidth={2} />
-          <span className="text-sm font-medium text-ink whitespace-nowrap">
-            {footerCount}
-          </span>
+          <span className="text-sm font-medium text-ink whitespace-nowrap">{footerCount}</span>
           <span className="text-sm text-ink-muted truncate">
             {searchQuery ? `matching "${searchQuery}"` : "loaded"}
           </span>
         </div>
-        <div className="text-xs text-ink-muted whitespace-nowrap hidden sm:block">
-          {hasNextPage ? "Scroll to load more" : "All books loaded"}
-        </div>
+        <div className="text-xs text-ink-muted whitespace-nowrap hidden sm:block">{endStatus}</div>
       </div>
     </div>
   );

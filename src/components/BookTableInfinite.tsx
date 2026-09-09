@@ -312,7 +312,13 @@ const EmptyState = memo(function EmptyState({
   onClearFilters?: () => void;
 }) {
   const heading =
-    reason === "empty-library" ? "Your library is empty" : reason === "offline" ? "You're offline" : reason === "auth-expired" ? "Session expired" : "No books found";
+    reason === "empty-library"
+      ? "Your library is empty"
+      : reason === "offline"
+        ? "You're offline"
+        : reason === "auth-expired"
+          ? "Session expired"
+          : "No books found";
   const hint = searchQuery
     ? `No books match "${searchQuery}". Try a different search term.`
     : reason === "empty-library"
@@ -467,18 +473,41 @@ export const BookTableInfinite = memo(function BookTableInfinite({
   onClearFilters,
 }: BookTableInfiniteProps) {
   const {
-    books, totalCount, retainedCount, windowTruncated, hasNextPage, fetchNextPage,
-    isFetchingNextPage, isFetchNextPageError, isLoading, isError, error, errorStage,
-    isPlaceholder, emptyReason, isAuthExpired, isOffline, refetch, queryKey,
+    books,
+    totalCount,
+    retainedCount,
+    windowTruncated,
+    hasNextPage,
+    fetchNextPage,
+    isFetchingNextPage,
+    isFetchNextPageError,
+    isLoading,
+    isError,
+    error,
+    errorStage,
+    isPlaceholder,
+    emptyReason,
+    isAuthExpired,
+    isOffline,
+    refetch,
+    queryKey,
   } = useFlattenedBooks(searchQuery, sortConfig, tagIds);
   const queryClient = useQueryClient();
 
   // S7: REAL scrollMargin measurement. The callback ref captures the list
   // container; its document-relative origin (viewport top + scroll offset,
-  // which is scroll-invariant) is measured at mount and re-measured on
-  // resize via ResizeObserver (+ a window resize fallback). The measured
-  // value is passed to the virtualizer as scrollMargin, which the React
-  // adapter picks up dynamically on re-render — no constant assertion.
+  // which is scroll-invariant) is measured at mount and re-measured whenever
+  // the origin can move:
+  // - ResizeObserver on the list container itself,
+  // - ResizeObserver on document.body (a sticky shelf/header above the list
+  //   resizing shifts the list origin without resizing the list),
+  // - window resize fallback,
+  // - MutationObserver on document.body (header/shelf DOM moves — filter row
+  //   mount, shelf expand — that shift the origin without a resize event),
+  // - explicit re-measure when books change (the second effect below).
+  // The measured value is passed to the virtualizer as scrollMargin, which
+  // the React adapter picks up dynamically on re-render — no constant
+  // assertion.
   const [listEl, setListEl] = useState<HTMLDivElement | null>(null);
   const [measuredScrollMargin, setMeasuredScrollMargin] = useState(TABLE_SCROLL_MARGIN_FALLBACK);
   useEffect(() => {
@@ -493,22 +522,46 @@ export const BookTableInfinite = memo(function BookTableInfinite({
     if (typeof ResizeObserver !== "undefined") {
       ro = new ResizeObserver(measure);
       ro.observe(el);
+      try {
+        ro.observe(document.body);
+      } catch {}
     }
     window.addEventListener("resize", measure);
+    let mo: MutationObserver | null = null;
+    if (typeof MutationObserver !== "undefined") {
+      mo = new MutationObserver(measure);
+      try {
+        mo.observe(document.body, { childList: true, subtree: true, attributes: true });
+      } catch {}
+    }
     return () => {
       ro?.disconnect();
+      mo?.disconnect();
       window.removeEventListener("resize", measure);
     };
   }, [listEl]);
 
+  // Re-measure the list origin when content above/around the list changes
+  // size (books appended, header/filter state changed). The observer effect
+  // above owns the listeners; this just re-runs the same scroll-invariant
+  // origin math on state transitions the observers might miss.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional re-measure on content transitions observers may miss.
+  useEffect(() => {
+    if (!listEl) return;
+    const origin = Math.max(0, Math.round(listEl.getBoundingClientRect().top + window.scrollY));
+    setMeasuredScrollMargin((prev) => (prev === origin ? prev : origin));
+  }, [listEl, books.length]);
+
   // Set up window virtualizer - uses window scroll. scrollMargin is the
   // MEASURED list origin (see above) and keeps the restored/focused row
   // clear of the sticky search + table headers.
-  // TanStack contract: keep scrollMargin on the virtualizer AND do NOT
-  // manually offset rows — rows use translateY(virtualItem.start) verbatim
-  // and the virtualizer applies the margin internally. scrollPaddingStart
-  // (200px below) is separate breathing room for scrollToIndex, NOT part of
-  // the measured origin.
+  // TanStack contract — margin applied ONCE: the virtualizer bakes
+  // scrollMargin into every measurement (first start = scrollMargin,
+  // totalSize excludes the margin), so rows render at
+  // translateY(start - scrollMargin) inside a container that sits AT the
+  // list origin in normal flow. Using translateY(start) verbatim would
+  // double-count the margin. scrollPaddingStart (200px below) is separate
+  // breathing room for scrollToIndex, NOT part of the measured origin.
   const virtualizer = useWindowVirtualizer({
     count: books.length,
     estimateSize: useCallback(() => ROW_HEIGHT, []),
@@ -592,7 +645,9 @@ export const BookTableInfinite = memo(function BookTableInfinite({
         const saved = raw ? (JSON.parse(raw) as { id?: unknown; offset?: unknown }) : null;
         if (saved && typeof saved.id === "number") anchorId = saved.id;
         if (saved && typeof saved.offset === "number") anchorOffset = saved.offset;
-      } catch { anchorId = null; }
+      } catch {
+        anchorId = null;
+      }
       let fresh = readFreshBooks();
       if (anchorId === null || fresh.length === 0) return;
       const wanted = anchorId;
@@ -602,8 +657,13 @@ export const BookTableInfinite = memo(function BookTableInfinite({
         guard++;
         try {
           const result = await fetchNextPage();
-          latestHasNext = (result.data?.pages.length ?? 0) > 0 ? (result.hasNextPage ?? latestHasNext) : latestHasNext;
-        } catch { break; }
+          latestHasNext =
+            (result.data?.pages.length ?? 0) > 0
+              ? (result.hasNextPage ?? latestHasNext)
+              : latestHasNext;
+        } catch {
+          break;
+        }
         fresh = readFreshBooks();
         if (fresh.some((b) => b.id === wanted)) break;
       }
@@ -620,12 +680,17 @@ export const BookTableInfinite = memo(function BookTableInfinite({
             virtualizer.scrollToIndex(idx, { align: "start" });
             if (off > 0) window.scrollBy({ top: off });
           } catch {}
-          try { sessionStorage.removeItem("caliber-scroll"); } catch {}
+          try {
+            sessionStorage.removeItem("caliber-scroll");
+          } catch {}
         });
       }
     };
     void run();
-    return () => { cancelled = true; cancelAnimationFrame(raf); };
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [restoreKey, books.length, hasNextPage, queryClient, queryKey]);
 
@@ -648,7 +713,11 @@ export const BookTableInfinite = memo(function BookTableInfinite({
   }
 
   if (isError && errorStage === "initial") {
-    const title = isAuthExpired ? "Session expired" : isOffline ? "You're offline" : "Failed to load books";
+    const title = isAuthExpired
+      ? "Session expired"
+      : isOffline
+        ? "You're offline"
+        : "Failed to load books";
     return (
       <div className="flex flex-col items-center justify-center h-64 text-center px-8">
         <div className="w-14 h-14 rounded-full bg-error/10 flex items-center justify-center mb-3">
@@ -660,7 +729,9 @@ export const BookTableInfinite = memo(function BookTableInfinite({
             ? "Please sign in again to continue browsing."
             : isOffline
               ? "Check your connection and try again."
-              : error instanceof Error ? error.message : "Unknown error"}
+              : error instanceof Error
+                ? error.message
+                : "Unknown error"}
         </p>
         <button
           type="button"
@@ -673,12 +744,18 @@ export const BookTableInfinite = memo(function BookTableInfinite({
     );
   }
 
-  const refreshBanner = isError && errorStage === "refresh" ? (
-    <div className="mx-4 mt-3 rounded-lg border border-ink px-3 py-2 text-sm text-ink-tertiary flex items-center justify-between gap-2" role="alert">
-      <span>Couldn't refresh — showing saved results.</span>
-      <button type="button" onClick={() => refetch()} className="underline font-medium">Retry</button>
-    </div>
-  ) : null;
+  const refreshBanner =
+    isError && errorStage === "refresh" ? (
+      <div
+        className="mx-4 mt-3 rounded-lg border border-ink px-3 py-2 text-sm text-ink-tertiary flex items-center justify-between gap-2"
+        role="alert"
+      >
+        <span>Couldn't refresh — showing saved results.</span>
+        <button type="button" onClick={() => refetch()} className="underline font-medium">
+          Retry
+        </button>
+      </div>
+    ) : null;
 
   if (books.length === 0 && !isPlaceholder) {
     return (
@@ -691,14 +768,27 @@ export const BookTableInfinite = memo(function BookTableInfinite({
     );
   }
 
-  const footerCount = totalCount !== null && windowTruncated
-    ? `Showing ${retainedCount.toLocaleString()} of ${totalCount.toLocaleString()} (retained window)`
-    : `${books.length.toLocaleString()} book${books.length !== 1 ? "s" : ""}`;
+  const footerCount =
+    totalCount !== null && windowTruncated
+      ? `Showing ${retainedCount.toLocaleString()} of ${totalCount.toLocaleString()} (retained window)`
+      : `${books.length.toLocaleString()} book${books.length !== 1 ? "s" : ""}`;
+  // Forward-only window: once maxPages evicts leading pages there is NO
+  // backward fetch, so a truncated window with an exhausted forward cursor
+  // must NOT claim "All books loaded" — the earlier books are simply outside
+  // the retained window.
+  const endStatus =
+    windowTruncated && !hasNextPage
+      ? "Earlier books unavailable — use search/filters"
+      : hasNextPage
+        ? "Scroll to load more"
+        : "All books loaded";
 
   return (
     <div ref={setListEl}>
       {refreshBanner}
-      {/* Virtual list container - no internal scroll, uses window */}
+      {/* Virtual list container at the list origin in normal flow (no
+          internal scroll, uses window); rows offset by (start -
+          scrollMargin) so the margin applies exactly once. */}
       <div style={{ height: `${totalSize}px`, position: "relative" }}>
         {virtualItems.map((virtualItem) => {
           const book = books[virtualItem.index];
@@ -712,7 +802,7 @@ export const BookTableInfinite = memo(function BookTableInfinite({
                 top: 0,
                 left: 0,
                 width: "100%",
-                transform: `translateY(${virtualItem.start}px)`,
+                transform: `translateY(${virtualItem.start - virtualizer.options.scrollMargin}px)`,
               }}
             >
               <TableRow book={book} />
@@ -723,7 +813,10 @@ export const BookTableInfinite = memo(function BookTableInfinite({
 
       {/* Loading indicator at bottom */}
       {isFetchingNextPage && (
-        <div className="flex items-center justify-center py-4 border-t border-parchment" aria-live="polite">
+        <div
+          className="flex items-center justify-center py-4 border-t border-parchment"
+          aria-live="polite"
+        >
           <div className="flex items-center gap-2 text-ink-muted">
             <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
             <span className="text-sm">Loading more…</span>
@@ -732,9 +825,14 @@ export const BookTableInfinite = memo(function BookTableInfinite({
       )}
 
       {isFetchNextPageError && !isFetchingNextPage && (
-        <div className="flex items-center justify-center gap-2 py-3 border-t border-parchment text-sm text-ink-tertiary" role="alert">
+        <div
+          className="flex items-center justify-center gap-2 py-3 border-t border-parchment text-sm text-ink-tertiary"
+          role="alert"
+        >
           <span>Couldn't load more books.</span>
-          <button type="button" onClick={() => fetchNextPage()} className="underline font-medium">Retry</button>
+          <button type="button" onClick={() => fetchNextPage()} className="underline font-medium">
+            Retry
+          </button>
         </div>
       )}
 
@@ -742,16 +840,12 @@ export const BookTableInfinite = memo(function BookTableInfinite({
       <div className="px-3 sm:px-4 py-3 border-t border-ink bg-parchment-dark flex items-center justify-between gap-2 overflow-hidden">
         <div className="flex items-center gap-2 min-w-0">
           <BookOpen className="h-4 w-4 text-accent flex-shrink-0" strokeWidth={2} />
-          <span className="text-sm font-medium text-ink whitespace-nowrap">
-            {footerCount}
-          </span>
+          <span className="text-sm font-medium text-ink whitespace-nowrap">{footerCount}</span>
           <span className="text-sm text-ink-muted truncate">
             {searchQuery ? `matching "${searchQuery}"` : "loaded"}
           </span>
         </div>
-        <div className="text-xs text-ink-muted whitespace-nowrap hidden sm:block">
-          {hasNextPage ? "Scroll to load more" : "All books loaded"}
-        </div>
+        <div className="text-xs text-ink-muted whitespace-nowrap hidden sm:block">{endStatus}</div>
       </div>
     </div>
   );
