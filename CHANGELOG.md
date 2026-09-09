@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.11](https://github.com/briansunter/caliber/compare/v0.1.10...v0.1.11) (2026-09-09)
+
+
+### Features
+
+* redesign library UI with shared reader chrome and accessibility pass ([0f5950e](https://github.com/briansunter/caliber/commit/0f5950e90fe9c47dec05197b0f9a3b068c15fbc2))
+
+
+### Bug Fixes
+
+* harden pagination, host validation, and reader progress persistence ([ea90b47](https://github.com/briansunter/caliber/commit/ea90b473f7e2b2a1876d8e028e6195de6d2894b1))
+* implement caliber audit F01-F32 (progress identity, auth, perf, OPDS, UI) ([b8b1bd3](https://github.com/briansunter/caliber/commit/b8b1bd32450fa0a3ca4b427b2fa68304ce450871))
+* ordered progress delivery, format-scoped restore, thumbnail fallback, cache identity ([357a203](https://github.com/briansunter/caliber/commit/357a203dcdedb1b4004d835e6c8e8c222e58b2b6))
+* revision-ordered progress, identity-checked delivery, cache rebuild, measured virtualizer ([1e402e5](https://github.com/briansunter/caliber/commit/1e402e5b097a9e2373e519b45ac575fef4d11e0f))
+* use sharp for cover thumbnail resizing ([a3cd451](https://github.com/briansunter/caliber/commit/a3cd451f6ba18efe1dd33a5184aae5747fa61775))
+* wire library/format identity, transactional outbox, display-verified saves, truthful smoke ([c7732c7](https://github.com/briansunter/caliber/commit/c7732c7a529de10b4677f16f5bfba5ae64e38788))
+
 ## [0.1.10](https://github.com/briansunter/caliber/compare/v0.1.9...v0.1.10) (2026-08-20)
 
 
