@@ -10,6 +10,8 @@ import {
   Minimize,
   Expand,
   MoveHorizontal,
+  Columns2,
+  FileText,
 } from "lucide-react";
 import {
   ReaderErrorPanel,
@@ -95,6 +97,107 @@ function isInteractiveTarget(target: ReaderPointerTarget): boolean {
   );
 }
 
+type PdfPageLayout = "single" | "double";
+
+// Gutter between facing pages in a spread (CSS px).
+const SPREAD_GAP_PX = 16;
+
+// PDF.js teardown/replacement paths race in-flight async work by design, so
+// cancel/destroy/cleanup/pre-warm rejections are routine and unactionable.
+// Log them at debug level instead of swallowing silently or interrupting
+// reading with UI errors.
+function noteIgnoredReaderError(stage: string, error: unknown): void {
+  console.debug(`[PdfReader] ignored ${stage} error`, error);
+}
+
+interface PdfSpreadSlots {
+  canvas: HTMLCanvasElement;
+  layer: HTMLDivElement;
+  annotation: HTMLDivElement;
+}
+
+// Paint one PDF page into its slots with double-buffering: render offscreen,
+// then blit to the visible canvas in one step so the previous page stays on
+// screen until the new one is ready. Returns true when the swap landed.
+async function paintPdfPage(args: {
+  page: pdfjsLib.PDFPageProxy;
+  viewport: pdfjsLib.PageViewport;
+  slots: PdfSpreadSlots;
+  taskRef: { current: pdfjsLib.RenderTask | null };
+  dpr: number;
+  isCurrent: () => boolean;
+  linkService: PdfLinkService;
+}): Promise<boolean> {
+  const { page, viewport, slots, taskRef, dpr, isCurrent, linkService } = args;
+  const offscreen = document.createElement("canvas");
+  offscreen.width = viewport.width * dpr;
+  offscreen.height = viewport.height * dpr;
+  const offCtx = offscreen.getContext("2d");
+  if (!offCtx) return false;
+
+  const renderTask = page.render({
+    canvasContext: offCtx,
+    viewport,
+    transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
+  });
+  taskRef.current = renderTask;
+  try {
+    await renderTask.promise;
+  } catch (error) {
+    // Cancellation lands here too; either way free the backing store.
+    noteIgnoredReaderError("render page", error);
+    offscreen.width = 0;
+    offscreen.height = 0;
+    return false;
+  }
+  if (!isCurrent()) {
+    offscreen.width = 0;
+    offscreen.height = 0;
+    return false;
+  }
+  slots.canvas.width = offscreen.width;
+  slots.canvas.height = offscreen.height;
+  slots.canvas.style.width = `${viewport.width}px`;
+  slots.canvas.style.height = `${viewport.height}px`;
+  slots.layer.style.width = `${viewport.width}px`;
+  slots.layer.style.height = `${viewport.height}px`;
+  slots.annotation.style.setProperty("--scale-factor", String(viewport.scale));
+  slots.canvas.getContext("2d")?.drawImage(offscreen, 0, 0);
+  // F06: release the offscreen backing store in a finally-equivalent path —
+  // both success and cancellation free the canvas.
+  offscreen.width = 0;
+  offscreen.height = 0;
+
+  try {
+    // Resolve annotations against the swapped viewport/scale-factor, not the
+    // previous page's.
+    const annotations = await page.getAnnotations({ intent: "display" });
+    if (!isCurrent()) return true;
+    slots.annotation.innerHTML = "";
+    const layer = new pdfjsLib.AnnotationLayer({
+      div: slots.annotation,
+      accessibilityManager: null,
+      annotationCanvasMap: null,
+      annotationEditorUIManager: null,
+      page,
+      viewport,
+      structTreeLayer: null,
+    });
+    await layer.render({
+      viewport,
+      div: slots.annotation,
+      annotations,
+      page,
+      linkService: linkService as never,
+      renderForms: false,
+    });
+  } catch (error) {
+    noteIgnoredReaderError("render annotations", error);
+    slots.annotation.innerHTML = "";
+  }
+  return true;
+}
+
 export function PdfReader({
   url,
   bookId,
@@ -103,11 +206,15 @@ export function PdfReader({
   initialLoadMode = "stream",
 }: PdfReaderProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const canvasRef2 = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const pageLayerRef = useRef<HTMLDivElement>(null);
+  const pageLayerRef2 = useRef<HTMLDivElement>(null);
   const annotationLayerRef = useRef<HTMLDivElement>(null);
+  const annotationLayerRef2 = useRef<HTMLDivElement>(null);
   const pdfRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
   const renderTaskRef = useRef<pdfjsLib.RenderTask | null>(null);
+  const renderTaskRef2 = useRef<pdfjsLib.RenderTask | null>(null);
   const renderTokenRef = useRef(0);
   const prefetchRunRef = useRef(0);
   const touchRef = useRef<{ x: number; y: number; t: number } | null>(null);
@@ -150,6 +257,12 @@ export function PdfReader({
       : "width";
   });
   const [zoomMenuOpen, setZoomMenuOpen] = useState(false);
+  // Single page or side-by-side spread. Persisted per book with the zoom so a
+  // wide-screen book stays two-up and a phone book stays single.
+  const [pageLayout, setPageLayout] = useState<PdfPageLayout>(() => {
+    const saved = stored(zoomKey, {}) as { pageLayout?: PdfPageLayout };
+    return saved.pageLayout === "double" ? "double" : "single";
+  });
   const [containerWidth, setContainerWidth] = useState(0);
   const [containerHeight, setContainerHeight] = useState(0);
   // Last rendered page size in PDF points; lets +/- zoom start from the
@@ -184,6 +297,9 @@ export function PdfReader({
   const applyFitMode = useCallback((mode: PdfFitMode) => {
     setFitMode(mode);
     setZoomMenuOpen(false);
+  }, []);
+  const togglePageLayout = useCallback(() => {
+    setPageLayout((layout) => (layout === "double" ? "single" : "double"));
   }, []);
   // Tap-to-turn zones only make sense when the page is not manually zoomed
   // (fit modes keep them enabled so phones can still page through).
@@ -222,13 +338,17 @@ export function PdfReader({
     }
   }, []);
 
+  // In double layout each turn moves a full spread. The left page stays the
+  // identity for progress, prefetch, and restore.
+  const pageStep = pageLayout === "double" ? 2 : 1;
+
   const goNext = useCallback(() => {
-    setCurrentPage((p) => Math.min(p + 1, totalPages || p));
-  }, [totalPages]);
+    setCurrentPage((p) => Math.min(p + pageStep, totalPages || p));
+  }, [totalPages, pageStep]);
 
   const goPrev = useCallback(() => {
-    setCurrentPage((p) => Math.max(p - 1, 1));
-  }, []);
+    setCurrentPage((p) => Math.max(p - pageStep, 1));
+  }, [pageStep]);
 
   const toggleUI = useCallback(() => setShowUI((p) => !p), []);
   const toggleLoadMode = useCallback(() => {
@@ -257,17 +377,20 @@ export function PdfReader({
   useEffect(() => {
     return () => {
       flushBookProgress(bookId);
-      if (renderTaskRef.current) {
+      for (const taskRef of [renderTaskRef, renderTaskRef2]) {
         try {
-          renderTaskRef.current.cancel();
-        } catch {}
-        renderTaskRef.current = null;
+          taskRef.current?.cancel();
+        } catch (error) {
+          noteIgnoredReaderError("cancel render", error);
+        }
+        taskRef.current = null;
       }
       if (pdfRef.current) {
-        try {
-          pdfRef.current.destroy();
-        } catch {}
+        const pdf = pdfRef.current;
         pdfRef.current = null;
+        void pdf
+          .destroy()
+          .catch((error: unknown) => noteIgnoredReaderError("destroy document", error));
       }
     };
   }, [bookId]);
@@ -431,17 +554,21 @@ export function PdfReader({
       setLoadError(null);
       setTotalPages(0);
 
-      if (renderTaskRef.current) {
+      for (const taskRef of [renderTaskRef, renderTaskRef2]) {
         try {
-          renderTaskRef.current.cancel();
-        } catch {}
-        renderTaskRef.current = null;
+          taskRef.current?.cancel();
+        } catch (error) {
+          noteIgnoredReaderError("cancel render", error);
+        }
+        taskRef.current = null;
       }
 
       if (pdfRef.current) {
         try {
           await pdfRef.current.destroy();
-        } catch {}
+        } catch (error) {
+          noteIgnoredReaderError("destroy document", error);
+        }
         pdfRef.current = null;
       }
 
@@ -464,7 +591,9 @@ export function PdfReader({
 
         const pdf = await loadingTask.promise;
         if (cancelled) {
-          await pdf.destroy().catch(() => {});
+          await pdf
+            .destroy()
+            .catch((error: unknown) => noteIgnoredReaderError("destroy document", error));
           return;
         }
 
@@ -484,7 +613,9 @@ export function PdfReader({
       }
     }
 
-    void loadPdf().catch(() => {});
+    void loadPdf().catch((error: unknown) => {
+      noteIgnoredReaderError("load document", error);
+    });
 
     return () => {
       cancelled = true;
@@ -492,7 +623,9 @@ export function PdfReader({
       if (loadingTask) {
         try {
           loadingTask.destroy();
-        } catch {}
+        } catch (error) {
+          noteIgnoredReaderError("destroy load task", error);
+        }
       }
     };
   }, [url, loadMode]);
@@ -521,148 +654,155 @@ export function PdfReader({
     totalPagesRef.current = totalPages;
   });
 
-  // Render current page
+  // Render the current page, or a two-page spread in double layout. Streaming
+  // and full-file PDFs share this path: in stream mode each getPage resolves
+  // through range requests, so the second page just warms another byte range.
   useEffect(() => {
     const pdf = pdfRef.current;
-    const canvas = canvasRef.current;
     const container = containerRef.current;
-    const pageLayer = pageLayerRef.current;
-    const annotationLayer = annotationLayerRef.current;
-    if (!pdf || !canvas || !container || !pageLayer || !annotationLayer || isLoading) return;
+    const leftCanvas = canvasRef.current;
+    const leftLayer = pageLayerRef.current;
+    const leftAnnotation = annotationLayerRef.current;
+    if (!pdf || !container || !leftCanvas || !leftLayer || !leftAnnotation || isLoading) return;
+    const leftSlots: PdfSpreadSlots = {
+      canvas: leftCanvas,
+      layer: leftLayer,
+      annotation: leftAnnotation,
+    };
+    // The right slots only exist while a spread is displayed (the second page
+    // must exist, so a book ending on the current page shows it alone).
+    const wantSpread = pageLayout === "double" && currentPage < totalPages;
+    const rightCanvas = canvasRef2.current;
+    const rightLayer = pageLayerRef2.current;
+    const rightAnnotation = annotationLayerRef2.current;
+    const rightSlots: PdfSpreadSlots | null =
+      rightCanvas && rightLayer && rightAnnotation
+        ? { canvas: rightCanvas, layer: rightLayer, annotation: rightAnnotation }
+        : null;
+    if (wantSpread && !rightSlots) return;
 
     const token = renderTokenRef.current + 1;
     renderTokenRef.current = token;
+    const isCurrent = () => renderTokenRef.current === token;
 
-    // Cancel previous render
-    if (renderTaskRef.current) {
-      renderTaskRef.current.cancel();
-      renderTaskRef.current = null;
+    // Cancel previous renders
+    for (const taskRef of [renderTaskRef, renderTaskRef2]) {
+      try {
+        taskRef.current?.cancel();
+      } catch (error) {
+        noteIgnoredReaderError("cancel render", error);
+      }
+      taskRef.current = null;
     }
 
     setRendering(true);
 
     const effectiveWidth = containerWidth > 0 ? containerWidth : container.clientWidth;
-    // Capture the requested page for the async swap; only this value may
+    const effectiveHeight = containerHeight > 0 ? containerHeight : container.clientHeight;
+    // Capture the requested pages for the async swap; only these values may
     // become displayedPage, and only under the token guard below.
     const requestedPage = currentPage;
+    const requestedSecondPage = wantSpread ? requestedPage + 1 : null;
 
-    // F06: terminal catch so a rejected getPage never becomes unhandled.
-    void pdf
-      .getPage(requestedPage)
-      .then(async (page) => {
-        if (renderTokenRef.current !== token) return;
-
-        const unscaledViewport = page.getViewport({ scale: 1 });
-        pageDimsRef.current = {
-          w: unscaledViewport.width,
-          h: unscaledViewport.height,
-        };
-        const fitWidthScale = effectiveWidth / unscaledViewport.width;
-        let scale: number;
-        if (fitMode === "actual") {
-          scale = ACTUAL_SIZE_SCALE;
-        } else if (fitMode === "page") {
-          const effectiveHeight = containerHeight > 0 ? containerHeight : container.clientHeight;
-          scale = Math.min(
-            effectiveWidth / unscaledViewport.width,
-            effectiveHeight / unscaledViewport.height,
-          );
-        } else {
-          // "width" and "custom" both build on fit-width; custom adds the
-          // manual +/- multiplier.
-          scale = fitWidthScale * (fitMode === "custom" ? zoom : 1);
+    const renderSpread = async (): Promise<void> => {
+      let firstPage: pdfjsLib.PDFPageProxy;
+      let secondPage: pdfjsLib.PDFPageProxy | null = null;
+      try {
+        firstPage = await pdf.getPage(requestedPage);
+        if (!isCurrent()) return;
+        if (requestedSecondPage !== null) {
+          secondPage = await pdf.getPage(requestedSecondPage);
+          if (!isCurrent()) return;
         }
-        const viewport = page.getViewport({ scale });
-        // Cap the pixel ratio so Retina pages don't allocate 2-3x oversized canvas
-        // backing stores — the main driver of Safari's per-tab memory crashes.
-        const deviceDpr = window.devicePixelRatio || 1;
-        const dpr =
-          settings.maxRenderScale > 0 ? Math.min(deviceDpr, settings.maxRenderScale) : deviceDpr;
+      } catch (error) {
+        // F06: terminal catch so a rejected getPage never becomes unhandled.
+        noteIgnoredReaderError("fetch page", error);
+        return;
+      }
 
-        // Double-buffer: render offscreen, then blit to the visible canvas in one
-        // step so the previous page stays on screen until the new one is ready.
-        const offscreen = document.createElement("canvas");
-        offscreen.width = viewport.width * dpr;
-        offscreen.height = viewport.height * dpr;
-        const offCtx = offscreen.getContext("2d");
-        if (!offCtx) return;
+      const firstUnscaled = firstPage.getViewport({ scale: 1 });
+      const secondUnscaled = secondPage?.getViewport({ scale: 1 }) ?? null;
+      pageDimsRef.current = { w: firstUnscaled.width, h: firstUnscaled.height };
+      // Both pages share one scale so facing pages align. In a spread each
+      // page gets half the container width minus the gutter.
+      const slotWidth =
+        secondUnscaled === null ? effectiveWidth : (effectiveWidth - SPREAD_GAP_PX) / 2;
+      const widthScale = Math.min(
+        slotWidth / firstUnscaled.width,
+        secondUnscaled === null ? Number.POSITIVE_INFINITY : slotWidth / secondUnscaled.width,
+      );
+      let scale: number;
+      if (fitMode === "actual") {
+        scale = ACTUAL_SIZE_SCALE;
+      } else if (fitMode === "page") {
+        const heightScale = Math.min(
+          effectiveHeight / firstUnscaled.height,
+          secondUnscaled === null
+            ? Number.POSITIVE_INFINITY
+            : effectiveHeight / secondUnscaled.height,
+        );
+        scale = Math.min(widthScale, heightScale);
+      } else {
+        // "width" and "custom" both build on fit-width; custom adds the
+        // manual +/- multiplier.
+        scale = widthScale * (fitMode === "custom" ? zoom : 1);
+      }
 
-        const renderTask = page.render({
-          canvasContext: offCtx,
-          viewport,
-          transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
+      // Cap the pixel ratio so Retina pages don't allocate 2-3x oversized canvas
+      // backing stores — the main driver of Safari's per-tab memory crashes.
+      const deviceDpr = window.devicePixelRatio || 1;
+      const dpr =
+        settings.maxRenderScale > 0 ? Math.min(deviceDpr, settings.maxRenderScale) : deviceDpr;
+
+      const leftOk = await paintPdfPage({
+        page: firstPage,
+        viewport: firstPage.getViewport({ scale }),
+        slots: leftSlots,
+        taskRef: renderTaskRef,
+        dpr,
+        isCurrent,
+        linkService: pdfLinkService,
+      });
+      if (!isCurrent()) return;
+      if (secondPage && rightSlots) {
+        await paintPdfPage({
+          page: secondPage,
+          viewport: secondPage.getViewport({ scale }),
+          slots: rightSlots,
+          taskRef: renderTaskRef2,
+          dpr,
+          isCurrent,
+          linkService: pdfLinkService,
         });
-        renderTaskRef.current = renderTask;
+        if (!isCurrent()) return;
+      }
+      if (leftOk) {
+        // FUP4: checkpoint ONLY on successful swap with the latest-token
+        // guard. This is the sole writer of displayedPage.
+        displayedPageRef.current = requestedPage;
+        setDisplayedPage(requestedPage);
+      }
+      setRendering(false);
+    };
 
-        renderTask.promise
-          .then(() => {
-            if (renderTokenRef.current !== token) return;
-            canvas.width = offscreen.width;
-            canvas.height = offscreen.height;
-            canvas.style.width = `${viewport.width}px`;
-            canvas.style.height = `${viewport.height}px`;
-            pageLayer.style.width = `${viewport.width}px`;
-            pageLayer.style.height = `${viewport.height}px`;
-            annotationLayer.style.setProperty("--scale-factor", String(viewport.scale));
-            canvas.getContext("2d")?.drawImage(offscreen, 0, 0);
-            // F06: release the offscreen backing store in a finally-equivalent
-            // path — both success and cancellation free the canvas.
-            offscreen.width = 0;
-            offscreen.height = 0;
-            // FUP4: checkpoint ONLY on successful swap with the latest-token
-            // guard. This is the sole writer of displayedPage.
-            displayedPageRef.current = requestedPage;
-            setDisplayedPage(requestedPage);
-            setRendering(false);
-          })
-          .catch(() => {
-            // Release even on cancellation/failure.
-            try {
-              offscreen.width = 0;
-              offscreen.height = 0;
-            } catch {}
-          }); // Ignore cancellation
-
-        try {
-          // Wait for the canvas swap so the layer renders against the new
-          // viewport/scale-factor, not the previous page's
-          await renderTask.promise;
-          const annotations = await page.getAnnotations({ intent: "display" });
-          if (renderTokenRef.current !== token) return;
-          annotationLayer.innerHTML = "";
-
-          const layer = new pdfjsLib.AnnotationLayer({
-            div: annotationLayer,
-            accessibilityManager: null,
-            annotationCanvasMap: null,
-            annotationEditorUIManager: null,
-            page,
-            viewport,
-            structTreeLayer: null,
-          });
-          await layer.render({
-            viewport,
-            div: annotationLayer,
-            annotations,
-            page,
-            linkService: pdfLinkService as never,
-            renderForms: false,
-          });
-        } catch {
-          annotationLayer.innerHTML = "";
-        }
-      })
-      .catch(() => {});
+    // F06: terminal catch so a rejected spread render never becomes unhandled.
+    void renderSpread().catch((error: unknown) => {
+      noteIgnoredReaderError("render spread", error);
+    });
 
     // FUP4: no saves from the render-start path. Persistence lives in the
     // displayedPage save effect below, which only fires after a successful
     // canvas swap.
-    // Save zoom
+    // Save zoom and layout
     try {
-      localStorage.setItem(zoomKey, JSON.stringify({ zoom, fitMode, ts: Date.now() }));
-    } catch {}
+      localStorage.setItem(zoomKey, JSON.stringify({ zoom, fitMode, pageLayout, ts: Date.now() }));
+    } catch (error) {
+      noteIgnoredReaderError("persist zoom", error);
+    }
   }, [
     currentPage,
+    totalPages,
+    pageLayout,
     isLoading,
     zoom,
     fitMode,
@@ -681,7 +821,9 @@ export function PdfReader({
     if (displayedPage === null) return;
     try {
       localStorage.setItem(posKey, JSON.stringify({ page: displayedPage, ts: Date.now() }));
-    } catch {}
+    } catch (error) {
+      noteIgnoredReaderError("persist position", error);
+    }
     // Sync to the signed-in user's server-side progress (debounced). Held
     // back until restore settles (see settle effect below) so a slow/failed
     // fetch can't let this device's older page clobber newer server progress.
@@ -781,7 +923,9 @@ export function PdfReader({
       if (visitsRef.current % PDF_CLEANUP_EVERY === 0) {
         try {
           await pdf.cleanup();
-        } catch {}
+        } catch (error) {
+          noteIgnoredReaderError("drop page cache", error);
+        }
         if (prefetchRunRef.current !== run) return;
       }
 
@@ -797,7 +941,9 @@ export function PdfReader({
           const page = await pdf.getPage(pageNumber);
           if (prefetchRunRef.current !== run) return;
           await page.getOperatorList();
-        } catch {}
+        } catch (error) {
+          noteIgnoredReaderError("pre-warm page", error);
+        }
       }
     })();
   }, [currentPage, isLoading, totalPages, settings.prefetchAhead, settings.prefetchBehind]);
@@ -815,6 +961,10 @@ export function PdfReader({
     document.addEventListener("keyup", handleKey);
     return () => document.removeEventListener("keyup", handleKey);
   }, [goPrev, goNext, onBack, toggleImmersive]);
+
+  // A spread needs a following page; a book ending on the current page shows
+  // it alone even in double layout.
+  const showSpread = pageLayout === "double" && currentPage < totalPages;
 
   const progress = totalPages > 0 ? Math.round((currentPage / totalPages) * 100) : 0;
 
@@ -852,6 +1002,22 @@ export function PdfReader({
           title={immersive ? "Show toolbars (f)" : "Hide toolbars / fullscreen (f)"}
         >
           {immersive ? <Minimize className="h-5 w-5" /> : <Maximize className="h-5 w-5" />}
+        </button>
+        <button
+          type="button"
+          onClick={togglePageLayout}
+          aria-pressed={pageLayout === "double"}
+          aria-label={
+            pageLayout === "double" ? "Switch to single page" : "Show two pages side by side"
+          }
+          title={pageLayout === "double" ? "Single page" : "Side-by-side pages"}
+          className="p-2 rounded-lg text-white active:opacity-60"
+        >
+          {pageLayout === "double" ? (
+            <Columns2 className="h-5 w-5" />
+          ) : (
+            <FileText className="h-5 w-5" />
+          )}
         </button>
         <button
           type="button"
@@ -952,11 +1118,17 @@ export function PdfReader({
         onClick={onClick}
         onKeyUp={onReaderKeyUp}
       >
-        <div className="flex items-start justify-center min-h-full">
-          <div ref={pageLayerRef} className="pdf-page-layer relative">
+        <div className="flex items-start justify-center min-h-full gap-4 px-4">
+          <div ref={pageLayerRef} className="pdf-page-layer relative shrink-0">
             <canvas ref={canvasRef} className="block" />
             <div ref={annotationLayerRef} className="annotationLayer pdf-annotation-layer" />
           </div>
+          {showSpread && (
+            <div ref={pageLayerRef2} className="pdf-page-layer relative shrink-0">
+              <canvas ref={canvasRef2} className="block" />
+              <div ref={annotationLayerRef2} className="annotationLayer pdf-annotation-layer" />
+            </div>
+          )}
         </div>
       </div>
 
@@ -990,7 +1162,9 @@ export function PdfReader({
                 onCommit={setCurrentPage}
                 describedById="pdf-page-total"
               />
-              <span id="pdf-page-total">/ {totalPages}</span>
+              <span id="pdf-page-total">
+                {showSpread ? `/ ${currentPage + 1}–${totalPages}` : `/ ${totalPages}`}
+              </span>
             </span>
             <button
               type="button"

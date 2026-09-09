@@ -17,6 +17,8 @@ import {
   ChevronRight,
   Hand,
   BookOpen,
+  Columns2,
+  FileText,
 } from "lucide-react";
 import {
   ReaderErrorPanel,
@@ -36,6 +38,7 @@ import {
   saveBookProgress,
   progressPosKey,
   readScopedPos,
+  getLibraryScopeId,
 } from "@/lib/reading-progress";
 import { getNextReaderLoadMode, type ReaderLoadMode } from "./reader-types";
 
@@ -113,7 +116,9 @@ async function errorText(response: Response): Promise<string> {
   try {
     const data = (await response.json()) as { error?: string };
     if (data.error) return data.error;
-  } catch {}
+  } catch (error) {
+    noteIgnoredEpubError("parse error body", error);
+  }
 
   return `HTTP ${response.status}`;
 }
@@ -183,6 +188,8 @@ function fractionToPercent(value: unknown): number | null {
 }
 
 function getLinearSpineItems(book: Book | null): SpineItemLike[] {
+  // SAFETY: epubjs has no public spine-items type; the shape is verified at
+  // runtime by the Array.isArray filter below, so a mismatch yields [].
   const spineItems = (book?.spine as unknown as { spineItems?: SpineItemLike[] } | undefined)
     ?.spineItems;
   if (!Array.isArray(spineItems)) return [];
@@ -202,7 +209,9 @@ function getSpineProgress(location: Location, book: Book | null): number | null 
     try {
       const last = book?.spine?.last();
       if (typeof last?.index === "number") lastIndex = last.index;
-    } catch {}
+    } catch (error) {
+      noteIgnoredEpubError("read spine end", error);
+    }
     sectionCount = Math.max(lastIndex + 1, startIndex + 1);
     sectionPosition = startIndex;
   } else if (sectionPosition < 0) {
@@ -233,7 +242,9 @@ function getEpubProgress(location: Location | null | undefined, book: Book | nul
     const cfi = location.start.cfi;
     const cfiPercent = cfi ? fractionToPercent(book?.locations?.percentageFromCfi(cfi)) : null;
     if (cfiPercent !== null && cfiPercent > 0) return roundProgress(cfiPercent);
-  } catch {}
+  } catch (error) {
+    noteIgnoredEpubError("read CFI progress", error);
+  }
 
   const spinePercent = getSpineProgress(location, book);
   if (spinePercent !== null) return roundProgress(spinePercent);
@@ -287,6 +298,16 @@ function isInteractiveTarget(target: ReaderPointerTarget): boolean {
   );
 }
 
+type EpubPageLayout = "single" | "double";
+
+// epub.js teardown/pre-warm paths race in-flight async work by design, so
+// destroy/navigation/location rejections are routine and unactionable. Log
+// them at debug level instead of swallowing silently or interrupting reading
+// with UI errors.
+function noteIgnoredEpubError(stage: string, error: unknown): void {
+  console.debug(`[EpubReader] ignored ${stage} error`, error);
+}
+
 export function EpubReader({
   streamUrl,
   fullUrl,
@@ -337,11 +358,20 @@ export function EpubReader({
   );
   const [isTouchDevice] = useState(() => window.matchMedia("(hover: none)").matches);
   const settingsDialogRef = useRef<HTMLDivElement>(null);
+  // Single page or side-by-side spread, persisted per book. Applied at
+  // rendition creation and toggled live via rendition.spread().
+  const spreadKey = `caliber-layout-${getLibraryScopeId()}-${bookId}-epub`;
+  const [pageLayout, setPageLayout] = useState<EpubPageLayout>(() =>
+    stored(spreadKey, "single" as EpubPageLayout),
+  );
+  const pageLayoutRef = useRef(pageLayout);
 
   useEffect(() => {
     try {
       localStorage.setItem("caliber-touch-mode", JSON.stringify(touchMode));
-    } catch {}
+    } catch (error) {
+      noteIgnoredEpubError("persist touch mode", error);
+    }
   }, [touchMode]);
 
   const openSettings = useCallback(() => {
@@ -404,6 +434,10 @@ export function EpubReader({
   }, [theme]);
 
   useEffect(() => {
+    pageLayoutRef.current = pageLayout;
+  }, [pageLayout]);
+
+  useEffect(() => {
     showSettingsRef.current = showSettings;
   }, [showSettings]);
 
@@ -451,7 +485,13 @@ export function EpubReader({
             return;
           }
 
-          const container = await fetch(streamEntryUrl(streamUrl, "META-INF/container.xml"), {
+          const containerUrl = streamEntryUrl(streamUrl, "META-INF/container.xml");
+          // The stream backend is always same-origin; refuse an off-origin URL
+          // so book content can never turn the reader into an open fetcher.
+          if (new URL(containerUrl, window.location.href).origin !== window.location.origin) {
+            throw new Error("Refusing to load EPUB container from another origin");
+          }
+          const container = await fetch(containerUrl, {
             signal: abort.signal,
           });
           if (!container.ok) throw new Error(await errorText(container));
@@ -474,7 +514,9 @@ export function EpubReader({
         if (cancelled || !viewerRef.current) {
           try {
             book.destroy();
-          } catch {}
+          } catch (error) {
+            noteIgnoredEpubError("destroy book", error);
+          }
           return;
         }
 
@@ -484,7 +526,11 @@ export function EpubReader({
           width: "100%",
           height: "100%",
           flow: "paginated",
-          spread: "none",
+          // "always" forces facing pages even on narrow screens; the
+          // minSpreadWidth floor of 1 keeps epubjs from collapsing the
+          // spread back to a single column. "none" is strict single page.
+          spread: pageLayoutRef.current === "double" ? "always" : "none",
+          minSpreadWidth: 1,
           allowScriptedContent: false,
         });
         renditionRef.current = rendition;
@@ -507,7 +553,9 @@ export function EpubReader({
           if (cfi) {
             try {
               localStorage.setItem(posKey, JSON.stringify({ cfi, ts: Date.now() }));
-            } catch {}
+            } catch (error) {
+              noteIgnoredEpubError("persist position", error);
+            }
             // Sync to the signed-in user's server-side progress (debounced).
             // Held back until the initial restore attempt settles so a slow or
             // failed fetch can't let this device's older position clobber
@@ -558,7 +606,9 @@ export function EpubReader({
               const s = localStorage.getItem(posKey);
               if (s) savedCfi = JSON.parse(s).cfi;
             }
-          } catch {}
+          } catch (error) {
+            noteIgnoredEpubError("restore position", error);
+          }
         }
         // F03: validate CFI shape before restoring; garbage never reaches display().
         if (savedCfi && !savedCfi.startsWith("epubcfi(")) {
@@ -579,7 +629,9 @@ export function EpubReader({
           .then((nav: Navigation) => {
             if (!cancelled) setToc(nav.toc);
           })
-          .catch(() => {});
+          .catch((error: unknown) => {
+            noteIgnoredEpubError("load table of contents", error);
+          });
 
         // Generate locations for progress (async, doesn't block)
         book.ready
@@ -596,7 +648,9 @@ export function EpubReader({
               }
             }
           })
-          .catch(() => {});
+          .catch((error: unknown) => {
+            noteIgnoredEpubError("generate locations", error);
+          });
 
         const navigateFromPointer = (clientX: number, viewportWidth: number) => {
           // Narrow 15% edge zones turn pages; the center 70% is interactive.
@@ -698,7 +752,9 @@ export function EpubReader({
       }
     }
 
-    void openBook().catch(() => {});
+    void openBook().catch((error: unknown) => {
+      noteIgnoredEpubError("open book", error);
+    });
 
     return () => {
       cancelled = true;
@@ -717,11 +773,15 @@ export function EpubReader({
       if (r)
         try {
           r.destroy();
-        } catch {}
+        } catch (error) {
+          noteIgnoredEpubError("destroy rendition", error);
+        }
       if (b)
         try {
           b.destroy();
-        } catch {}
+        } catch (error) {
+          noteIgnoredEpubError("destroy book", error);
+        }
     };
   }, [streamUrl, fullUrl, loadMode, posKey, toggleUI, toggleImmersive, bookId]);
 
@@ -730,7 +790,9 @@ export function EpubReader({
     renditionRef.current?.themes.select(theme);
     try {
       localStorage.setItem("caliber-reader-theme", JSON.stringify(theme));
-    } catch {}
+    } catch (error) {
+      noteIgnoredEpubError("persist theme", error);
+    }
   }, [theme]);
 
   // Font size changes
@@ -738,7 +800,9 @@ export function EpubReader({
     renditionRef.current?.themes.fontSize(`${fontSize}%`);
     try {
       localStorage.setItem("caliber-fontsize", JSON.stringify(fontSize));
-    } catch {}
+    } catch (error) {
+      noteIgnoredEpubError("persist font size", error);
+    }
   }, [fontSize]);
 
   const handleTocNav = useCallback((href: string) => {
@@ -746,6 +810,31 @@ export function EpubReader({
     setShowToc(false);
     setShowUI(false);
   }, []);
+
+  // Live spread toggle: epubjs re-layouts the current position, then we
+  // re-display the current CFI so facing pages settle deterministically.
+  const applyPageLayout = useCallback(
+    (next: EpubPageLayout) => {
+      setPageLayout(next);
+      try {
+        localStorage.setItem(spreadKey, JSON.stringify(next));
+      } catch (error) {
+        noteIgnoredEpubError("persist page layout", error);
+      }
+      const rendition = renditionRef.current;
+      if (!rendition) return;
+      void (async () => {
+        try {
+          rendition.spread(next === "double" ? "always" : "none", 0);
+          const cfi = lastLocationRef.current?.start?.cfi ?? rendition.location?.start?.cfi;
+          await rendition.display(cfi);
+        } catch (error) {
+          noteIgnoredEpubError("apply page layout", error);
+        }
+      })();
+    },
+    [spreadKey],
+  );
 
   const bg = BG[theme];
   const fg = FG[theme];
@@ -1048,6 +1137,50 @@ export function EpubReader({
                   ))}
                 </div>
               </div>
+
+              {/* Page layout (reflowable books only; the single-file HTML
+                  fallback has no spread to toggle) */}
+              {!htmlDocument && (
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-medium" style={{ color: fg }}>
+                    Page layout
+                  </span>
+                  <fieldset
+                    className="flex items-center rounded-full border p-1"
+                    style={{ borderColor: subtle }}
+                  >
+                    <legend className="sr-only">Page layout</legend>
+                    {(
+                      [
+                        { value: "single", label: "Single", icon: FileText },
+                        { value: "double", label: "Double", icon: Columns2 },
+                      ] as const
+                    ).map(({ value, label, icon: Icon }) => (
+                      <button
+                        type="button"
+                        key={value}
+                        onClick={() => applyPageLayout(value)}
+                        aria-pressed={pageLayout === value}
+                        aria-label={`${label} page layout`}
+                        title={value === "single" ? "One page at a time" : "Two pages side by side"}
+                        className="flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs active:opacity-60"
+                        style={{
+                          color: fg,
+                          background:
+                            pageLayout === value
+                              ? isDark
+                                ? "rgba(255,255,255,0.12)"
+                                : "rgba(0,0,0,0.08)"
+                              : "transparent",
+                        }}
+                      >
+                        <Icon className="h-4 w-4" />
+                        {label}
+                      </button>
+                    ))}
+                  </fieldset>
+                </div>
+              )}
             </div>
           </div>
         </>
