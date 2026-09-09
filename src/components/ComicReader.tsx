@@ -1,6 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import JSZip from "jszip";
-import { ArrowLeft, ChevronLeft, ChevronRight, Download, Wifi, ZoomIn, ZoomOut } from "lucide-react";
+import { ChevronLeft, ChevronRight, Wifi, ZoomIn, ZoomOut } from "lucide-react";
+import {
+  ReaderErrorPanel,
+  ReaderFooterShell,
+  ReaderHeader,
+  ReaderLoadingOverlay,
+  ReaderLoadModeToggle,
+  ReaderPageInput,
+  ReaderRoot,
+  darkTone,
+} from "./ReaderChrome";
 import { useReaderSettings } from "@/lib/reader-settings";
 import { flushBookProgress, fetchBookProgress, saveBookProgress, progressPosKey, readScopedPos } from "@/lib/reading-progress";
 import {
@@ -594,109 +604,70 @@ export function ComicReader({
   const progress = totalPages > 0 ? Math.round((currentPage / totalPages) * 100) : 0;
 
   return (
-    <div className="fixed inset-0 z-[100] flex flex-col bg-neutral-950 select-none">
+    <ReaderRoot bgClassName="bg-neutral-950">
       {isLoading && (
-        <div className="absolute inset-0 z-[115] flex items-center justify-center bg-neutral-950">
-          <div className="flex flex-col items-center gap-3">
-            <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
-            <p className="text-sm text-white/50">
-              {loadMode === "stream" ? "Streaming pages…" : "Loading comic…"}
-            </p>
-          </div>
-        </div>
+        <ReaderLoadingOverlay
+          message={loadMode === "stream" ? "Streaming pages…" : "Loading comic…"}
+          bgClassName="bg-neutral-950"
+        />
       )}
 
       {loadError && (
-        <div className="absolute inset-0 z-[115] flex items-center justify-center bg-neutral-950">
-          <div className="max-w-sm px-6 text-center">
-            <p className="text-sm text-white/70">Failed to load comic: {loadError}</p>
-            <button
-              type="button"
-              onClick={() => setLoadMode("stream")}
-              className="mt-4 rounded bg-white/10 px-4 py-2 text-sm text-white active:opacity-70"
-            >
-              Try streaming
-            </button>
-          </div>
-        </div>
+        <ReaderErrorPanel
+          kindLabel="comic"
+          detail={loadError}
+          // "Try streaming" is a no-op state set when already streaming
+          // (e.g. CBR, which has no full-file path), so hide the retry
+          // button there instead of showing a dead control.
+          onRetry={loadMode === "stream" ? undefined : () => setLoadMode("stream")}
+          onBack={onBack}
+          downloadHref={`/api/books/${bookId}/download/${format}`}
+          bgClassName="bg-neutral-950"
+        />
       )}
 
-      <div
-        className="shrink-0 z-[108] transition-transform duration-200"
-        style={{
-          transform: showUI ? "translateY(0)" : "translateY(-100%)",
-          background: "rgba(0,0,0,0.85)",
-          backdropFilter: "blur(12px)",
-          borderBottom: "1px solid rgba(255,255,255,0.1)",
-          paddingTop: "env(safe-area-inset-top, 0px)",
-        }}
-      >
-        <div className="flex h-12 items-center justify-between px-3">
-          <button
-            type="button"
-            onClick={onBack}
-            aria-label="Back to book"
-            title="Back to book"
-            className="-ml-1 rounded-lg p-2 text-white active:opacity-60"
+      <ReaderHeader title={title} showUI={showUI} onBack={onBack} overlay={false} tone={darkTone()}>
+        {supportsFullFile ? (
+          <ReaderLoadModeToggle
+            loadMode={loadMode}
+            onToggle={toggleLoadMode}
+            streamLabel="Streaming pages"
+            fullLabel="Full-file loading"
+            tone={darkTone()}
+          />
+        ) : (
+          <span
+            className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs text-white/70"
+            title="Streaming pages"
           >
-            <ArrowLeft className="h-5 w-5" />
-          </button>
-          <span className="mx-2 flex-1 truncate text-center text-sm font-medium text-white">
-            {title}
+            <Wifi className="h-4 w-4" />
+            <span className="hidden sm:inline">Stream</span>
           </span>
-          <div className="flex items-center gap-1">
-            {supportsFullFile ? (
-              <button
-                type="button"
-                onClick={toggleLoadMode}
-                className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs text-white active:opacity-60"
-                aria-label={loadMode === "stream" ? "Streaming pages" : "Full-file loading"}
-                title={loadMode === "stream" ? "Streaming pages" : "Full-file loading"}
-              >
-                {loadMode === "stream" ? (
-                  <Wifi className="h-4 w-4" />
-                ) : (
-                  <Download className="h-4 w-4" />
-                )}
-                <span className="hidden sm:inline">
-                  {loadMode === "stream" ? "Stream" : "Full"}
-                </span>
-              </button>
-            ) : (
-              <span
-                className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs text-white/70"
-                title="Streaming pages"
-              >
-                <Wifi className="h-4 w-4" />
-                <span className="hidden sm:inline">Stream</span>
-              </span>
-            )}
-            <button
-              type="button"
-              onClick={() => setZoom((z) => Math.max(0.5, z - 0.25))}
-              aria-label="Zoom out"
-              title="Zoom out"
-              className="rounded-lg p-2 text-white active:opacity-60"
-            >
-              <ZoomOut className="h-5 w-5" />
-            </button>
-            <span className="w-10 text-center text-xs tabular-nums text-white/60">
-              {Math.round(zoom * 100)}%
-            </span>
-            <button
-              type="button"
-              onClick={() => setZoom((z) => Math.min(3, z + 0.25))}
-              aria-label="Zoom in"
-              title="Zoom in"
-              className="-mr-1 rounded-lg p-2 text-white active:opacity-60"
-            >
-              <ZoomIn className="h-5 w-5" />
-            </button>
-          </div>
-        </div>
-      </div>
+        )}
+        <button
+          type="button"
+          onClick={() => setZoom((z) => Math.max(0.5, z - 0.25))}
+          aria-label="Zoom out"
+          title="Zoom out"
+          className="rounded-lg p-2 text-white active:opacity-60"
+        >
+          <ZoomOut className="h-5 w-5" />
+        </button>
+        <span className="w-10 text-center text-xs tabular-nums text-white/60">
+          {Math.round(zoom * 100)}%
+        </span>
+        <button
+          type="button"
+          onClick={() => setZoom((z) => Math.min(3, z + 0.25))}
+          aria-label="Zoom in"
+          title="Zoom in"
+          className="-mr-1 rounded-lg p-2 text-white active:opacity-60"
+        >
+          <ZoomIn className="h-5 w-5" />
+        </button>
+      </ReaderHeader>
 
-      <div className="relative min-h-0 flex-1 overflow-auto">
+      <section className="relative min-h-0 flex-1 overflow-auto" aria-label="Comic pages">
         <div className="flex min-h-full items-start justify-center">
           {displayed && (
             <img
@@ -748,25 +719,16 @@ export function ComicReader({
         {!isLoading && zoom === 1 && (
           <button
             type="button"
-            aria-label="Page navigation overlay"
+            aria-label="Page navigation: tap the left edge for the previous page, the right edge for the next page, or the center to toggle toolbars"
             className="absolute inset-0 z-[106] m-0 block h-full w-full cursor-default appearance-none border-none bg-transparent p-0 outline-none"
             onTouchStart={onTouchStart}
             onTouchEnd={onTouchEnd}
             onClick={onClick}
           />
         )}
-      </div>
+      </section>
 
-      <div
-        className="shrink-0 z-[108] transition-transform duration-200"
-        style={{
-          transform: showUI ? "translateY(0)" : "translateY(100%)",
-          background: "rgba(0,0,0,0.85)",
-          backdropFilter: "blur(12px)",
-          borderTop: "1px solid rgba(255,255,255,0.1)",
-          paddingBottom: "env(safe-area-inset-bottom, 0px)",
-        }}
-      >
+      <ReaderFooterShell showUI={showUI} overlay={false} tone={darkTone()}>
         <div className="px-4 py-3">
           <div className="mb-2 h-1 w-full rounded-full bg-white/10">
             <div
@@ -786,26 +748,13 @@ export function ComicReader({
               <ChevronLeft className="h-5 w-5" />
             </button>
             <span className="flex items-center gap-1 text-sm tabular-nums text-white/60">
-              <input
-                type="number"
-                min={1}
-                max={totalPages || 1}
+              <ReaderPageInput
                 value={currentPage}
-                onChange={(e) => {
-                  const val = parseInt(e.target.value, 10);
-                  if (Number.isInteger(val) && val >= 1 && val <= (totalPages || 1)) {
-                    setCurrentPage(val);
-                  }
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-                  e.stopPropagation();
-                }}
-                onClick={(e) => e.stopPropagation()}
-                className="w-10 bg-transparent text-center text-sm text-white/60 tabular-nums [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none outline-none border-b border-white/20 focus:border-white/50"
-                aria-label="Page number"
+                max={totalPages || 1}
+                onCommit={setCurrentPage}
+                describedById="comic-page-total"
               />
-              <span>/ {totalPages || "-"}</span>
+              <span id="comic-page-total">/ {totalPages || "-"}</span>
             </span>
             <button
               type="button"
@@ -819,7 +768,7 @@ export function ComicReader({
             </button>
           </div>
         </div>
-      </div>
-    </div>
+      </ReaderFooterShell>
+    </ReaderRoot>
   );
 }

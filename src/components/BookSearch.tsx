@@ -13,16 +13,29 @@ export const BookSearch = memo(function BookSearch({
   const [inputValue, setInputValue] = useState(initialValue);
   const isMounted = useRef(false);
 
+  // Keep the input in sync when initialValue changes from outside (e.g.
+  // back-navigation restores a different ?q= from the URL). Typing only
+  // flows outward through the debounced onSearch below.
+  useEffect(() => {
+    setInputValue(initialValue);
+  }, [initialValue]);
+
   useEffect(() => {
     if (!isMounted.current) {
       isMounted.current = true;
       return;
     }
+    // The URL is the source of truth: when the input already matches it
+    // (e.g. a remount that adopted a transiently stale initialValue during
+    // a history pop, or the echo of our own just-committed write) there is
+    // nothing to propagate. Without this guard a stale "" would be
+    // debounce-written back to the URL and permanently clear ?q=.
+    if (inputValue === initialValue) return;
     const timer = setTimeout(() => {
       onSearch(inputValue);
     }, 300);
     return () => clearTimeout(timer);
-  }, [inputValue, onSearch]);
+  }, [inputValue, initialValue, onSearch]);
 
   const handleChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     setInputValue(e.target.value);
@@ -30,7 +43,10 @@ export const BookSearch = memo(function BookSearch({
 
   const handleClear = useCallback(() => {
     setInputValue("");
-  }, []);
+    // Clearing is explicit intent: notify immediately instead of waiting
+    // out the debounce so results reset without a laggy round-trip.
+    onSearch("");
+  }, [onSearch]);
 
   return (
     <div className="relative">

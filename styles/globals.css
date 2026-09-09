@@ -47,6 +47,18 @@
   /* Semantic error color — mirrors --error in :root */
   --color-error: #dc2626;
 
+  /* Paper/ink families — mirror the :root palette so Tailwind generates
+     real color utilities (including opacity modifiers like
+     bg-parchment-dark/70 and hover:bg-ink/5 via color-mix). Values stay
+     in sync with --bg-*, --text-* in :root, which remain canonical. */
+  --color-parchment: var(--bg);
+  --color-parchment-dark: var(--bg-muted);
+  --color-parchment-warm: var(--bg-subtle);
+  --color-ink: var(--text);
+  --color-ink-secondary: var(--text-secondary);
+  --color-ink-tertiary: var(--text-tertiary);
+  --color-ink-muted: var(--text-muted);
+
   /* Radius - Subtle rounding */
   --radius-sm: 6px;
   --radius-md: 10px;

@@ -13,6 +13,7 @@ interface BookGridInfiniteProps {
   searchQuery: string;
   sortConfig: SortConfig;
   tagIds?: number[];
+  onClearFilters?: () => void;
 }
 
 const CARD_GAP = 16;
@@ -58,7 +59,12 @@ const GridCard = memo(function GridCard({ book }: { book: BookListItem }) {
   );
 });
 
-export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, sortConfig, tagIds }: BookGridInfiniteProps) {
+export const BookGridInfinite = memo(function BookGridInfinite({
+  searchQuery,
+  sortConfig,
+  tagIds,
+  onClearFilters,
+}: BookGridInfiniteProps) {
   const {
     books, totalCount, retainedCount, windowTruncated, hasNextPage, fetchNextPage,
     isFetchingNextPage, isFetchNextPageError, isLoading, isError, error, errorStage,
@@ -352,6 +358,16 @@ export const BookGridInfinite = memo(function BookGridInfinite({ searchQuery, so
                   ? "Please sign in again to continue browsing."
                   : "No books match the current filters."}
         </p>
+        {(searchQuery !== "" || (tagIds?.length ?? 0) > 0) && onClearFilters && (
+          <button
+            type="button"
+            onClick={onClearFilters}
+            aria-label="Clear search and filters"
+            className="mt-3 rounded-lg border border-ink px-3 py-1.5 text-sm font-medium text-ink hover:bg-parchment-dark transition-colors"
+          >
+            Clear search and filters
+          </button>
+        )}
       </div>
     );
   }

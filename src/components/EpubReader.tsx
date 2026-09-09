@@ -6,14 +6,11 @@ import type { Location } from "epubjs/types/rendition";
 import type { NavItem } from "epubjs/types/navigation";
 import type Navigation from "epubjs/types/navigation";
 import {
-  ArrowLeft,
   Settings,
   List,
   Minus,
   Plus,
   X,
-  Download,
-  Wifi,
   Maximize,
   Minimize,
   ChevronLeft,
@@ -21,6 +18,16 @@ import {
   Hand,
   BookOpen,
 } from "lucide-react";
+import {
+  ReaderErrorPanel,
+  ReaderFooterShell,
+  ReaderHeader,
+  ReaderLoadingOverlay,
+  ReaderLoadModeToggle,
+  ReaderRoot,
+  themedTone,
+  useDialogFocusTrap,
+} from "./ReaderChrome";
 import { stored } from "@/lib/utils";
 import { useFullscreen } from "@/lib/use-fullscreen";
 import { flushBookProgress, fetchBookProgress, saveBookProgress, progressPosKey, readScopedPos } from "@/lib/reading-progress";
@@ -319,7 +326,6 @@ export function EpubReader({
     stored("caliber-touch-mode", "read" as TouchMode),
   );
   const [isTouchDevice] = useState(() => window.matchMedia("(hover: none)").matches);
-  const [settingsReturnFocus, setSettingsReturnFocus] = useState<HTMLElement | null>(null);
   const settingsDialogRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -329,49 +335,21 @@ export function EpubReader({
   }, [touchMode]);
 
   const openSettings = useCallback(() => {
-    setSettingsReturnFocus(document.activeElement as HTMLElement | null);
     setShowToc(false);
     setShowSettings(true);
   }, []);
 
   const closeSettings = useCallback(() => {
     setShowSettings(false);
-    // Return focus to the opener for screen-reader continuity.
-    settingsReturnFocus?.focus?.();
-  }, [settingsReturnFocus]);
+  }, []);
 
-  // Focus trap + Esc handling for the settings dialog primitive.
-  useEffect(() => {
-    if (!showSettings) return;
-    const dialog = settingsDialogRef.current;
-    dialog?.querySelector<HTMLElement>("button")?.focus();
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        closeSettings();
-        return;
-      }
-      if (e.key !== "Tab" || !dialog) return;
-      const focusables = dialog.querySelectorAll<HTMLElement>(
-        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-      );
-      const items = Array.from(focusables).filter((el) => !el.hasAttribute("disabled"));
-      if (items.length === 0) return;
-      const first = items[0];
-      const last = items[items.length - 1];
-      if (!first || !last) return;
-      if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    };
-    document.addEventListener("keydown", onKeyDown, true);
-    return () => document.removeEventListener("keydown", onKeyDown, true);
-  }, [showSettings, closeSettings]);
-  const { isFullscreen, supported: fullscreenSupported, toggle: toggleFullscreen } = useFullscreen();
+  // Focus trap + Esc handling + opener focus-restore for the settings dialog.
+  useDialogFocusTrap(showSettings, settingsDialogRef, closeSettings);
+  const {
+    isFullscreen,
+    supported: fullscreenSupported,
+    toggle: toggleFullscreen,
+  } = useFullscreen();
   const fontSizeRef = useRef(fontSize);
   const themeRef = useRef(theme);
   const showSettingsRef = useRef(showSettings);
@@ -765,146 +743,100 @@ export function EpubReader({
   const subtle = isDark ? "rgba(255,255,255,0.12)" : "rgba(0,0,0,0.08)";
   const barBg = isDark ? "rgba(0,0,0,0.88)" : "rgba(255,255,255,0.96)";
 
+  const tone = themedTone({ fg, barBg, subtle });
+
   return (
-    <div className="fixed inset-0 z-[100] flex flex-col select-none" style={{ background: bg }}>
+    <ReaderRoot bgClassName="" style={{ background: bg }}>
       {/* Loading */}
       {isLoading && (
-        <div
-          className="absolute inset-0 z-[115] flex items-center justify-center"
-          style={{ background: bg }}
-        >
-          <div className="flex flex-col items-center gap-3">
-            <div
-              className="h-8 w-8 animate-spin rounded-full border-2 border-current/30 border-t-current"
-              style={{ color: fg }}
-            />
-            <p className="text-sm" style={{ color: fg, opacity: 0.6 }}>
-              {loadMode === "stream" ? "Streaming book…" : "Loading book…"}
-            </p>
-          </div>
-        </div>
+        <ReaderLoadingOverlay
+          message={loadMode === "stream" ? "Streaming book…" : "Loading book…"}
+          bg={bg}
+          fg={fg}
+        />
       )}
 
       {loadError && (
-        <div
-          className="absolute inset-0 z-[115] flex items-center justify-center"
-          style={{ background: bg }}
-        >
-          <div className="max-w-sm px-6 text-center">
-            <p className="text-sm" style={{ color: fg, opacity: 0.75 }}>
-              Failed to load EPUB: {loadError}
-            </p>
-            <button
-              type="button"
-              onClick={() => setLoadMode("stream")}
-              className="mt-4 rounded px-4 py-2 text-sm active:opacity-70"
-              style={{ color: fg, border: `1px solid ${subtle}` }}
-            >
-              Try streaming
-            </button>
-          </div>
-        </div>
+        <ReaderErrorPanel
+          kindLabel="EPUB"
+          detail={loadError}
+          onRetry={() => setLoadMode("stream")}
+          onBack={onBack}
+          downloadHref={`/api/books/${bookId}/download/EPUB`}
+          bg={bg}
+          fg={fg}
+          subtle={subtle}
+        />
       )}
 
       {/* Header overlay: position fixed so immersive mode never reserves
           flex space or shifts the page layout. */}
-      <div
-        className="fixed top-0 left-0 right-0 z-[108] transition-transform duration-200"
-        style={{
-          transform: showUI ? "translateY(0)" : "translateY(-100%)",
-          background: barBg,
-          backdropFilter: "blur(12px)",
-          borderBottom: `1px solid ${subtle}`,
-          paddingTop: "env(safe-area-inset-top, 0px)",
-          pointerEvents: showUI ? "auto" : "none",
-        }}
+      <ReaderHeader
+        title={title}
+        showUI={showUI}
+        onBack={onBack}
+        overlay
+        tone={tone}
+        actionsClassName="flex items-center"
       >
-        <div className="flex items-center justify-between px-3 h-12">
-          <button
-            type="button"
-            onClick={onBack}
-            aria-label="Back to book"
-            title="Back to book"
-            className="p-2 -ml-1 rounded-lg active:opacity-60"
-            style={{ color: fg }}
-          >
-            <ArrowLeft className="h-5 w-5" />
-          </button>
-          <span
-            className="text-sm truncate mx-2 flex-1 text-center font-medium"
-            style={{ color: fg }}
-          >
-            {title}
-          </span>
-          <div className="flex items-center">
-            <button
-              type="button"
-              onClick={toggleLoadMode}
-              className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs active:opacity-60"
-              style={{ color: fg }}
-              aria-label={loadMode === "stream" ? "Streaming book" : "Full-file loading"}
-              title={loadMode === "stream" ? "Streaming book" : "Full-file loading"}
-            >
-              {loadMode === "stream" ? (
-                <Wifi className="h-4 w-4" />
-              ) : (
-                <Download className="h-4 w-4" />
-              )}
-              <span className="hidden sm:inline">{loadMode === "stream" ? "Stream" : "Full"}</span>
-            </button>
-            <button
-              type="button"
-              onClick={toggleImmersive}
-              className="p-2 rounded-lg active:opacity-60"
-              style={{ color: fg }}
-              aria-label={immersive ? "Show toolbars" : "Hide toolbars"}
-              title={immersive ? "Show toolbars (f)" : "Hide toolbars / fullscreen (f)"}
-            >
-              {immersive ? <Minimize className="h-5 w-5" /> : <Maximize className="h-5 w-5" />}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setShowToc(true);
-                setShowSettings(false);
-              }}
-              aria-label="Table of contents"
-              title="Table of contents"
-              className="p-2 rounded-lg active:opacity-60"
-              style={{ color: fg }}
-            >
-              <List className="h-5 w-5" />
-            </button>
-            <button
-              type="button"
-              onClick={() => setTouchMode((m) => (m === "read" ? "interact" : "read"))}
-              className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs active:opacity-60"
-              style={{ color: fg }}
-              aria-label={touchMode === "read" ? "Reading mode: tap center toggles toolbars" : "Interact mode: center passes through to book content"}
-              aria-pressed={touchMode === "interact"}
-              title={touchMode === "read" ? "Switch to Interact mode" : "Switch to Read mode"}
-            >
-              {touchMode === "read" ? (
-                <BookOpen className="h-4 w-4" />
-              ) : (
-                <Hand className="h-4 w-4" />
-              )}
-              <span className="hidden sm:inline">{touchMode === "read" ? "Read" : "Interact"}</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => (showSettings ? closeSettings() : openSettings())}
-              aria-label="Reader settings"
-              aria-haspopup="dialog"
-              title="Reader settings"
-              className="p-2 -mr-1 rounded-lg active:opacity-60"
-              style={{ color: fg }}
-            >
-              <Settings className="h-5 w-5" />
-            </button>
-          </div>
-        </div>
-      </div>
+        <ReaderLoadModeToggle
+          loadMode={loadMode}
+          onToggle={toggleLoadMode}
+          streamLabel="Streaming book"
+          fullLabel="Full-file loading"
+          tone={tone}
+        />
+        <button
+          type="button"
+          onClick={toggleImmersive}
+          className="p-2 rounded-lg active:opacity-60"
+          style={{ color: fg }}
+          aria-label={immersive ? "Show toolbars" : "Hide toolbars"}
+          title={immersive ? "Show toolbars (f)" : "Hide toolbars / fullscreen (f)"}
+        >
+          {immersive ? <Minimize className="h-5 w-5" /> : <Maximize className="h-5 w-5" />}
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setShowToc(true);
+            setShowSettings(false);
+          }}
+          aria-label="Table of contents"
+          title="Table of contents"
+          className="p-2 rounded-lg active:opacity-60"
+          style={{ color: fg }}
+        >
+          <List className="h-5 w-5" />
+        </button>
+        <button
+          type="button"
+          onClick={() => setTouchMode((m) => (m === "read" ? "interact" : "read"))}
+          className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs active:opacity-60"
+          style={{ color: fg }}
+          aria-label={
+            touchMode === "read"
+              ? "Reading mode: tap center toggles toolbars"
+              : "Interact mode: center passes through to book content"
+          }
+          aria-pressed={touchMode === "interact"}
+          title={touchMode === "read" ? "Switch to Interact mode" : "Switch to Read mode"}
+        >
+          {touchMode === "read" ? <BookOpen className="h-4 w-4" /> : <Hand className="h-4 w-4" />}
+          <span className="hidden sm:inline">{touchMode === "read" ? "Read" : "Interact"}</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => (showSettings ? closeSettings() : openSettings())}
+          aria-label="Reader settings"
+          aria-haspopup="dialog"
+          title="Reader settings"
+          className="p-2 -mr-1 rounded-lg active:opacity-60"
+          style={{ color: fg }}
+        >
+          <Settings className="h-5 w-5" />
+        </button>
+      </ReaderHeader>
 
       {/* Book viewer + touch overlay */}
       <div className="flex-1 relative min-h-0">
@@ -989,17 +921,7 @@ export function EpubReader({
 
       {/* Footer overlay: position fixed so immersive mode never reserves
           flex space or shifts the page layout. */}
-      <div
-        className="fixed bottom-0 left-0 right-0 z-[108] transition-transform duration-200"
-        style={{
-          transform: showUI ? "translateY(0)" : "translateY(100%)",
-          background: barBg,
-          backdropFilter: "blur(12px)",
-          borderTop: `1px solid ${subtle}`,
-          paddingBottom: "env(safe-area-inset-bottom, 0px)",
-          pointerEvents: showUI ? "auto" : "none",
-        }}
-      >
+      <ReaderFooterShell showUI={showUI} overlay tone={tone}>
         <div className="px-4 py-3">
           <div className="w-full h-1 rounded-full" style={{ background: subtle }}>
             <div
@@ -1019,7 +941,7 @@ export function EpubReader({
             <span>{touchMode === "read" ? "Read mode" : "Interact mode"}</span>
           </div>
         </div>
-      </div>
+      </ReaderFooterShell>
 
       {/* Settings dialog primitive: role=dialog + aria-modal with a focus
           trap and Esc handling (see effect above). */}
@@ -1176,6 +1098,6 @@ export function EpubReader({
           </div>
         </div>
       )}
-    </div>
+    </ReaderRoot>
   );
 }

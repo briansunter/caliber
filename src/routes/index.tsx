@@ -4,8 +4,14 @@ import { BookGridInfinite } from "@/components/BookGridInfinite";
 import { BookSearch } from "@/components/BookSearch";
 import { LibraryConfigPanel } from "@/components/LibraryConfigPanel";
 import { useState, useCallback, useMemo } from "react";
-import { BookOpen, Users, Layers, Library, LayoutGrid, List, Settings } from "lucide-react";
-import { useLibraryConfig, useLibraryStats, useTags, type SortConfig, type SortField } from "@/hooks/useBooksInfinite";
+import { BookOpen, Users, Layers, Library, LayoutGrid, List, Settings, X } from "lucide-react";
+import {
+  useLibraryConfig,
+  useLibraryStats,
+  useTags,
+  type SortConfig,
+  type SortField,
+} from "@/hooks/useBooksInfinite";
 import { UserMenu } from "@/components/UserMenu";
 import { TagFilter } from "@/components/TagFilter";
 import { RecentlyRead } from "@/components/RecentlyRead";
@@ -95,6 +101,9 @@ function IndexComponent() {
   const searchQuery = uiState.search;
   const viewMode = uiState.view;
   const sortConfig = uiState.sort;
+  // Selected tag chips render inside the sticky toolbar, growing its height.
+  // The sticky table header offset must grow with it or the rows slide under.
+  const hasSelectedTags = uiState.tags.length > 0;
 
   const updateCanonical = useCallback(
     (patch: Partial<CanonicalState>) => {
@@ -116,8 +125,9 @@ function IndexComponent() {
     (config: SortConfig) => updateCanonical({ sort: config }),
     [updateCanonical],
   );
-  const setTags = useCallback(
-    (tags: number[]) => updateCanonical({ tags }),
+  const setTags = useCallback((tags: number[]) => updateCanonical({ tags }), [updateCanonical]);
+  const clearSearchAndFilters = useCallback(
+    () => updateCanonical({ search: "", tags: [] }),
     [updateCanonical],
   );
   const toggleDensity = useCallback(() => {
@@ -243,25 +253,48 @@ function IndexComponent() {
           {viewMode === "grid" && (
             <GridSortBar sortConfig={sortConfig} onSortChange={setSortConfig} />
           )}
+          <SelectedTagChips
+            selectedIds={uiState.tags}
+            tags={tags}
+            onRemove={(id) => setTags(uiState.tags.filter((t) => t !== id))}
+            onClear={() => setTags([])}
+          />
         </div>
 
         {viewMode === "list" && (
           <>
-            {/* Table Header - Sticky below search */}
-            <div className="sticky top-[46px] sm:top-[56px] z-30 bg-parchment-dark">
+            {/* Table Header - Sticky below search; offset grows when the
+                selected-tag chips add a row to the sticky toolbar. */}
+            <div
+              className={
+                hasSelectedTags
+                  ? "sticky top-[80px] sm:top-[90px] z-30 bg-parchment-dark"
+                  : "sticky top-[46px] sm:top-[56px] z-30 bg-parchment-dark"
+              }
+            >
               <TableHeader sortConfig={sortConfig} onSortChange={setSortConfig} />
             </div>
 
             {/* Table Section */}
             <div className="bg-surface border-x border-b border-ink rounded-b-lg shadow-sm">
-              <BookTableInfinite searchQuery={searchQuery} sortConfig={sortConfig} tagIds={uiState.tags} />
+              <BookTableInfinite
+                searchQuery={searchQuery}
+                sortConfig={sortConfig}
+                tagIds={uiState.tags}
+                onClearFilters={clearSearchAndFilters}
+              />
             </div>
           </>
         )}
 
         {viewMode === "grid" && (
           <div className="bg-surface border-x border-b border-ink rounded-b-lg shadow-sm pt-4">
-            <BookGridInfinite searchQuery={searchQuery} sortConfig={sortConfig} tagIds={uiState.tags} />
+            <BookGridInfinite
+              searchQuery={searchQuery}
+              sortConfig={sortConfig}
+              tagIds={uiState.tags}
+              onClearFilters={clearSearchAndFilters}
+            />
           </div>
         )}
       </main>
@@ -361,6 +394,60 @@ function GridSortBar({
         <SortHeader label="Added" field="added" currentSort={sortConfig} onSort={handleSort} />
       </div>
     </div>
+  );
+}
+
+// Removable chips for the currently selected tags. Rendered inside the
+// sticky toolbar so active filters stay visible while scrolling. The URL
+// (`?tag=`) remains the source of truth — chips only call onRemove/onClear.
+function SelectedTagChips({
+  selectedIds,
+  tags,
+  onRemove,
+  onClear,
+}: {
+  selectedIds: number[];
+  tags: { id: number; name: string }[] | undefined;
+  onRemove: (id: number) => void;
+  onClear: () => void;
+}) {
+  if (selectedIds.length === 0) return null;
+  const nameById = new Map((tags ?? []).map((t) => [t.id, t.name] as const));
+  return (
+    <ul
+      className="mt-2 flex flex-wrap items-center gap-1.5 list-none m-0 p-0"
+      aria-label="Selected tags"
+    >
+      {selectedIds.map((id) => {
+        const name = nameById.get(id) ?? `Tag ${id}`;
+        return (
+          <li
+            key={id}
+            className="inline-flex items-center gap-1 rounded-full border border-ink bg-surface py-1 pl-2.5 pr-1.5 text-xs font-medium text-ink"
+          >
+            <span className="max-w-[160px] truncate">{name}</span>
+            <button
+              type="button"
+              onClick={() => onRemove(id)}
+              aria-label={`Remove ${name} filter`}
+              className="flex h-5 w-5 items-center justify-center rounded-full text-ink-muted transition-colors hover:bg-parchment-dark hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            >
+              <X className="h-3 w-3" strokeWidth={2.5} />
+            </button>
+          </li>
+        );
+      })}
+      <li>
+        <button
+          type="button"
+          onClick={onClear}
+          aria-label="Clear all selected tags"
+          className="text-xs font-semibold text-accent hover:text-accent-hover transition-colors"
+        >
+          Clear all
+        </button>
+      </li>
+    </ul>
   );
 }
 

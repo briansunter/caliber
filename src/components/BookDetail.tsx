@@ -25,6 +25,11 @@ interface BookDetailProps {
 
 const RATING_STAR_KEYS = ["star-1", "star-2", "star-3", "star-4", "star-5"] as const;
 
+// Single theme-token action style shared by the Read and Download buttons.
+// Uses parchment/ink tokens only (no hardcoded hex) so both actions match.
+const BOOK_ACTION_BUTTON_CLASS =
+  "bg-ink text-white border-ink hover:bg-ink-secondary shadow-sm transition-colors duration-150 rounded text-xs uppercase tracking-wider font-semibold cursor-pointer";
+
 // Elegant book cover with leather-bound shadow and spine effect
 const BookCover = memo(function BookCover({
   bookId,
@@ -99,6 +104,7 @@ const MetadataRow = memo(function MetadataRow({
   value: React.ReactNode;
   highlight?: boolean;
 }) {
+  const valueText = typeof value === "string" ? value : undefined;
   return (
     <div className="flex items-center gap-3 py-2">
       <div className="flex items-center justify-center w-8 h-8 rounded bg-parchment-dark text-ink-muted border border-ink">
@@ -111,6 +117,7 @@ const MetadataRow = memo(function MetadataRow({
             "text-sm truncate",
             highlight ? "font-semibold text-accent" : "text-ink-secondary",
           )}
+          title={valueText}
         >
           {value}
         </p>
@@ -131,7 +138,7 @@ const StarRating = memo(function StarRating({ rating }: { rating: number | null 
   if (!stars) return null;
 
   return (
-    <div className="flex items-center gap-0.5">
+    <div className="flex items-center gap-0.5" role="img" aria-label={`Rated ${rating} out of 10`}>
       {RATING_STAR_KEYS.map((starKey, i) => (
         <Star
           key={starKey}
@@ -150,7 +157,8 @@ const StarRating = memo(function StarRating({ rating }: { rating: number | null 
   );
 });
 
-// Download format button
+// Download format button - plain anchor with the download attribute so the
+// file saves via the same /api/books/:id/download/:format path (no window.open).
 const FormatButton = memo(function FormatButton({
   format,
   bookId,
@@ -158,20 +166,18 @@ const FormatButton = memo(function FormatButton({
   format: string;
   bookId: number;
 }) {
-  const handleDownload = useCallback(() => {
-    window.open(`/api/books/${bookId}/download/${format}`, "_blank");
-  }, [bookId, format]);
-
   return (
-    <Button
-      size="sm"
-      onClick={handleDownload}
-      className="bg-neutral-900 hover:bg-neutral-800 text-white border-neutral-900 hover:border-neutral-800 shadow-sm transition-colors duration-150 rounded text-xs uppercase tracking-wider font-semibold"
-    >
-      <span className="flex items-center gap-2">
-        <Download className="h-3.5 w-3.5" strokeWidth={2} />
-        <span>{format.toUpperCase()}</span>
-      </span>
+    <Button asChild size="sm" className={BOOK_ACTION_BUTTON_CLASS}>
+      <a
+        href={`/api/books/${bookId}/download/${format}`}
+        download
+        aria-label={`Download ${format.toUpperCase()} format`}
+      >
+        <span className="flex items-center gap-2">
+          <Download className="h-3.5 w-3.5" strokeWidth={2} />
+          <span>{format.toUpperCase()}</span>
+        </span>
+      </a>
     </Button>
   );
 });
@@ -192,8 +198,8 @@ const TagPill = memo(function TagPill({ tag }: { tag: string }) {
 const OrnamentalDivider = memo(function OrnamentalDivider() {
   return (
     <div className="flex items-center justify-center gap-4 py-5">
-      <div className="h-px flex-1 bg-border-default" />
-      <div className="h-px flex-1 bg-border-default" />
+      <div className="h-px flex-1 bg-border" />
+      <div className="h-px flex-1 bg-border" />
     </div>
   );
 });
@@ -239,6 +245,9 @@ export function BookDetail({ bookId }: BookDetailProps) {
     if (!book?.comments) return "";
     return stripHtmlTags(book.comments);
   }, [book?.comments]);
+
+  const [showFullDescription, setShowFullDescription] = useState(false);
+  const isLongDescription = descriptionText.length > 280;
 
   if (isLoading) {
     return (
@@ -311,10 +320,7 @@ export function BookDetail({ bookId }: BookDetailProps) {
                         params={{ id: String(bookId), format: format.toLowerCase() }}
                         search={{ from: `/book/${bookId}`, mode: undefined }}
                       >
-                        <Button
-                          size="sm"
-                          className="bg-[#4f46e5] hover:bg-[#4338ca] text-white border-[#4f46e5] hover:border-[#4338ca] shadow-sm transition-colors duration-150 rounded text-xs uppercase tracking-wider font-semibold cursor-pointer"
-                        >
+                        <Button size="sm" className={BOOK_ACTION_BUTTON_CLASS}>
                           <span className="flex items-center gap-2">
                             <BookOpen className="h-3.5 w-3.5" strokeWidth={2} />
                             <span>Read {format}</span>
@@ -418,16 +424,37 @@ export function BookDetail({ bookId }: BookDetailProps) {
             </div>
           )}
 
-          {/* Description */}
+          {/* Description - clamped with a Show more/less toggle */}
           {descriptionText && (
             <div className="space-y-4">
               <h3 className="text-xs font-semibold text-ink-muted uppercase tracking-widest flex items-center gap-2">
                 <FileText className="h-4 w-4" strokeWidth={1.5} />
                 About this book
               </h3>
-              <p className="leading-relaxed text-ink-secondary whitespace-pre-wrap break-words">
+              <p
+                className={cn(
+                  "leading-relaxed text-ink-secondary whitespace-pre-wrap break-words",
+                  !showFullDescription && "line-clamp-6",
+                )}
+              >
                 {descriptionText}
               </p>
+              {isLongDescription && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setShowFullDescription((v) => !v)}
+                  aria-expanded={showFullDescription}
+                  aria-label={
+                    showFullDescription
+                      ? "Show less of the book description"
+                      : "Show more of the book description"
+                  }
+                  className="text-accent hover:text-accent-hover px-0"
+                >
+                  {showFullDescription ? "Show less" : "Show more"}
+                </Button>
+              )}
             </div>
           )}
 

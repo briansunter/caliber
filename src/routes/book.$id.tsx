@@ -2,7 +2,6 @@ import { createFileRoute, useParams, useNavigate } from "@tanstack/react-router"
 import { BookDetail } from "@/components/BookDetail";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft, BookOpen } from "lucide-react";
-import { useEffect } from "react";
 
 export const Route = createFileRoute("/book/$id")({
   component: BookDetailPage,
@@ -14,32 +13,28 @@ function BookDetailPage() {
   const navigate = useNavigate();
 
   function handleBack() {
-    navigate({ to: "/", search: { q: "", view: "list", sortBy: "added", sortOrder: "desc", tag: [] } });
-  }
-
-  // Ensure the browser's back button goes to the library instead of leaving
-  // the app when the detail page was opened as a direct link (e.g. from an
-  // external referrer or a bookmark). In that case history has no in-app
-  // entry to go back to, so we insert the library behind the detail page.
-  // Normal in-app navigation (library -> detail) already has the library
-  // behind us, so we leave history alone.
-  useEffect(() => {
-    let sameOriginReferrer = false;
-    try {
-      if (document.referrer) {
-        sameOriginReferrer = new URL(document.referrer).origin === window.location.origin;
-      }
-    } catch {
-      sameOriginReferrer = false;
+    // Library state (q/view/sort/tags) lives in the URL, so going back
+    // through history pops to the intact library entry and preserves it.
+    // No document.referrer sniffing or window.history.length gate here:
+    // the referrer does not update on SPA pushes (misfires on normal
+    // fresh tab -> library -> detail navigation), and history.length counts
+    // external/cross-origin entries too, so a direct open/bookmark can
+    // still report length > 1 and back() would exit the app entirely.
+    // TanStack Router stamps each in-app entry with __TSR_index in
+    // history.state (0 on the first entry), so it is the reliable signal
+    // for "there is an in-app entry to return to". Direct opens/bookmarks
+    // have no in-app entry to return to, so they fall back to the library
+    // root (there is no prior state to preserve).
+    const tsrIndex = (window.history.state as { __TSR_index?: number } | null)?.__TSR_index ?? 0;
+    if (tsrIndex > 0) {
+      window.history.back();
+    } else {
+      navigate({
+        to: "/",
+        search: { q: "", view: "list", sortBy: "added", sortOrder: "desc", tag: [] },
+      });
     }
-
-    if (sameOriginReferrer) return;
-
-    const detailHref = window.location.href;
-    // Insert the library entry behind the detail page so Back lands on it.
-    window.history.replaceState(null, "", "/");
-    window.history.pushState(null, "", detailHref);
-  }, []);
+  }
 
   return (
     <div className="min-h-screen bg-parchment paper-texture">

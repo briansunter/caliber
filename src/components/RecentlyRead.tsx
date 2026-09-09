@@ -1,12 +1,14 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
-import { X, Check, ChevronDown, ChevronUp, Trash2 } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
+import { X, Check, ChevronDown, ChevronUp, Trash2, Undo2 } from "lucide-react";
 import { BookCoverImage } from "./BookCoverImage";
 import { isUnknownAuthor } from "@/lib/utils";
 import {
   useReadingList,
   useRemoveFromReadingList,
   useClearReadingList,
+  saveBookProgress,
   sortReadingList,
   type ReadingListItem,
   type ReadingSort,
@@ -20,18 +22,114 @@ const SORT_OPTIONS: { value: ReadingSort; label: string }[] = [
   { value: "progress", label: "Progress" },
 ];
 
+interface UndoToast {
+  key: number;
+  message: string;
+  items: ReadingListItem[];
+}
+
 export function RecentlyRead() {
-  const { data, isLoading } = useReadingList();
+  const { data, isLoading, isError } = useReadingList();
+  const queryClient = useQueryClient();
   const remove = useRemoveFromReadingList();
   const clear = useClearReadingList();
   const [expanded, setExpanded] = useState(false);
   const [sort, setSort] = useState<ReadingSort>("recent");
   const [confirmClear, setConfirmClear] = useState(false);
+  const [toast, setToast] = useState<UndoToast | null>(null);
 
   const items = useMemo(() => sortReadingList(data?.items ?? [], sort), [data?.items, sort]);
 
+  // Auto-dismiss the undo toast after 6s.
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => {
+      setToast((cur) => (cur?.key === toast.key ? null : cur));
+    }, 6000);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  const undo = () => {
+    const snapshot = toast;
+    if (!snapshot) return;
+    setToast(null);
+    // Restore the shelf optimistically, then re-save each entry. The
+    // re-save lands after the deletion tombstone (ts >= deletedAt), so the
+    // documented last-writer-wins policy resurrects the rows server-side.
+    try {
+      const current = queryClient.getQueryData<{ items: ReadingListItem[] }>(["reading-list"]);
+      const seen = new Set((current?.items ?? []).map((i) => i.book.id));
+      const missing = snapshot.items.filter((i) => !seen.has(i.book.id));
+      if (missing.length > 0) {
+        queryClient.setQueryData(["reading-list"], {
+          items: [...(current?.items ?? []), ...missing],
+        });
+      }
+    } catch {}
+    for (const entry of snapshot.items) {
+      try {
+        saveBookProgress(entry.book.id, {
+          format: entry.progress.format,
+          location: null,
+          percentage: entry.progress.percentage,
+          finished: entry.progress.finished,
+        });
+      } catch {}
+    }
+  };
+
+  const handleRemove = (item: ReadingListItem) => {
+    setToast({
+      key: Date.now(),
+      message: `Removed “${item.book.title}”.`,
+      items: [item],
+    });
+    remove.mutate(item.book.id);
+  };
+
+  const handleClear = () => {
+    if (items.length > 0) {
+      setToast({
+        key: Date.now(),
+        message: `Cleared ${items.length} recently read book${items.length === 1 ? "" : "s"}.`,
+        items,
+      });
+    }
+    clear.mutate();
+    setConfirmClear(false);
+    setExpanded(false);
+  };
+
+  // Loading skeleton keeps the shelf space stable while the reading list
+  // resolves. Signed-out (error) stays hidden, as does an empty shelf.
+  if (isLoading) {
+    return (
+      <section className="mb-4 sm:mb-6" aria-label="Loading recently read" aria-busy="true">
+        <div className="mb-2 flex items-center gap-3">
+          <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-secondary">
+            Recently read
+          </h2>
+        </div>
+        <div
+          className="grid grid-cols-3 gap-2 sm:grid-cols-4 sm:gap-3 md:grid-cols-6"
+          aria-hidden="true"
+        >
+          {Array.from({ length: COLLAPSED_COUNT }, (_, i) => `recent-skeleton-${i}`).map((key) => (
+            <div key={key} className="overflow-hidden rounded-lg border border-ink bg-surface">
+              <div className="aspect-[2/3] w-full animate-pulse bg-parchment-dark/70" />
+              <div className="flex min-h-[52px] flex-col gap-1.5 p-1.5">
+                <div className="h-3 w-4/5 animate-pulse rounded bg-parchment-dark/70" />
+                <div className="h-2.5 w-3/5 animate-pulse rounded bg-parchment-dark/70" />
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+    );
+  }
+
   // Hidden entirely when signed out or nothing read yet.
-  if (isLoading || items.length === 0) return null;
+  if (isError || items.length === 0) return null;
 
   const visible = expanded ? items : items.slice(0, COLLAPSED_COUNT);
   const hasMore = items.length > COLLAPSED_COUNT;
@@ -64,11 +162,7 @@ export function RecentlyRead() {
             <span className="flex items-center gap-1">
               <button
                 type="button"
-                onClick={() => {
-                  clear.mutate();
-                  setConfirmClear(false);
-                  setExpanded(false);
-                }}
+                onClick={handleClear}
                 className="rounded-md bg-red-600 px-2 py-1 text-xs font-semibold text-white hover:bg-red-700 transition-colors"
               >
                 Clear all
@@ -97,11 +191,7 @@ export function RecentlyRead() {
 
       <div className="grid grid-cols-3 gap-2 sm:grid-cols-4 sm:gap-3 md:grid-cols-6">
         {visible.map((item) => (
-          <ReadingCard
-            key={item.book.id}
-            item={item}
-            onRemove={() => remove.mutate(item.book.id)}
-          />
+          <ReadingCard key={item.book.id} item={item} onRemove={() => handleRemove(item)} />
         ))}
       </div>
 
@@ -123,6 +213,31 @@ export function RecentlyRead() {
             )}
           </button>
         </div>
+      )}
+      {toast && (
+        <output
+          aria-live="polite"
+          className="fixed bottom-4 left-1/2 z-50 flex max-w-[calc(100vw-2rem)] -translate-x-1/2 items-center gap-2 rounded-lg border border-ink bg-surface px-3 py-2 shadow-xl"
+        >
+          <span className="max-w-[50vw] truncate text-sm text-ink">{toast.message}</span>
+          <button
+            type="button"
+            onClick={undo}
+            aria-label="Undo remove from recently read"
+            className="flex flex-shrink-0 items-center gap-1 rounded-md bg-ink px-2.5 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          >
+            <Undo2 className="h-3.5 w-3.5" strokeWidth={2} />
+            Undo
+          </button>
+          <button
+            type="button"
+            onClick={() => setToast(null)}
+            aria-label="Dismiss notification"
+            className="flex-shrink-0 rounded-md p-1 text-ink-muted transition-colors hover:bg-parchment-dark hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          >
+            <X className="h-4 w-4" strokeWidth={2} />
+          </button>
+        </output>
       )}
     </section>
   );

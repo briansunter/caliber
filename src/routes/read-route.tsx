@@ -67,7 +67,7 @@ function ReaderPage() {
       <div className="fixed inset-0 z-[100] flex items-center justify-center bg-neutral-900">
         <div className="flex flex-col items-center gap-3">
           <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
-          <p className="text-sm text-white/50">Loading…</p>
+          <p className="text-sm text-white/50">Loading your library</p>
         </div>
       </div>
     );
@@ -96,7 +96,7 @@ function ReaderPage() {
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-neutral-900">
       <div className="flex flex-col items-center gap-3">
         <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
-        <p className="text-sm text-white/50">Loading…</p>
+        <p className="text-sm text-white/50">Loading your library</p>
       </div>
     </div>
   );

@@ -21,6 +21,7 @@ interface BookTableInfiniteProps {
   searchQuery: string;
   sortConfig: SortConfig;
   tagIds?: number[];
+  onClearFilters?: () => void;
 }
 
 // All flexible tracks use minmax(0, Nfr) so the grid can never exceed the
@@ -208,6 +209,15 @@ const ActionsCell = memo(function ActionsCell({ id }: { id: number }) {
   );
 });
 
+// Preferred "read" format for the mobile compact badge: EPUB first, then
+// PDF, otherwise the first available format (uppercased for display).
+function preferredReadFormat(formats: string[]): string {
+  const upper = formats.map((f) => f.toUpperCase());
+  if (upper.includes("EPUB")) return "EPUB";
+  if (upper.includes("PDF")) return "PDF";
+  return upper[0] ?? "";
+}
+
 // Virtual row component - rendered as a normal row in the flow
 interface TableRowProps {
   book: BookListItem;
@@ -225,9 +235,35 @@ const TableRow = memo(function TableRow({ book }: TableRowProps) {
           <TitleCell title={book.title} id={book.id} hasCover={book.has_cover} />
         </div>
         <div className="flex items-center min-w-0 py-2 overflow-hidden">
-          <span className="text-xs text-ink-tertiary truncate">
-            {isUnknownAuthor(book.authors) ? "—" : book.authors?.[0]}
-          </span>
+          <div className="flex min-w-0 flex-col justify-center gap-0.5">
+            <span className="text-xs text-ink-tertiary truncate">
+              {isUnknownAuthor(book.authors) ? "—" : book.authors?.[0]}
+            </span>
+            {(book.rating != null || (book.formats && book.formats.length > 0)) && (
+              <span className="flex items-center gap-1.5">
+                {book.rating != null && book.rating > 0 && (
+                  <span
+                    className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-ink-secondary"
+                    role="img"
+                    aria-label={`Rated ${book.rating} out of 10`}
+                  >
+                    <Star className="h-3 w-3 fill-accent text-accent" aria-hidden="true" />
+                    {Number.isInteger(book.rating / 2)
+                      ? String(book.rating / 2)
+                      : (book.rating / 2).toFixed(1)}
+                  </span>
+                )}
+                {book.formats && book.formats.length > 0 && (
+                  <span
+                    title={`Available as ${preferredReadFormat(book.formats)}`}
+                    className="rounded border border-ink bg-parchment-dark px-1 py-px text-[10px] font-semibold uppercase tracking-wide text-ink-secondary"
+                  >
+                    {preferredReadFormat(book.formats)}
+                  </span>
+                )}
+              </span>
+            )}
+          </div>
         </div>
         <div className="flex items-center justify-end py-2">
           <ActionsCell id={book.id} />
@@ -264,7 +300,17 @@ const TableRow = memo(function TableRow({ book }: TableRowProps) {
 });
 
 // Empty state
-const EmptyState = memo(function EmptyState({ searchQuery, reason }: { searchQuery: string; reason?: string | null }) {
+const EmptyState = memo(function EmptyState({
+  searchQuery,
+  reason,
+  hasActiveFilters,
+  onClearFilters,
+}: {
+  searchQuery: string;
+  reason?: string | null;
+  hasActiveFilters: boolean;
+  onClearFilters?: () => void;
+}) {
   const heading =
     reason === "empty-library" ? "Your library is empty" : reason === "offline" ? "You're offline" : reason === "auth-expired" ? "Session expired" : "No books found";
   const hint = searchQuery
@@ -283,6 +329,16 @@ const EmptyState = memo(function EmptyState({ searchQuery, reason }: { searchQue
       </div>
       <h3 className="text-base font-semibold text-ink mb-1">{heading}</h3>
       <p className="text-sm text-ink-tertiary">{hint}</p>
+      {hasActiveFilters && onClearFilters && (
+        <button
+          type="button"
+          onClick={onClearFilters}
+          aria-label="Clear search and filters"
+          className="mt-3 rounded-lg border border-ink px-3 py-1.5 text-sm font-medium text-ink hover:bg-parchment-dark transition-colors"
+        >
+          Clear search and filters
+        </button>
+      )}
     </div>
   );
 });
@@ -404,7 +460,12 @@ export const TableHeader = memo(function TableHeader({
   );
 });
 
-export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, sortConfig, tagIds }: BookTableInfiniteProps) {
+export const BookTableInfinite = memo(function BookTableInfinite({
+  searchQuery,
+  sortConfig,
+  tagIds,
+  onClearFilters,
+}: BookTableInfiniteProps) {
   const {
     books, totalCount, retainedCount, windowTruncated, hasNextPage, fetchNextPage,
     isFetchingNextPage, isFetchNextPageError, isLoading, isError, error, errorStage,
@@ -620,7 +681,14 @@ export const BookTableInfinite = memo(function BookTableInfinite({ searchQuery, 
   ) : null;
 
   if (books.length === 0 && !isPlaceholder) {
-    return <EmptyState searchQuery={searchQuery} reason={emptyReason} />;
+    return (
+      <EmptyState
+        searchQuery={searchQuery}
+        reason={emptyReason}
+        hasActiveFilters={searchQuery !== "" || (tagIds?.length ?? 0) > 0}
+        onClearFilters={onClearFilters}
+      />
+    );
   }
 
   const footerCount = totalCount !== null && windowTruncated

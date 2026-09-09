@@ -1,17 +1,17 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import * as pdfjsLib from "pdfjs-dist";
+import { ZoomIn, ZoomOut, ChevronLeft, ChevronRight, Maximize, Minimize } from "lucide-react";
 import {
-  ArrowLeft,
-  ZoomIn,
-  ZoomOut,
-  ChevronLeft,
-  ChevronRight,
-  Download,
-  Wifi,
-  Maximize,
-  Minimize,
-} from "lucide-react";
+  ReaderErrorPanel,
+  ReaderFooterShell,
+  ReaderHeader,
+  ReaderLoadingOverlay,
+  ReaderLoadModeToggle,
+  ReaderPageInput,
+  ReaderRoot,
+  darkTone,
+} from "./ReaderChrome";
 import { stored } from "@/lib/utils";
 import { useReaderSettings } from "@/lib/reader-settings";
 import { useFullscreen } from "@/lib/use-fullscreen";
@@ -713,106 +713,62 @@ export function PdfReader({
   const progress = totalPages > 0 ? Math.round((currentPage / totalPages) * 100) : 0;
 
   return (
-    <div className="fixed inset-0 z-[100] flex flex-col bg-neutral-900 select-none">
+    <ReaderRoot>
       {/* Loading */}
       {isLoading && (
-        <div className="absolute inset-0 z-[115] flex items-center justify-center bg-neutral-900">
-          <div className="flex flex-col items-center gap-3">
-            <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
-            <p className="text-sm text-white/50">
-              {loadMode === "stream" ? "Streaming PDF…" : "Loading PDF…"}
-            </p>
-          </div>
-        </div>
+        <ReaderLoadingOverlay message={loadMode === "stream" ? "Streaming PDF…" : "Loading PDF…"} />
       )}
 
       {loadError && (
-        <div className="absolute inset-0 z-[115] flex items-center justify-center bg-neutral-900">
-          <div className="max-w-sm px-6 text-center">
-            <p className="text-sm text-white/70">Failed to load PDF: {loadError}</p>
-            <button
-              type="button"
-              onClick={() => setLoadMode("stream")}
-              className="mt-4 rounded bg-white/10 px-4 py-2 text-sm text-white active:opacity-70"
-            >
-              Try streaming
-            </button>
-          </div>
-        </div>
+        <ReaderErrorPanel
+          kindLabel="PDF"
+          detail={loadError}
+          onRetry={() => setLoadMode("stream")}
+          onBack={onBack}
+          downloadHref={`/api/books/${bookId}/download/PDF`}
+        />
       )}
 
       {/* Header */}
-      <div
-        className="shrink-0 z-[108] transition-transform duration-200"
-        style={{
-          transform: showUI ? "translateY(0)" : "translateY(-100%)",
-          background: "rgba(0,0,0,0.85)",
-          backdropFilter: "blur(12px)",
-          borderBottom: "1px solid rgba(255,255,255,0.1)",
-          paddingTop: "env(safe-area-inset-top, 0px)",
-        }}
-      >
-        <div className="flex items-center justify-between px-3 h-12">
-          <button
-            type="button"
-            onClick={onBack}
-            aria-label="Back to book"
-            title="Back to book"
-            className="p-2 -ml-1 rounded-lg text-white active:opacity-60"
-          >
-            <ArrowLeft className="h-5 w-5" />
-          </button>
-          <span className="text-sm text-white truncate mx-2 flex-1 text-center font-medium">
-            {title}
-          </span>
-          <div className="flex items-center gap-1">
-            <button
-              type="button"
-              onClick={toggleLoadMode}
-              className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs text-white active:opacity-60"
-              aria-label={loadMode === "stream" ? "Streaming pages" : "Full-file loading"}
-              title={loadMode === "stream" ? "Streaming pages" : "Full-file loading"}
-            >
-              {loadMode === "stream" ? (
-                <Wifi className="h-4 w-4" />
-              ) : (
-                <Download className="h-4 w-4" />
-              )}
-              <span className="hidden sm:inline">{loadMode === "stream" ? "Stream" : "Full"}</span>
-            </button>
-            <button
-              type="button"
-              onClick={toggleImmersive}
-              className="p-2 rounded-lg text-white active:opacity-60"
-              aria-label={immersive ? "Show toolbars" : "Hide toolbars"}
-              title={immersive ? "Show toolbars (f)" : "Hide toolbars / fullscreen (f)"}
-            >
-              {immersive ? <Minimize className="h-5 w-5" /> : <Maximize className="h-5 w-5" />}
-            </button>
-            <button
-              type="button"
-              onClick={() => setZoom((z) => Math.max(0.5, z - 0.25))}
-              aria-label="Zoom out"
-              title="Zoom out"
-              className="p-2 rounded-lg text-white active:opacity-60"
-            >
-              <ZoomOut className="h-5 w-5" />
-            </button>
-            <span className="text-xs text-white/60 w-10 text-center tabular-nums">
-              {Math.round(zoom * 100)}%
-            </span>
-            <button
-              type="button"
-              onClick={() => setZoom((z) => Math.min(3, z + 0.25))}
-              aria-label="Zoom in"
-              title="Zoom in"
-              className="p-2 -mr-1 rounded-lg text-white active:opacity-60"
-            >
-              <ZoomIn className="h-5 w-5" />
-            </button>
-          </div>
-        </div>
-      </div>
+      <ReaderHeader title={title} showUI={showUI} onBack={onBack} overlay={false} tone={darkTone()}>
+        <ReaderLoadModeToggle
+          loadMode={loadMode}
+          onToggle={toggleLoadMode}
+          streamLabel="Streaming pages"
+          fullLabel="Full-file loading"
+          tone={darkTone()}
+        />
+        <button
+          type="button"
+          onClick={toggleImmersive}
+          className="p-2 rounded-lg text-white active:opacity-60"
+          aria-label={immersive ? "Show toolbars" : "Hide toolbars"}
+          title={immersive ? "Show toolbars (f)" : "Hide toolbars / fullscreen (f)"}
+        >
+          {immersive ? <Minimize className="h-5 w-5" /> : <Maximize className="h-5 w-5" />}
+        </button>
+        <button
+          type="button"
+          onClick={() => setZoom((z) => Math.max(0.5, z - 0.25))}
+          aria-label="Zoom out"
+          title="Zoom out"
+          className="p-2 rounded-lg text-white active:opacity-60"
+        >
+          <ZoomOut className="h-5 w-5" />
+        </button>
+        <span className="text-xs text-white/60 w-10 text-center tabular-nums">
+          {Math.round(zoom * 100)}%
+        </span>
+        <button
+          type="button"
+          onClick={() => setZoom((z) => Math.min(3, z + 0.25))}
+          aria-label="Zoom in"
+          title="Zoom in"
+          className="p-2 -mr-1 rounded-lg text-white active:opacity-60"
+        >
+          <ZoomIn className="h-5 w-5" />
+        </button>
+      </ReaderHeader>
 
       {/* Canvas container */}
       <div
@@ -834,16 +790,7 @@ export function PdfReader({
       </div>
 
       {/* Footer */}
-      <div
-        className="shrink-0 z-[108] transition-transform duration-200"
-        style={{
-          transform: showUI ? "translateY(0)" : "translateY(100%)",
-          background: "rgba(0,0,0,0.85)",
-          backdropFilter: "blur(12px)",
-          borderTop: "1px solid rgba(255,255,255,0.1)",
-          paddingBottom: "env(safe-area-inset-bottom, 0px)",
-        }}
-      >
+      <ReaderFooterShell showUI={showUI} overlay={false} tone={darkTone()}>
         <div className="px-4 py-3">
           {/* Progress bar */}
           <div className="w-full h-1 rounded-full bg-white/10 mb-2">
@@ -866,26 +813,13 @@ export function PdfReader({
               <ChevronLeft className="h-5 w-5" />
             </button>
             <span className="flex items-center gap-1 text-sm text-white/60 tabular-nums">
-              <input
-                type="number"
-                min={1}
-                max={totalPages || 1}
+              <ReaderPageInput
                 value={currentPage}
-                onChange={(e) => {
-                  const val = parseInt(e.target.value, 10);
-                  if (Number.isInteger(val) && val >= 1 && val <= (totalPages || 1)) {
-                    setCurrentPage(val);
-                  }
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-                  e.stopPropagation();
-                }}
-                onClick={(e) => e.stopPropagation()}
-                className="w-10 bg-transparent text-center text-sm text-white/60 tabular-nums [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none outline-none border-b border-white/20 focus:border-white/50"
-                aria-label="Page number"
+                max={totalPages || 1}
+                onCommit={setCurrentPage}
+                describedById="pdf-page-total"
               />
-              <span>/ {totalPages}</span>
+              <span id="pdf-page-total">/ {totalPages}</span>
             </span>
             <button
               type="button"
@@ -899,7 +833,7 @@ export function PdfReader({
             </button>
           </div>
         </div>
-      </div>
-    </div>
+      </ReaderFooterShell>
+    </ReaderRoot>
   );
 }

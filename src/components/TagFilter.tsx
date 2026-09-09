@@ -1,7 +1,8 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Tags, X, Check, Search, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { TagSummary } from "@/hooks/useBooksInfinite";
+import { useDialogFocusTrap } from "./ReaderChrome";
 
 interface TagFilterProps {
   tags: TagSummary[] | undefined;
@@ -23,21 +24,18 @@ export const TagFilter = memo(function TagFilter({
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
 
   const selectedCount = selectedIds.length;
   const active = open || selectedCount > 0;
 
-  const close = () => setOpen(false);
+  const close = useCallback(() => setOpen(false), []);
 
-  // Esc to close
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open]);
+  // Modal dialog semantics: aria-modal + focus trap + Esc + return focus
+  // to the trigger (shared trap; desktop initial focus stays in the search
+  // box via the effect below, mobile keeps focus off the input).
+  useDialogFocusTrap(open, panelRef, close, triggerRef);
 
   // Lock body scroll only while the mobile sheet is open (avoid layout shift / blocking
   // background scroll on desktop where the dropdown is small).
@@ -91,6 +89,7 @@ export const TagFilter = memo(function TagFilter({
     <div className="relative flex-shrink-0">
       <button
         type="button"
+        ref={triggerRef}
         onClick={() => setOpen((o) => !o)}
         aria-haspopup="dialog"
         aria-expanded={open}
@@ -125,7 +124,9 @@ export const TagFilter = memo(function TagFilter({
             aria-hidden="true"
           />
           <div
+            ref={panelRef}
             role="dialog"
+            aria-modal="true"
             aria-label="Filter by tags"
             className={cn(
               "fixed inset-x-0 bottom-0 z-50 flex flex-col bg-surface border border-ink shadow-xl",
