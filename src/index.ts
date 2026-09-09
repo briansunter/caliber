@@ -852,7 +852,15 @@ async function serveLocalFile(
 
   baseHeaders.set("Content-Length", String(fileStat.size));
 
-  return new Response(includeBody ? file : null, { headers: baseHeaders });
+  // Bun.serve auto-slices any BunFile body when the request carries a Range
+  // header — ignoring If-Range entirely. When the range was denied (stale
+  // If-Range), buffer the body so the runtime cannot re-slice it into a 206.
+  // This path only triggers on Range + failed If-Range, so the extra copy
+  // stays off the hot path.
+  const rangeDenied =
+    Boolean(rangeHeader) && !ifRangeAllowsRange(req.headers.get("If-Range"), etag, mtimeMs);
+  const body = !includeBody ? null : rangeDenied ? await file.arrayBuffer() : file;
+  return new Response(body, { headers: baseHeaders });
 }
 
 async function serveBookFile(
