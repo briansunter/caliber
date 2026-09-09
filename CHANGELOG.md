@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.13](https://github.com/briansunter/caliber/compare/v0.1.12...v0.1.13) (2026-09-09)
+
+
+### Bug Fixes
+
+* ignore Range on stale If-Range instead of serving 206 ([7b13ad4](https://github.com/briansunter/caliber/commit/7b13ad40f1297f350e594ea05fd1d3dba7963b29))
+
 ## [0.1.12](https://github.com/briansunter/caliber/compare/v0.1.11...v0.1.12) (2026-09-09)
 
 
