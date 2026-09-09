@@ -1131,6 +1131,20 @@ async function tryResizeImage(
   if (process.env.CALIBER_THUMB_DISABLE_RESIZE === "1") {
     return null;
   }
+  // PRIMARY: sharp (libvips prebuild, runs everywhere Bun runs, including CI).
+  // The Bun image-pipeline probes below stay as fallback for sharp-less installs.
+  try {
+    const { default: sharp } = await import("sharp");
+    const out = await sharp(bytes)
+      .resize({ width: targetWidth, withoutEnlargement: true })
+      .jpeg()
+      .toBuffer();
+    if (out && out.byteLength > 0) return out;
+  } catch (error) {
+    console.warn(
+      `[thumb] sharp resize failed (Bun ${Bun.version}): ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   try {
     const ImageCtor = (Bun as BunWithImagePipeline).Image;
     if (typeof ImageCtor === "function") {
