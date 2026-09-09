@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.14](https://github.com/briansunter/caliber/compare/v0.1.13...v0.1.14) (2026-09-09)
+
+
+### Features
+
+* single and side-by-side page layouts for EPUB and PDF readers ([5eee5ed](https://github.com/briansunter/caliber/commit/5eee5ed8d4fd4c65c87d5b702b86378bd988bbc7))
+
 ## [0.1.13](https://github.com/briansunter/caliber/compare/v0.1.12...v0.1.13) (2026-09-09)
 
 
