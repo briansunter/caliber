@@ -57,6 +57,19 @@ interface EpubReaderProps {
 
 type ReaderTheme = "light" | "dark" | "sepia";
 
+// Page measure: caps how wide the text column may grow. Narrow is full-bleed
+// (the previous behavior); Normal/Wide center the column at a comfortable
+// measure. The cap only bites on viewports wider than the value, so phones
+// are unaffected. Applied to the rendition container (not in-iframe styles)
+// so epub.js lays out its fixed-px columns at the capped width.
+type EpubMargin = "narrow" | "normal" | "wide";
+const EPUB_MARGIN_MAX_WIDTH: Record<EpubMargin, string | undefined> = {
+  narrow: undefined,
+  normal: "48rem",
+  wide: "38rem",
+};
+const EPUB_MARGINS: EpubMargin[] = ["narrow", "normal", "wide"];
+
 interface SpineItemLike {
   index?: number;
   linear?: boolean | string;
@@ -345,6 +358,10 @@ export function EpubReader({
   const [pageInfo, setPageInfo] = useState<EpubPageInfo | null>(null);
   const [toc, setToc] = useState<NavItem[]>([]);
   const [fontSize, setFontSize] = useState(() => stored("caliber-fontsize", 100));
+  const [margins, setMargins] = useState<EpubMargin>(() => {
+    const saved = stored("caliber-margins", "normal" as EpubMargin);
+    return saved === "narrow" || saved === "normal" || saved === "wide" ? saved : "normal";
+  });
   const [theme, setTheme] = useState<ReaderTheme>(() =>
     stored("caliber-reader-theme", "light" as ReaderTheme),
   );
@@ -836,8 +853,36 @@ export function EpubReader({
     [spreadKey],
   );
 
+  // Live margin change: the container's max-width restyles, then the
+  // rendition re-measures and re-displays the current CFI so pagination
+  // settles at the same position (same pattern as applyPageLayout). The
+  // single-file HTML fallback has no rendition — its iframe picks up the
+  // reactive max-width style on its own.
+  const applyMargins = useCallback((next: EpubMargin) => {
+    setMargins(next);
+    try {
+      localStorage.setItem("caliber-margins", JSON.stringify(next));
+    } catch (error) {
+      noteIgnoredEpubError("persist margins", error);
+    }
+    const rendition = renditionRef.current;
+    const container = viewerRef.current;
+    if (!rendition || !container) return;
+    void (async () => {
+      try {
+        rendition.resize(container.clientWidth, container.clientHeight);
+        const cfi = lastLocationRef.current?.start?.cfi ?? rendition.location?.start?.cfi;
+        await rendition.display(cfi);
+      } catch (error) {
+        noteIgnoredEpubError("apply margins", error);
+      }
+    })();
+  }, []);
+
   const bg = BG[theme];
   const fg = FG[theme];
+  // Centered measure cap for the page column (undefined = full-bleed).
+  const maxMeasure = EPUB_MARGIN_MAX_WIDTH[margins];
   const isDark = theme === "dark";
   const subtle = isDark ? "rgba(255,255,255,0.12)" : "rgba(0,0,0,0.08)";
   const barBg = isDark ? "rgba(0,0,0,0.88)" : "rgba(255,255,255,0.96)";
@@ -941,14 +986,19 @@ export function EpubReader({
       <div className="flex-1 relative min-h-0">
         {htmlDocument ? (
           <iframe
-            className="absolute inset-0 h-full w-full border-0"
+            className="absolute inset-0 mx-auto h-full w-full border-0"
+            style={maxMeasure ? { maxWidth: maxMeasure } : undefined}
             title={title}
             sandbox="allow-popups allow-popups-to-escape-sandbox"
             referrerPolicy="no-referrer"
             srcDoc={htmlDocument}
           />
         ) : (
-          <div ref={viewerRef} className="absolute inset-0" />
+          <div
+            ref={viewerRef}
+            className="absolute inset-0 mx-auto h-full w-full"
+            style={maxMeasure ? { maxWidth: maxMeasure } : undefined}
+          />
         )}
 
         {/* Real-DOM tap zones over the book. epub.js renders into an iframe
@@ -1112,6 +1162,49 @@ export function EpubReader({
                     <Plus className="h-4 w-4" />
                   </button>
                 </div>
+              </div>
+
+              {/* Margins: caps the text column width on wide screens.
+                  Narrow is full-bleed; Normal/Wide center a comfortable
+                  measure. Narrow screens are unaffected either way. */}
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-medium" style={{ color: fg }}>
+                  Margins
+                </span>
+                <fieldset
+                  className="flex items-center rounded-full border p-1"
+                  style={{ borderColor: subtle }}
+                >
+                  <legend className="sr-only">Margins</legend>
+                  {EPUB_MARGINS.map((value) => (
+                    <button
+                      type="button"
+                      key={value}
+                      onClick={() => applyMargins(value)}
+                      aria-pressed={margins === value}
+                      aria-label={`${value} margins`}
+                      title={
+                        value === "narrow"
+                          ? "Text fills the screen"
+                          : value === "normal"
+                            ? "Comfortable reading width"
+                            : "Narrow column"
+                      }
+                      className="rounded-full px-3 py-1.5 text-xs capitalize active:opacity-60"
+                      style={{
+                        color: fg,
+                        background:
+                          margins === value
+                            ? isDark
+                              ? "rgba(255,255,255,0.12)"
+                              : "rgba(0,0,0,0.08)"
+                            : "transparent",
+                      }}
+                    >
+                      {value}
+                    </button>
+                  ))}
+                </fieldset>
               </div>
 
               {/* Theme */}

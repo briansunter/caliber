@@ -20,6 +20,11 @@ export interface TagSummary {
   bookCount: number;
 }
 
+export interface FormatSummary {
+  name: string;
+  bookCount: number;
+}
+
 export interface LibraryConfigStatus {
   libraryPath: string;
   dbName: string;
@@ -71,17 +76,29 @@ export function emptyReasonOf(args: {
   error: unknown;
   searchQuery: string;
   tagIds: number[];
+  formats?: string[];
 }): EmptyReason {
   if (args.booksLength > 0 || args.isLoading || args.error) return null;
   if (args.error instanceof HttpError && args.error.status === 401) return "auth-expired";
   if (args.error instanceof TypeError) return "offline";
-  if (args.searchQuery.trim().length > 0 || args.tagIds.length > 0) return "no-matches";
+  if (
+    args.searchQuery.trim().length > 0 ||
+    args.tagIds.length > 0 ||
+    (args.formats?.length ?? 0) > 0
+  )
+    return "no-matches";
   return "empty-library";
 }
 
 function appendTagParams(params: URLSearchParams, tagIds: number[]): void {
   for (const id of tagIds) {
     params.append("tag", String(id));
+  }
+}
+
+function appendFormatParams(params: URLSearchParams, formats: string[]): void {
+  for (const format of formats) {
+    params.append("format", format);
   }
 }
 
@@ -94,12 +111,14 @@ async function fetchBooks({
   sortBy,
   sortOrder,
   tagIds,
+  formats,
   signal,
 }: {
   pageParam?: string;
   sortBy: SortField;
   sortOrder: SortOrder;
   tagIds: number[];
+  formats: string[];
   signal?: AbortSignal;
 }): Promise<BooksResponse> {
   const params = new URLSearchParams();
@@ -113,6 +132,7 @@ async function fetchBooks({
     params.set("includeTotal", "1");
   }
   appendTagParams(params, tagIds);
+  appendFormatParams(params, formats);
 
   return fetchJson<BooksResponse>(`${API_BASE}/books?${params}`, { signal });
 }
@@ -123,6 +143,7 @@ async function searchBooks({
   sortBy,
   sortOrder,
   tagIds,
+  formats,
   signal,
 }: {
   pageParam?: string;
@@ -130,6 +151,7 @@ async function searchBooks({
   sortBy: SortField;
   sortOrder: SortOrder;
   tagIds: number[];
+  formats: string[];
   signal?: AbortSignal;
 }): Promise<BooksResponse> {
   const params = new URLSearchParams();
@@ -144,6 +166,7 @@ async function searchBooks({
     params.set("includeTotal", "1");
   }
   appendTagParams(params, tagIds);
+  appendFormatParams(params, formats);
 
   return fetchJson<BooksResponse>(`${API_BASE}/books/search?${params}`, { signal });
 }
@@ -154,6 +177,7 @@ export function useBooksInfinite(
   tagIds: number[] = [],
   enabled = true,
   options: InfiniteWindowOptions = {},
+  formats: string[] = [],
 ) {
   const { maxPages = 50, userId, libraryId } = options;
   return useInfiniteQuery({
@@ -163,6 +187,7 @@ export function useBooksInfinite(
       sortConfig.field,
       sortConfig.order,
       tagIds,
+      formats,
       ...scopeSuffix({ userId, libraryId }),
     ],
     queryFn: ({ pageParam, signal }) =>
@@ -171,6 +196,7 @@ export function useBooksInfinite(
         sortBy: sortConfig.field,
         sortOrder: sortConfig.order,
         tagIds,
+        formats,
         signal,
       }),
     getNextPageParam: (lastPage) => lastPage.nextCursor,
@@ -195,6 +221,7 @@ export function useSearchInfinite(
   tagIds: number[] = [],
   enabled = query.trim().length > 0,
   options: InfiniteWindowOptions = {},
+  formats: string[] = [],
 ) {
   const { maxPages = 20, userId, libraryId } = options;
   return useInfiniteQuery({
@@ -206,6 +233,7 @@ export function useSearchInfinite(
       sortConfig.field,
       sortConfig.order,
       tagIds,
+      formats,
       ...scopeSuffix({ userId, libraryId }),
     ],
     queryFn: ({ pageParam, signal }) =>
@@ -215,6 +243,7 @@ export function useSearchInfinite(
         sortBy: sortConfig.field,
         sortOrder: sortConfig.order,
         tagIds,
+        formats,
         signal,
       }),
     getNextPageParam: (lastPage) => lastPage.nextCursor,
@@ -256,10 +285,18 @@ export function useFlattenedBooks(
   sortConfig: SortConfig,
   tagIds: number[] = [],
   options: InfiniteWindowOptions = {},
+  formats: string[] = [],
 ) {
   const isSearching = searchQuery.trim().length > 0;
-  const booksQuery = useBooksInfinite(sortConfig, tagIds, !isSearching, options);
-  const searchQueryHook = useSearchInfinite(searchQuery, sortConfig, tagIds, isSearching, options);
+  const booksQuery = useBooksInfinite(sortConfig, tagIds, !isSearching, options, formats);
+  const searchQueryHook = useSearchInfinite(
+    searchQuery,
+    sortConfig,
+    tagIds,
+    isSearching,
+    options,
+    formats,
+  );
   const query = isSearching ? searchQueryHook : booksQuery;
   const keepFirstPageAnchor = options.keepFirstPageAnchor ?? true;
 
@@ -274,6 +311,7 @@ export function useFlattenedBooks(
             sortConfig.field,
             sortConfig.order,
             tagIds,
+            formats,
             ...scopeSuffix({ userId: options.userId, libraryId: options.libraryId }),
           ] as const)
         : ([
@@ -282,6 +320,7 @@ export function useFlattenedBooks(
             sortConfig.field,
             sortConfig.order,
             tagIds,
+            formats,
             ...scopeSuffix({ userId: options.userId, libraryId: options.libraryId }),
           ] as const),
     [
@@ -290,12 +329,13 @@ export function useFlattenedBooks(
       sortConfig.field,
       sortConfig.order,
       tagIds,
+      formats,
       options.userId,
       options.libraryId,
     ],
   );
   // R6: bind the anchor to the query identity. Key covers the full
-  // activeQueryKey (search text + sort + tags + user + library).
+  // activeQueryKey (search text + sort + tags + formats + user + library).
   const queryIdentityKey = JSON.stringify(activeQueryKey);
 
   // R6: retain the first page keyed by query identity so maxPages eviction
@@ -420,6 +460,7 @@ export function useFlattenedBooks(
     error: query.error,
     searchQuery,
     tagIds,
+    formats,
   });
   const isAuthExpired = query.error instanceof HttpError && query.error.status === 401;
   const isOffline = !query.isLoading && !hasData && query.error instanceof TypeError;
@@ -473,6 +514,16 @@ export function useTags(enabled = true, scope: InfiniteScope = {}) {
   return useQuery({
     queryKey: ["tags", ...scopeSuffix(scope)],
     queryFn: ({ signal }) => fetchJson<TagSummary[]>(`${API_BASE}/tags`, { signal }),
+    enabled,
+    staleTime: 1000 * 60 * 10,
+  });
+}
+
+// Hook for all formats with counts (format filter UI)
+export function useFormats(enabled = true, scope: InfiniteScope = {}) {
+  return useQuery({
+    queryKey: ["formats", ...scopeSuffix(scope)],
+    queryFn: ({ signal }) => fetchJson<FormatSummary[]>(`${API_BASE}/formats`, { signal }),
     enabled,
     staleTime: 1000 * 60 * 10,
   });

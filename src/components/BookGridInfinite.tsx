@@ -13,6 +13,7 @@ interface BookGridInfiniteProps {
   searchQuery: string;
   sortConfig: SortConfig;
   tagIds?: number[];
+  formats?: string[];
   onClearFilters?: () => void;
 }
 
@@ -63,6 +64,7 @@ export const BookGridInfinite = memo(function BookGridInfinite({
   searchQuery,
   sortConfig,
   tagIds,
+  formats,
   onClearFilters,
 }: BookGridInfiniteProps) {
   const {
@@ -84,7 +86,7 @@ export const BookGridInfinite = memo(function BookGridInfinite({
     isOffline,
     refetch,
     queryKey,
-  } = useFlattenedBooks(searchQuery, sortConfig, tagIds);
+  } = useFlattenedBooks(searchQuery, sortConfig, tagIds, undefined, formats);
   const queryClient = useQueryClient();
 
   // FUP8: callback-ref container so the ResizeObserver re-attaches when the
@@ -286,7 +288,7 @@ export const BookGridInfinite = memo(function BookGridInfinite({
   // FUP8: deps include books.length/hasNextPage readiness; the loop re-reads
   // the latest books from the queryClient cache after each fetchNextPage
   // (never the captured array, which goes stale across awaits).
-  const restoreKey = `${searchQuery}|${sortConfig.field}|${sortConfig.order}|${(tagIds ?? []).join(",")}`;
+  const restoreKey = `${searchQuery}|${sortConfig.field}|${sortConfig.order}|${(tagIds ?? []).join(",")}|${(formats ?? []).join(",")}`;
   // biome-ignore lint/correctness/useExhaustiveDependencies: restore intentionally reads fresh books via queryClient after each fetch; captured books/fetchNextPage would go stale across awaits.
   useEffect(() => {
     let cancelled = false;
@@ -442,16 +444,17 @@ export const BookGridInfinite = memo(function BookGridInfinite({
                   ? "Please sign in again to continue browsing."
                   : "No books match the current filters."}
         </p>
-        {(searchQuery !== "" || (tagIds?.length ?? 0) > 0) && onClearFilters && (
-          <button
-            type="button"
-            onClick={onClearFilters}
-            aria-label="Clear search and filters"
-            className="mt-3 rounded-lg border border-ink px-3 py-1.5 text-sm font-medium text-ink hover:bg-parchment-dark transition-colors"
-          >
-            Clear search and filters
-          </button>
-        )}
+        {(searchQuery !== "" || (tagIds?.length ?? 0) > 0 || (formats?.length ?? 0) > 0) &&
+          onClearFilters && (
+            <button
+              type="button"
+              onClick={onClearFilters}
+              aria-label="Clear search and filters"
+              className="mt-3 rounded-lg border border-ink px-3 py-1.5 text-sm font-medium text-ink hover:bg-parchment-dark transition-colors"
+            >
+              Clear search and filters
+            </button>
+          )}
       </div>
     );
   }

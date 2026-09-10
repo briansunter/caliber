@@ -21,6 +21,7 @@ interface BookTableInfiniteProps {
   searchQuery: string;
   sortConfig: SortConfig;
   tagIds?: number[];
+  formats?: string[];
   onClearFilters?: () => void;
 }
 
@@ -470,6 +471,7 @@ export const BookTableInfinite = memo(function BookTableInfinite({
   searchQuery,
   sortConfig,
   tagIds,
+  formats,
   onClearFilters,
 }: BookTableInfiniteProps) {
   const {
@@ -491,7 +493,7 @@ export const BookTableInfinite = memo(function BookTableInfinite({
     isOffline,
     refetch,
     queryKey,
-  } = useFlattenedBooks(searchQuery, sortConfig, tagIds);
+  } = useFlattenedBooks(searchQuery, sortConfig, tagIds, undefined, formats);
   const queryClient = useQueryClient();
 
   // S7: REAL scrollMargin measurement. The callback ref captures the list
@@ -625,7 +627,7 @@ export const BookTableInfinite = memo(function BookTableInfinite({
   // FUP8: deps include books.length/hasNextPage readiness; the loop re-reads
   // the latest books from the queryClient cache after each fetchNextPage
   // (never the captured array, which goes stale across awaits).
-  const restoreKey = `${searchQuery}|${sortConfig.field}|${sortConfig.order}|${(tagIds ?? []).join(",")}`;
+  const restoreKey = `${searchQuery}|${sortConfig.field}|${sortConfig.order}|${(tagIds ?? []).join(",")}|${(formats ?? []).join(",")}`;
   // biome-ignore lint/correctness/useExhaustiveDependencies: restore intentionally reads fresh books via queryClient after each fetch; captured books/fetchNextPage would go stale across awaits.
   useEffect(() => {
     let cancelled = false;
@@ -762,7 +764,9 @@ export const BookTableInfinite = memo(function BookTableInfinite({
       <EmptyState
         searchQuery={searchQuery}
         reason={emptyReason}
-        hasActiveFilters={searchQuery !== "" || (tagIds?.length ?? 0) > 0}
+        hasActiveFilters={
+          searchQuery !== "" || (tagIds?.length ?? 0) > 0 || (formats?.length ?? 0) > 0
+        }
         onClearFilters={onClearFilters}
       />
     );

@@ -9,11 +9,13 @@ import {
   useLibraryConfig,
   useLibraryStats,
   useTags,
+  useFormats,
   type SortConfig,
   type SortField,
 } from "@/hooks/useBooksInfinite";
 import { UserMenu } from "@/components/UserMenu";
 import { TagFilter } from "@/components/TagFilter";
+import { FormatFilter } from "@/components/FormatFilter";
 import { RecentlyRead } from "@/components/RecentlyRead";
 
 type ViewMode = "list" | "grid";
@@ -26,6 +28,7 @@ interface CanonicalState {
   sort: SortConfig;
   search: string;
   tags: number[];
+  formats: string[];
 }
 
 const SORT_FIELDS: SortField[] = ["title", "author", "added", "rating"];
@@ -37,6 +40,7 @@ function toSearchParams(state: CanonicalState): Record<string, unknown> {
   params.sortBy = state.sort.field;
   params.sortOrder = state.sort.order;
   if (state.tags.length > 0) params.tag = state.tags.map(String);
+  if (state.formats.length > 0) params.format = state.formats;
   return params;
 }
 
@@ -62,6 +66,8 @@ export const Route = createFileRoute("/")({
       typeof v === "string" ? v : Array.isArray(v) && typeof v[0] === "string" ? v[0] : undefined;
     const tags = search.tag;
     const tagList = Array.isArray(tags) ? tags : tags === undefined ? [] : [tags];
+    const formats = search.format;
+    const formatList = Array.isArray(formats) ? formats : formats === undefined ? [] : [formats];
     return {
       q: pick(search.q) ?? "",
       view: pick(search.view) === "grid" ? "grid" : "list",
@@ -71,6 +77,9 @@ export const Route = createFileRoute("/")({
       sortOrder: pick(search.sortOrder) === "asc" ? "asc" : "desc",
       tag: tagList.filter(
         (t): t is string => typeof t === "string" && /^\d+$/.test(t) && Number(t) > 0,
+      ),
+      format: formatList.filter(
+        (f): f is string => typeof f === "string" && /^[A-Za-z0-9]{1,10}$/.test(f),
       ),
     };
   },
@@ -87,6 +96,17 @@ function IndexComponent() {
     const list: unknown[] = Array.isArray(search.tag) ? search.tag : [];
     return list.filter((t): t is string => typeof t === "string" && /^\d+$/.test(t)).map(Number);
   }, [search.tag]);
+  // Normalized uppercase format names for query keys (?format= is case-insensitive).
+  const formatNames = useMemo(() => {
+    const list: unknown[] = Array.isArray(search.format) ? search.format : [];
+    const seen = new Set<string>();
+    for (const f of list) {
+      if (typeof f === "string" && /^[A-Za-z0-9]{1,10}$/.test(f)) {
+        seen.add(f.toUpperCase());
+      }
+    }
+    return Array.from(seen);
+  }, [search.format]);
   const uiState: CanonicalState = useMemo(
     () => ({
       view: search.view === "grid" ? "grid" : search.view === "list" ? "list" : defaultView,
@@ -98,16 +118,19 @@ function IndexComponent() {
         order: search.sortOrder === "asc" ? "asc" : "desc",
       },
       tags: tagNumbers,
+      formats: formatNames,
     }),
-    [search.q, search.view, search.sortBy, search.sortOrder, tagNumbers, defaultView],
+    [search.q, search.view, search.sortBy, search.sortOrder, tagNumbers, formatNames, defaultView],
   );
   const [density, setDensity] = useState<Density>(loadDensity);
   const searchQuery = uiState.search;
   const viewMode = uiState.view;
   const sortConfig = uiState.sort;
-  // Selected tag chips render inside the sticky toolbar, growing its height.
+  // Selected tag/format chips render inside the sticky toolbar, growing its height.
   // The sticky table header offset must grow with it or the rows slide under.
   const hasSelectedTags = uiState.tags.length > 0;
+  const hasSelectedFormats = uiState.formats.length > 0;
+  const hasSelectedFilters = hasSelectedTags || hasSelectedFormats;
 
   const updateCanonical = useCallback(
     (patch: Partial<CanonicalState>) => {
@@ -116,6 +139,7 @@ function IndexComponent() {
         search: uiState.search,
         sort: uiState.sort,
         tags: uiState.tags,
+        formats: uiState.formats,
         ...patch,
       };
       void navigate({ to: "/", search: toSearchParams(next) as never, replace: true });
@@ -133,8 +157,12 @@ function IndexComponent() {
     [updateCanonical],
   );
   const setTags = useCallback((tags: number[]) => updateCanonical({ tags }), [updateCanonical]);
+  const setFormats = useCallback(
+    (formats: string[]) => updateCanonical({ formats }),
+    [updateCanonical],
+  );
   const clearSearchAndFilters = useCallback(
-    () => updateCanonical({ search: "", tags: [] }),
+    () => updateCanonical({ search: "", tags: [], formats: [] }),
     [updateCanonical],
   );
   const toggleDensity = useCallback(() => {
@@ -157,6 +185,7 @@ function IndexComponent() {
   const libraryReady = libraryConfig?.ready === true;
   const { data: stats, isLoading: statsLoading } = useLibraryStats(libraryReady);
   const { data: tags, isLoading: tagsLoading } = useTags(libraryReady);
+  const { data: formats, isLoading: formatsLoading } = useFormats(libraryReady);
 
   if (libraryConfigLoading || !libraryConfig) {
     return (
@@ -242,6 +271,12 @@ function IndexComponent() {
               onChange={setTags}
               isLoading={tagsLoading}
             />
+            <FormatFilter
+              formats={formats}
+              selected={uiState.formats}
+              onChange={setFormats}
+              isLoading={formatsLoading}
+            />
             <fieldset
               aria-label="View mode"
               className="m-0 p-0 flex-shrink-0 flex items-center border border-ink rounded-lg overflow-hidden"
@@ -289,6 +324,11 @@ function IndexComponent() {
             onRemove={(id) => setTags(uiState.tags.filter((t) => t !== id))}
             onClear={() => setTags([])}
           />
+          <SelectedFormatChips
+            selected={uiState.formats}
+            onRemove={(name) => setFormats(uiState.formats.filter((f) => f !== name))}
+            onClear={() => setFormats([])}
+          />
         </div>
 
         {viewMode === "list" && (
@@ -297,7 +337,7 @@ function IndexComponent() {
                 selected-tag chips add a row to the sticky toolbar. */}
             <div
               className={
-                hasSelectedTags
+                hasSelectedFilters
                   ? "sticky top-[80px] sm:top-[90px] z-30 bg-parchment-dark"
                   : "sticky top-[46px] sm:top-[56px] z-30 bg-parchment-dark"
               }
@@ -311,6 +351,7 @@ function IndexComponent() {
                 searchQuery={searchQuery}
                 sortConfig={sortConfig}
                 tagIds={uiState.tags}
+                formats={uiState.formats}
                 onClearFilters={clearSearchAndFilters}
               />
             </div>
@@ -323,6 +364,7 @@ function IndexComponent() {
               searchQuery={searchQuery}
               sortConfig={sortConfig}
               tagIds={uiState.tags}
+              formats={uiState.formats}
               onClearFilters={clearSearchAndFilters}
             />
           </div>
@@ -482,6 +524,54 @@ function SelectedTagChips({
           type="button"
           onClick={onClear}
           aria-label="Clear all selected tags"
+          className="text-xs font-semibold text-accent hover:text-accent-hover transition-colors"
+        >
+          Clear all
+        </button>
+      </li>
+    </ul>
+  );
+}
+
+// Removable chips for the currently selected formats. Rendered inside the
+// sticky toolbar next to the tag chips; the URL (`?format=`) remains the
+// source of truth — chips only call onRemove/onClear.
+function SelectedFormatChips({
+  selected,
+  onRemove,
+  onClear,
+}: {
+  selected: string[];
+  onRemove: (name: string) => void;
+  onClear: () => void;
+}) {
+  if (selected.length === 0) return null;
+  return (
+    <ul
+      className="mt-2 flex flex-wrap items-center gap-1.5 list-none m-0 p-0"
+      aria-label="Selected file types"
+    >
+      {selected.map((name) => (
+        <li
+          key={name}
+          className="inline-flex items-center gap-1 rounded-full border border-ink bg-surface py-1 pl-2.5 pr-1.5 text-xs font-medium text-ink"
+        >
+          <span className="font-mono uppercase">{name}</span>
+          <button
+            type="button"
+            onClick={() => onRemove(name)}
+            aria-label={`Remove ${name} filter`}
+            className="flex h-5 w-5 items-center justify-center rounded-full text-ink-muted transition-colors hover:bg-parchment-dark hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          >
+            <X className="h-3 w-3" strokeWidth={2.5} />
+          </button>
+        </li>
+      ))}
+      <li>
+        <button
+          type="button"
+          onClick={onClear}
+          aria-label="Clear all selected file types"
           className="text-xs font-semibold text-accent hover:text-accent-hover transition-colors"
         >
           Clear all

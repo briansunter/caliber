@@ -96,6 +96,15 @@ function buildFixtureDb(dbPath: string, books: BookSpec[]): void {
     db.run("INSERT INTO books_tags_link (book, tag) VALUES (?, ?)", [book, tag]);
   }
 
+  for (const [book, format] of FORMAT_BOOKS) {
+    db.run("INSERT INTO data (book, format, uncompressed_size, name) VALUES (?, ?, ?, ?)", [
+      book,
+      format,
+      1000,
+      `${book}.${format.toLowerCase()}`,
+    ]);
+  }
+
   db.close();
 }
 
@@ -152,6 +161,18 @@ const TAG_BOOKS: Array<[number, number]> = [
   [1, 1], [2, 1], [3, 1], [4, 1], // Fiction
   [3, 2], [4, 2], [5, 2], // History
   [5, 3], [6, 3], // Sci-Fi
+];
+
+// Formats for the format-filter (OR) tests. Membership mirrors the tag
+// fixture so expectations stay parallel:
+//   EPUB: books 1,2,3,4 -> count 4
+//   PDF:  books 3,4,5   -> count 3
+//   MOBI: books 5,6     -> count 2
+// Union EPUB ∪ PDF = {1,2,3,4,5}.
+const FORMAT_BOOKS: Array<[number, string]> = [
+  [1, "EPUB"], [2, "EPUB"], [3, "EPUB"], [4, "EPUB"],
+  [3, "PDF"], [4, "PDF"], [5, "PDF"],
+  [5, "MOBI"], [6, "MOBI"],
 ];
 
 beforeAll(async () => {
@@ -672,5 +693,113 @@ describe("tag filter (OR logic)", () => {
       4,
     ]);
     expect(lib.searchBooksCursor({ query: "Dragon", tagIds: [3] }).items).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. Format filter (OR logic) tests
+// ---------------------------------------------------------------------------
+
+describe("format filter (OR logic)", () => {
+  // FORMAT_BOOKS: EPUB={1,2,3,4}, PDF={3,4,5}, MOBI={5,6}
+
+  test("listAllFormats: sorted by book count desc then name, with counts", () => {
+    const formats = lib.listAllFormats();
+    expect(formats.map((f) => f.name)).toEqual(["EPUB", "PDF", "MOBI"]);
+    expect(formats.map((f) => f.bookCount)).toEqual([4, 3, 2]);
+    expect(formats[0]).toMatchObject({ name: "EPUB", bookCount: 4 });
+  });
+
+  test("no formats returns all books (filter disabled)", () => {
+    const all = lib.listBooksCursor({ sortBy: "title", sortOrder: "asc" }).items.map((b) => b.id);
+    expect(all).toHaveLength(BOOKS.length);
+  });
+
+  test("single format filters to its books", () => {
+    expect(
+      lib.listBooksCursor({ formats: ["PDF"], sortBy: "title", sortOrder: "asc" }).items.map((b) => b.id),
+    ).toEqual([3, 4, 5]);
+    expect(
+      lib.listBooksCursor({ formats: ["MOBI"], sortBy: "title", sortOrder: "asc" }).items.map((b) => b.id),
+    ).toEqual([5, 6]);
+  });
+
+  test("format matching is case-insensitive", () => {
+    expect(
+      lib.listBooksCursor({ formats: ["epub"], sortBy: "title", sortOrder: "asc" }).items.map((b) => b.id),
+    ).toEqual([1, 2, 3, 4]);
+    expect(
+      lib.listBooksCursor({ formats: ["Pdf"], sortBy: "title", sortOrder: "asc" }).items.map((b) => b.id),
+    ).toEqual([3, 4, 5]);
+  });
+
+  test("multiple formats union without duplicates", () => {
+    expect(
+      lib.listBooksCursor({ formats: ["EPUB", "PDF"], sortBy: "title", sortOrder: "asc" }).items.map((b) => b.id),
+    ).toEqual([1, 2, 3, 4, 5]); // EPUB ∪ PDF
+    expect(
+      lib.listBooksCursor({ formats: ["EPUB", "MOBI"], sortBy: "title", sortOrder: "asc" }).items.map((b) => b.id),
+    ).toEqual([1, 2, 3, 4, 5, 6]); // EPUB ∪ MOBI
+  });
+
+  test("duplicate / non-existent / invalid formats are handled", () => {
+    expect(
+      lib.listBooksCursor({ formats: ["EPUB", "EPUB", "PDF", "pdf"] }).items.map((b) => b.id),
+    ).toEqual([1, 2, 3, 4, 5]);
+    // Non-existent AZW3 contributes nothing; valid ones still OR together
+    expect(lib.listBooksCursor({ formats: ["EPUB", "AZW3"] }).items.map((b) => b.id)).toEqual([
+      1, 2, 3, 4,
+    ]);
+    // Invalid values are ignored (empty strings, punctuation, too long)
+    expect(
+      lib.listBooksCursor({ formats: ["EPUB", "", "  ", "E-PUB", "TOOLONGFORMATNAME"] }).items.map((b) => b.id),
+    ).toEqual([1, 2, 3, 4]);
+    expect(lib.listBooksCursor({ formats: ["AZW3"] }).items).toHaveLength(0);
+  });
+
+  test("search × format filter compose (AND across, OR within formats)", () => {
+    expect(
+      lib.searchBooksCursor({ query: "Aardvark", formats: ["EPUB"] }).items.map((b) => b.id),
+    ).toEqual([1]);
+    // Aardvark (book 1) is not PDF
+    expect(lib.searchBooksCursor({ query: "Aardvark", formats: ["PDF"] }).items).toHaveLength(0);
+    // Dragon (book 4) is EPUB and PDF, not MOBI
+    expect(
+      lib.searchBooksCursor({ query: "Dragon", formats: ["EPUB", "MOBI"] }).items.map((b) => b.id),
+    ).toEqual([4]);
+    expect(lib.searchBooksCursor({ query: "Dragon", formats: ["MOBI"] }).items).toHaveLength(0);
+  });
+
+  test("tag × format filters compose (AND across)", () => {
+    // Fiction ∩ EPUB = {1,2,3,4}
+    expect(
+      lib.listBooksCursor({ tagIds: [1], formats: ["EPUB"], sortBy: "title" }).items.map((b) => b.id),
+    ).toEqual([1, 2, 3, 4]);
+    // Fiction ∩ MOBI = {} (no Fiction book has MOBI)
+    expect(lib.listBooksCursor({ tagIds: [1], formats: ["MOBI"] }).items).toHaveLength(0);
+    // (Fiction ∪ History) ∩ PDF = {3,4,5}
+    expect(
+      lib.listBooksCursor({ tagIds: [1, 2], formats: ["PDF"], sortBy: "title" }).items.map((b) => b.id),
+    ).toEqual([3, 4, 5]);
+  });
+
+  test("union paginates with no dups and monotonic title order", () => {
+    const collected: number[] = [];
+    let cursor: string | undefined = undefined;
+    for (;;) {
+      const page = lib.listBooksCursor({
+        formats: ["EPUB", "PDF"],
+        limit: 2,
+        sortBy: "title",
+        sortOrder: "asc",
+        cursor,
+      });
+      for (const b of page.items) collected.push(b.id);
+      if (!page.nextCursor) break;
+      cursor = page.nextCursor;
+    }
+    expect([...collected].sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5]);
+    expect(new Set(collected).size).toBe(collected.length);
+    expect(collected).toEqual([1, 2, 3, 4, 5]);
   });
 });

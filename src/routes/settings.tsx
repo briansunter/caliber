@@ -80,7 +80,14 @@ function SettingsComponent() {
         <div className="flex items-center gap-3 mb-6">
           <Link
             to="/"
-            search={{ q: "", view: "list", sortBy: "added", sortOrder: "desc", tag: [] }}
+            search={{
+              q: "",
+              view: "list",
+              sortBy: "added",
+              sortOrder: "desc",
+              tag: [],
+              format: [],
+            }}
             className="p-2 -ml-2 rounded-lg text-ink-muted hover:text-ink hover:bg-ink/5 transition-colors"
             aria-label="Back to library"
           >
@@ -100,9 +107,9 @@ function SettingsComponent() {
           <div className="mb-2">
             <h2 className="text-base font-semibold text-ink">Reader performance</h2>
             <p className="text-xs text-ink-tertiary mt-1 max-w-xl">
-              Lower values use less memory — helpful if the reader crashes with “A problem repeatedly
-              occurred” (common in Safari on large PDFs or image-heavy comics). Higher values page
-              faster but keep more in memory. Changes apply the next time a page loads.
+              Lower values use less memory — helpful if the reader crashes with “A problem
+              repeatedly occurred” (common in Safari on large PDFs or image-heavy comics). Higher
+              values page faster but keep more in memory. Changes apply the next time a page loads.
             </p>
           </div>
 
@@ -167,7 +174,8 @@ function SettingsComponent() {
           <div className="pt-4 mt-2 border-t border-ink/10 flex items-center justify-between gap-4">
             <span className="text-xs text-ink-tertiary">
               Defaults: {DEFAULT_READER_SETTINGS.prefetchAhead} ahead /{" "}
-              {DEFAULT_READER_SETTINGS.prefetchBehind} behind, {DEFAULT_READER_SETTINGS.maxRenderScale}×
+              {DEFAULT_READER_SETTINGS.prefetchBehind} behind,{" "}
+              {DEFAULT_READER_SETTINGS.maxRenderScale}×
             </span>
             <button
               type="button"

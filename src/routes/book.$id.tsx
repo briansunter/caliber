@@ -31,7 +31,7 @@ function BookDetailPage() {
     } else {
       navigate({
         to: "/",
-        search: { q: "", view: "list", sortBy: "added", sortOrder: "desc", tag: [] },
+        search: { q: "", view: "list", sortBy: "added", sortOrder: "desc", tag: [], format: [] },
       });
     }
   }

@@ -7,6 +7,7 @@ import {
   listSeriesCursor,
   listTagsCursor,
   listAllTags,
+  listAllFormats,
   listFormatsCursor,
   listBooksByAuthorCursor,
   listBooksBySeriesCursor,
@@ -160,6 +161,24 @@ function parseTagIds(url: URL): number[] {
     }
   }
   return Array.from(ids);
+}
+
+// Parse repeated `format` query params into deduped, uppercased format names
+// (OR logic). Calibre stores `data.format` uppercase; values are validated
+// to alphanumerics so they are safe to bind and cache-key.
+const MAX_FORMAT_FILTERS = 20;
+function parseFormats(url: URL): string[] {
+  const raw = url.searchParams.getAll("format");
+  if (raw.length === 0) return [];
+  const formats = new Set<string>();
+  for (const value of raw) {
+    const normalized = value.trim().toUpperCase();
+    if (/^[A-Z0-9]{1,10}$/.test(normalized)) {
+      formats.add(normalized);
+      if (formats.size >= MAX_FORMAT_FILTERS) break;
+    }
+  }
+  return Array.from(formats);
 }
 
 // --- User session cookie (no auth yet: cookie just remembers a username) ---
@@ -1618,6 +1637,13 @@ const routes: RouteTable = {
     },
   },
 
+  // All formats with book counts (for the format filter UI)
+  "/api/formats": {
+    GET: (req) => {
+      return getCachedResponse("formats", () => listAllFormats(), req);
+    },
+  },
+
   // Book count (lightweight)
   "/api/books/count": {
     GET: (req) => {
@@ -2595,6 +2621,7 @@ const routes: RouteTable = {
         const sortBy = parseSortField(url.searchParams.get("sortBy"));
         const sortOrder = parseSortOrder(url.searchParams.get("sortOrder"));
         const tagIds = parseTagIds(url);
+        const formats = parseFormats(url);
         // S7: cheap first-page total. Explicit ?includeTotal=0/false opts
         // out; otherwise the first page (cursor == null) includes total via
         // COUNT(*) with the same filters and later pages omit it.
@@ -2604,11 +2631,19 @@ const routes: RouteTable = {
             ? !cursor
             : includeParam === "1" || includeParam.toLowerCase() === "true";
 
-        const cacheKey = `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}:tags:${tagIds.join(",")}:total:${wantTotal ? 1 : 0}`;
+        const cacheKey = `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}:tags:${tagIds.join(",")}:formats:${formats.join(",")}:total:${wantTotal ? 1 : 0}`;
         return getCachedResponse(
           cacheKey,
           () =>
-            listBooksCursor({ cursor, limit, sortBy, sortOrder, tagIds, includeTotal: wantTotal }),
+            listBooksCursor({
+              cursor,
+              limit,
+              sortBy,
+              sortOrder,
+              tagIds,
+              formats,
+              includeTotal: wantTotal,
+            }),
           req,
         );
       } catch (error) {
@@ -2631,6 +2666,7 @@ const routes: RouteTable = {
         const sortBy = parseSortField(url.searchParams.get("sortBy"));
         const sortOrder = parseSortOrder(url.searchParams.get("sortOrder"));
         const tagIds = parseTagIds(url);
+        const formats = parseFormats(url);
         // S7: same first-page-total contract as /api/books (see above).
         const includeParam = url.searchParams.get("includeTotal");
         const wantTotal =
@@ -2640,7 +2676,7 @@ const routes: RouteTable = {
 
         if (!query.trim()) {
           return getCachedResponse(
-            `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}:tags:${tagIds.join(",")}:total:${wantTotal ? 1 : 0}`,
+            `books:${cursor || "first"}:${limit}:${sortBy}:${sortOrder}:tags:${tagIds.join(",")}:formats:${formats.join(",")}:total:${wantTotal ? 1 : 0}`,
             () =>
               listBooksCursor({
                 cursor,
@@ -2648,6 +2684,7 @@ const routes: RouteTable = {
                 sortBy,
                 sortOrder,
                 tagIds,
+                formats,
                 includeTotal: wantTotal,
               }),
             req,
@@ -2661,6 +2698,7 @@ const routes: RouteTable = {
           sortBy,
           sortOrder,
           tagIds,
+          formats,
           includeTotal: wantTotal,
         });
 

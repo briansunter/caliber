@@ -15,17 +15,8 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import {
-  CONFIG_DIR_PATH,
-  DB_NAME,
-  DB_REFRESH_INTERVAL_MS,
-  LIBRARY_PATH,
-} from "./config";
-import {
-  type SourceSignature,
-  getDatabaseSignature,
-  isSameSignature,
-} from "./file-signature";
+import { CONFIG_DIR_PATH, DB_NAME, DB_REFRESH_INTERVAL_MS, LIBRARY_PATH } from "./config";
+import { type SourceSignature, getDatabaseSignature, isSameSignature } from "./file-signature";
 
 let DB_PATH = join(LIBRARY_PATH, DB_NAME);
 
@@ -130,7 +121,10 @@ export function getSnapshotStatus(): {
     const snapshot = readSnapshotMetadata();
     const sig = getDatabaseSignature(DB_PATH);
     stale =
-      stale || !snapshot || snapshot.sourcePath !== resolve(DB_PATH) || !isSameSignature(snapshot.signature, sig);
+      stale ||
+      !snapshot ||
+      snapshot.sourcePath !== resolve(DB_PATH) ||
+      !isSameSignature(snapshot.signature, sig);
   } catch {
     // If stat fails we cannot prove freshness; report not-stale.
   }
@@ -207,9 +201,11 @@ function copyDbToWritable(): void {
   const sourceDb = new Database(DB_PATH, { readonly: true });
   try {
     const tables = new Set(
-      (sourceDb.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map(
-        (row) => row.name,
-      ),
+      (
+        sourceDb.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{
+          name: string;
+        }>
+      ).map((row) => row.name),
     );
     const missingTables = ["books", "authors", "data", "books_authors_link"].filter(
       (table) => !tables.has(table),
@@ -546,30 +542,26 @@ function setupSnapshotDb(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_books_timestamp_key ON books(timestamp, id);`);
   // Matches BOOK_SORT_EXPRESSIONS.added (`COALESCE(b.timestamp, '')`) with the
   // alias stripped, so the added-sort page query seeks instead of sorting.
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_books_timestamp_matching ON books(COALESCE(timestamp,''), id);`);
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_books_timestamp_matching ON books(COALESCE(timestamp,''), id);`,
+  );
   // Matches BOOK_SORT_EXPRESSIONS.series_index (`COALESCE(b.series_index, 1)`)
   // with the alias stripped (covering index: key + rowid tie-break).
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_books_series_index_key ON books(COALESCE(series_index,1), id);`);
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_books_series_index_key ON books(COALESCE(series_index,1), id);`,
+  );
   db.exec(`CREATE INDEX IF NOT EXISTS idx_books_ratings_link_book ON books_ratings_link(book);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_ratings_value ON ratings(rating, id);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_data_format ON data(format);`);
 
   // Link-table indexes
-  db.exec(
-    `CREATE INDEX IF NOT EXISTS idx_books_authors_link_book ON books_authors_link(book);`,
-  );
-  db.exec(
-    `CREATE INDEX IF NOT EXISTS idx_books_tags_link_book ON books_tags_link(book);`,
-  );
-  db.exec(
-    `CREATE INDEX IF NOT EXISTS idx_books_series_link_book ON books_series_link(book);`,
-  );
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_books_authors_link_book ON books_authors_link(book);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_books_tags_link_book ON books_tags_link(book);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_books_series_link_book ON books_series_link(book);`);
   db.exec(
     `CREATE INDEX IF NOT EXISTS idx_books_publishers_link_book ON books_publishers_link(book);`,
   );
-  db.exec(
-    `CREATE INDEX IF NOT EXISTS idx_books_series_link_series ON books_series_link(series);`,
-  );
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_books_series_link_series ON books_series_link(series);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_books_tags_link_tag ON books_tags_link(tag);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_authors_name ON authors(name);`);
 
@@ -594,7 +586,9 @@ function setupSnapshotDb(db: Database): void {
     count: number;
   };
   const metaRows = db
-    .query("SELECT key, value FROM caliber_fts_meta WHERE key IN ('source_signature', 'fts_schema_version')")
+    .query(
+      "SELECT key, value FROM caliber_fts_meta WHERE key IN ('source_signature', 'fts_schema_version')",
+    )
     .all() as Array<{ key: string; value: string }>;
   const metaByKey = new Map(metaRows.map((row) => [row.key, row.value]));
   const schemaVersion = metaByKey.get("fts_schema_version");
@@ -645,9 +639,9 @@ function setupSnapshotDb(db: Database): void {
       db.query(
         "INSERT OR REPLACE INTO caliber_fts_meta (key, value) VALUES ('source_signature', ?)",
       ).run(sourceSignatureValue);
-      db.query("INSERT OR REPLACE INTO caliber_fts_meta (key, value) VALUES ('fts_schema_version', ?)").run(
-        FTS_SCHEMA_VERSION,
-      );
+      db.query(
+        "INSERT OR REPLACE INTO caliber_fts_meta (key, value) VALUES ('fts_schema_version', ?)",
+      ).run(FTS_SCHEMA_VERSION);
       db.exec("COMMIT;");
     } catch (error) {
       try {
@@ -975,6 +969,9 @@ interface ListOptions {
   // Tag IDs to filter by (OR logic: a book matches if it has ANY of these tags).
   // Combined with any search/FTS clause via AND.
   tagIds?: number[];
+  // Formats to filter by, uppercased (OR logic: a book matches if it has
+  // ANY of these formats in `data`). Combined with tag/search clauses via AND.
+  formats?: string[];
   // F23: when true, exclude metadata-only books (no rows in data) at the
   // query level. Used by OPDS acquisition feeds.
   requireFormats?: boolean;
@@ -987,9 +984,7 @@ interface ListOptions {
 
 // Build a `b.id IN (...)` clause for OR-logic tag filtering, or "" if none valid.
 // Returns the clause fragment and the deduped, valid IDs to bind.
-function buildTagFilterClause(
-  tagIds: number[] | undefined,
-): { clause: string; ids: number[] } {
+function buildTagFilterClause(tagIds: number[] | undefined): { clause: string; ids: number[] } {
   if (!tagIds || tagIds.length === 0) return { clause: "", ids: [] };
   const seen = new Set<number>();
   for (const id of tagIds) {
@@ -1001,6 +996,30 @@ function buildTagFilterClause(
   return {
     clause: `b.id IN (SELECT book FROM books_tags_link WHERE tag IN (${placeholders}))`,
     ids,
+  };
+}
+
+// Build a `b.id IN (...)` clause for OR-logic format filtering, or "" if none
+// valid. Returns the clause fragment and the normalized (uppercased) formats
+// to bind. Calibre stores `data.format` uppercase; matching is case-insensitive
+// so lowercase query params still work.
+function buildFormatFilterClause(formats: string[] | undefined): {
+  clause: string;
+  values: string[];
+} {
+  if (!formats || formats.length === 0) return { clause: "", values: [] };
+  const seen = new Set<string>();
+  for (const format of formats) {
+    if (typeof format !== "string") continue;
+    const normalized = format.trim().toUpperCase();
+    if (/^[A-Z0-9]{1,10}$/.test(normalized)) seen.add(normalized);
+  }
+  const values = Array.from(seen);
+  if (values.length === 0) return { clause: "", values: [] };
+  const placeholders = values.map(() => "?").join(",");
+  return {
+    clause: `b.id IN (SELECT book FROM data WHERE UPPER(format) IN (${placeholders}))`,
+    values,
   };
 }
 
@@ -1141,9 +1160,12 @@ function listBooksWithWhere(
     // query's WHERE), so it composes with search/FTS via AND and is covered
     // by idx_books_tags_link_tag.
     const tagFilter = buildTagFilterClause(options.tagIds);
-    const baseWhere =
-      tagFilter.clause.length > 0 ? `${initialWhere} AND ${tagFilter.clause}` : initialWhere;
+    const formatFilter = buildFormatFilterClause(options.formats);
+    let baseWhere = initialWhere;
+    if (tagFilter.clause.length > 0) baseWhere += ` AND ${tagFilter.clause}`;
+    if (formatFilter.clause.length > 0) baseWhere += ` AND ${formatFilter.clause}`;
     if (tagFilter.ids.length > 0) params.push(...tagFilter.ids);
+    if (formatFilter.values.length > 0) params.push(...formatFilter.values);
     // F23: exclude metadata-only books (no formats) at the query level.
     const formatsWhere = options.requireFormats
       ? `${baseWhere} AND EXISTS (SELECT 1 FROM data d WHERE d.book = b.id)`
@@ -1299,7 +1321,11 @@ function listBooksWithWhere(
     const nextCursor =
       lastPageRow && items.length > 0
         ? encodeCursor(
-            { ...baseById.get(lastPageRow.id), id: lastPageRow.id, cursor_sort: lastPageRow.cursor_sort } as BookRow,
+            {
+              ...baseById.get(lastPageRow.id),
+              id: lastPageRow.id,
+              cursor_sort: lastPageRow.cursor_sort,
+            } as BookRow,
             sortBy,
           )
         : null;
@@ -1401,11 +1427,9 @@ export function listBooksByFormatCursor(
   format: string,
   options: ListOptions = {},
 ): CursorPaginatedResult<BookListItem> {
-  return listBooksWithWhere(
-    options,
-    "WHERE b.id IN (SELECT book FROM data WHERE format = ?)",
-    [format.toUpperCase()],
-  );
+  return listBooksWithWhere(options, "WHERE b.id IN (SELECT book FROM data WHERE format = ?)", [
+    format.toUpperCase(),
+  ]);
 }
 
 // Get book details by ID
@@ -1590,7 +1614,12 @@ export function getLibraryStats(): {
           (SELECT COUNT(*) FROM series) as totalSeries,
           (SELECT COUNT(*) FROM tags) as totalTags`,
       )
-      .get() as { totalBooks: number; totalAuthors: number; totalSeries: number; totalTags: number };
+      .get() as {
+      totalBooks: number;
+      totalAuthors: number;
+      totalSeries: number;
+      totalTags: number;
+    };
 
     return stats;
   } finally {
@@ -1717,11 +1746,15 @@ function listCatalogEntries(
   }
 }
 
-export function listAuthorsCursor(options: CatalogOptions = {}): CursorPaginatedResult<CatalogEntry> {
+export function listAuthorsCursor(
+  options: CatalogOptions = {},
+): CursorPaginatedResult<CatalogEntry> {
   return listCatalogEntries("authors", options);
 }
 
-export function listSeriesCursor(options: CatalogOptions = {}): CursorPaginatedResult<CatalogEntry> {
+export function listSeriesCursor(
+  options: CatalogOptions = {},
+): CursorPaginatedResult<CatalogEntry> {
   return listCatalogEntries("series", options);
 }
 
@@ -1729,7 +1762,9 @@ export function listTagsCursor(options: CatalogOptions = {}): CursorPaginatedRes
   return listCatalogEntries("tags", options);
 }
 
-export function listFormatsCursor(options: CatalogOptions = {}): CursorPaginatedResult<CatalogEntry> {
+export function listFormatsCursor(
+  options: CatalogOptions = {},
+): CursorPaginatedResult<CatalogEntry> {
   return listCatalogEntries("formats", options);
 }
 
@@ -1757,6 +1792,32 @@ export function listAllTags(limit: number = 2000): TagSummary[] {
         LIMIT ?`,
       )
       .all(capped) as TagSummary[];
+    return rows;
+  } finally {
+    releaseDb();
+  }
+}
+
+// All formats with book counts, most-popular-first — drives the format filter UI.
+export interface FormatSummary {
+  name: string;
+  bookCount: number;
+}
+
+export function listAllFormats(): FormatSummary[] {
+  const db = getDb();
+  try {
+    const rows = db
+      .query(
+        `SELECT
+          UPPER(d.format) AS name,
+          COUNT(DISTINCT d.book) AS bookCount
+        FROM data d
+        WHERE d.format IS NOT NULL AND TRIM(d.format) != ''
+        GROUP BY UPPER(d.format)
+        ORDER BY bookCount DESC, name ASC`,
+      )
+      .all() as FormatSummary[];
     return rows;
   } finally {
     releaseDb();
