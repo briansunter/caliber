@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.15](https://github.com/briansunter/caliber/compare/v0.1.14...v0.1.15) (2026-10-02)
+
+
+### Features
+
+* filter books by file type with Formats toolbar button ([34f1ee2](https://github.com/briansunter/caliber/commit/34f1ee2feb027e5a9a96a9c9525ec2f2e7d89f7a))
+* redesign library UI and improve reliability ([405509c](https://github.com/briansunter/caliber/commit/405509c2378ba7ad9897b8a51c16bdc2da3234bf))
+
 ## [0.1.14](https://github.com/briansunter/caliber/compare/v0.1.13...v0.1.14) (2026-09-09)
 
 
