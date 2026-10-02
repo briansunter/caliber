@@ -19,6 +19,7 @@ const FORMAT_CONTENT_TYPES: Record<string, string> = {
 };
 
 const PATH_CONTENT_TYPES: Record<string, string> = {
+  avif: "image/avif",
   css: "text/css; charset=utf-8",
   gif: "image/gif",
   htm: "text/html; charset=utf-8",

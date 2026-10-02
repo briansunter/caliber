@@ -9,6 +9,14 @@ export interface SourceSignature {
   shmMtimeMs?: number;
 }
 
+export function isSourceSignature(value: unknown): value is SourceSignature {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  return ["size", "mtimeMs"].every(
+    (key) => typeof record[key] === "number" && Number.isFinite(record[key]) && record[key] >= 0,
+  );
+}
+
 export function getSourceSignature(path: string): SourceSignature {
   const stat = statSync(path);
   return {
@@ -43,10 +51,7 @@ export function getDatabaseSignature(path: string): SourceSignature {
   };
 }
 
-export function isSameSignature(
-  a: SourceSignature | null,
-  b: SourceSignature,
-): boolean {
+export function isSameSignature(a: SourceSignature | null, b: SourceSignature): boolean {
   return Boolean(
     a &&
       a.size === b.size &&

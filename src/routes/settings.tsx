@@ -74,15 +74,19 @@ function SettingsComponent() {
   const settings = useReaderSettings();
 
   return (
-    <div className="min-h-screen bg-parchment paper-texture">
-      <main id="main-content" className="max-w-2xl mx-auto px-4 sm:px-6 pt-6 sm:pt-10 pb-16">
+    <div className="min-h-screen bg-parchment">
+      <main
+        id="main-content"
+        tabIndex={-1}
+        className="max-w-2xl mx-auto px-4 sm:px-6 pt-6 sm:pt-10 pb-16"
+      >
         {/* Header */}
         <div className="flex items-center gap-3 mb-6">
           <Link
             to="/"
             search={{
               q: "",
-              view: "list",
+              view: "grid",
               sortBy: "added",
               sortOrder: "desc",
               tag: [],
@@ -96,7 +100,9 @@ function SettingsComponent() {
           <div className="w-8 h-8 bg-ink rounded-lg flex items-center justify-center">
             <SettingsIcon className="h-4 w-4 text-white" strokeWidth={1.5} />
           </div>
-          <h1 className="text-xl sm:text-2xl font-semibold text-ink tracking-tight">Settings</h1>
+          <h1 className="font-display text-3xl sm:text-4xl font-normal text-ink tracking-tight">
+            Settings
+          </h1>
         </div>
 
         <LibraryConfigPanel />

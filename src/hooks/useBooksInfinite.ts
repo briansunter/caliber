@@ -1,7 +1,9 @@
-import { useInfiniteQuery, useQuery, keepPreviousData } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { BookListItem, BookWithDetails, CursorPaginatedResult } from "@/lib/calibre-optimized";
 import { fetchJson, HttpError } from "@/lib/http";
+import { flattenBookWindow, type WindowAnchor } from "@/lib/infinite-window";
+import { useCurrentUser } from "@/lib/user";
 
 const API_BASE = "/api";
 const PAGE_SIZE = 100;
@@ -26,6 +28,7 @@ export interface FormatSummary {
 }
 
 export interface LibraryConfigStatus {
+  libraryId?: string;
   libraryPath: string;
   dbName: string;
   databasePath: string;
@@ -78,9 +81,10 @@ export function emptyReasonOf(args: {
   tagIds: number[];
   formats?: string[];
 }): EmptyReason {
-  if (args.booksLength > 0 || args.isLoading || args.error) return null;
+  if (args.booksLength > 0 || args.isLoading) return null;
   if (args.error instanceof HttpError && args.error.status === 401) return "auth-expired";
   if (args.error instanceof TypeError) return "offline";
+  if (args.error) return null;
   if (
     args.searchQuery.trim().length > 0 ||
     args.tagIds.length > 0 ||
@@ -104,6 +108,15 @@ function appendFormatParams(params: URLSearchParams, formats: string[]): void {
 
 function scopeSuffix(scope: InfiniteScope): (string | number)[] {
   return [scope.userId ?? "anon", scope.libraryId ?? "default-lib"];
+}
+
+function useLibraryScope(scope: InfiniteScope): InfiniteScope {
+  const { user } = useCurrentUser();
+  const { data: config } = useLibraryConfig();
+  return {
+    userId: scope.userId === undefined ? user?.id : scope.userId,
+    libraryId: scope.libraryId === undefined ? config?.libraryId : scope.libraryId,
+  };
 }
 
 async function fetchBooks({
@@ -207,7 +220,11 @@ export function useBooksInfinite(
     getPreviousPageParam: (firstPage) => firstPage.prevCursor ?? undefined,
     initialPageParam: undefined as string | undefined,
     enabled,
-    placeholderData: keepPreviousData,
+    placeholderData: (previousData, previousQuery) =>
+      previousQuery?.queryKey.at(-2) === (userId ?? "anon") &&
+      previousQuery.queryKey.at(-1) === (libraryId ?? "default-lib")
+        ? previousData
+        : undefined,
     staleTime: 1000 * 60 * 5,
     gcTime: 1000 * 60 * 10,
     maxPages,
@@ -250,36 +267,19 @@ export function useSearchInfinite(
     getPreviousPageParam: (firstPage) => firstPage.prevCursor ?? undefined,
     initialPageParam: undefined as string | undefined,
     enabled,
-    placeholderData: keepPreviousData,
+    placeholderData: (previousData, previousQuery) =>
+      previousQuery?.queryKey.at(-2) === (userId ?? "anon") &&
+      previousQuery.queryKey.at(-1) === (libraryId ?? "default-lib")
+        ? previousData
+        : undefined,
     staleTime: 1000 * 60,
     gcTime: 1000 * 60 * 5,
     maxPages,
   });
 }
 
-// Shared hook: flattens pages and exposes fetch controls.
-//
-// Forward-only contract (documented, do NOT claim otherwise):
-// - The server is forward-only: it emits only nextCursor, never prevCursor.
-//   There is NO server backward fetch, so fetchPreviousPage is a no-op that
-//   returns undefined until the server adds prevCursor support. The retained
-//   window is therefore NEVER continuous once maxPages evicts leading pages:
-//   footers must say "retained window" / "earlier books unavailable" and must
-//   never claim "all books loaded" while windowTruncated, even when the
-//   forward cursor is exhausted.
-// - The client keeps all loaded pages in the TanStack cache up to maxPages
-//   (no manual eviction besides TanStack's maxPages window). windowTruncated
-//   is derived from cached data length vs totalCount once the window is full.
-// - keepFirstPageAnchor retains the first page's items keyed by query
-//   identity and prepends them ONLY when eviction is proven
-//   (window full while retained < total when total is present; window full
-//   alone when later pages omit total). Otherwise rawBooks are
-//   returned untouched, so a search/sort/tag/user/library change can never
-//   inherit a stale anchor from a previous query. keepPreviousData
-//   placeholder pages are never captured as the anchor.
-// - S7 totals are first-page-only: later pages omit `total`, so the
-//   first-page total is preserved in totalForIdentityRef alongside the anchor
-//   items and survives eviction of the first page from the window.
+// The API supports forward paging only. Preserve the initial page and its
+// total under the full query identity, while bounding the retained page window.
 export function useFlattenedBooks(
   searchQuery: string,
   sortConfig: SortConfig,
@@ -287,14 +287,17 @@ export function useFlattenedBooks(
   options: InfiniteWindowOptions = {},
   formats: string[] = [],
 ) {
-  const isSearching = searchQuery.trim().length > 0;
-  const booksQuery = useBooksInfinite(sortConfig, tagIds, !isSearching, options, formats);
+  const scope = useLibraryScope(options);
+  const scopedOptions = { ...options, ...scope };
+  const normalizedSearch = searchQuery.trim();
+  const isSearching = normalizedSearch.length > 0;
+  const booksQuery = useBooksInfinite(sortConfig, tagIds, !isSearching, scopedOptions, formats);
   const searchQueryHook = useSearchInfinite(
-    searchQuery,
+    normalizedSearch,
     sortConfig,
     tagIds,
     isSearching,
-    options,
+    scopedOptions,
     formats,
   );
   const query = isSearching ? searchQueryHook : booksQuery;
@@ -307,12 +310,12 @@ export function useFlattenedBooks(
             "books",
             "search",
             "infinite",
-            searchQuery,
+            normalizedSearch,
             sortConfig.field,
             sortConfig.order,
             tagIds,
             formats,
-            ...scopeSuffix({ userId: options.userId, libraryId: options.libraryId }),
+            ...scopeSuffix({ userId: scopedOptions.userId, libraryId: scopedOptions.libraryId }),
           ] as const)
         : ([
             "books",
@@ -321,124 +324,44 @@ export function useFlattenedBooks(
             sortConfig.order,
             tagIds,
             formats,
-            ...scopeSuffix({ userId: options.userId, libraryId: options.libraryId }),
+            ...scopeSuffix({ userId: scopedOptions.userId, libraryId: scopedOptions.libraryId }),
           ] as const),
     [
       isSearching,
-      searchQuery,
+      normalizedSearch,
       sortConfig.field,
       sortConfig.order,
       tagIds,
       formats,
-      options.userId,
-      options.libraryId,
+      scopedOptions.userId,
+      scopedOptions.libraryId,
     ],
   );
-  // R6: bind the anchor to the query identity. Key covers the full
-  // activeQueryKey (search text + sort + tags + formats + user + library).
   const queryIdentityKey = JSON.stringify(activeQueryKey);
-
-  // R6: retain the first page keyed by query identity so maxPages eviction
-  // never loses the top anchor — and a query change never inherits a stale
-  // anchor. Stored in a ref (not state) to avoid extra renders; reset when
-  // the identity key changes. The first-page `total` rides alongside the
-  // anchor items (totalForIdentity) so "Showing X of Y" survives eviction of
-  // the first page itself.
-  // S7: keepPreviousData placeholder pages are NEVER captured — while
-  // isPlaceholderData is true, query.data still holds the PREVIOUS query's
-  // first page, which must not be anchored under the new identity key.
   const isPlaceholderData = query.isPlaceholderData ?? false;
-  const firstPageDataRef = useRef<{
-    key: string;
-    items: BookListItem[];
-    total: number | null;
-  } | null>(null);
-  const firstPageSeen = !isPlaceholderData ? query.data?.pages[0]?.items : undefined;
-  const firstPageTotalSeen = !isPlaceholderData ? query.data?.pages[0]?.total : undefined;
+  const [anchor, setAnchor] = useState<WindowAnchor<BookListItem> | null>(null);
+  const firstPage =
+    !isPlaceholderData && query.data?.pageParams[0] === undefined
+      ? query.data?.pages[0]
+      : undefined;
   useEffect(() => {
-    if (!isPlaceholderData && firstPageSeen && firstPageSeen.length > 0) {
-      if (!firstPageDataRef.current || firstPageDataRef.current.key !== queryIdentityKey) {
-        firstPageDataRef.current = {
-          key: queryIdentityKey,
-          items: firstPageSeen,
-          total: typeof firstPageTotalSeen === "number" ? firstPageTotalSeen : null,
-        };
-      } else if (
-        firstPageDataRef.current.total === null &&
-        typeof firstPageTotalSeen === "number"
-      ) {
-        // Backfill: the anchor was captured on a render where the first
-        // page had no total yet; adopt it now while the identity matches.
-        firstPageDataRef.current.total = firstPageTotalSeen;
-      }
-    }
-  }, [firstPageSeen, firstPageTotalSeen, queryIdentityKey, isPlaceholderData]);
+    if (firstPage) setAnchor({ identity: queryIdentityKey, page: firstPage });
+  }, [firstPage, queryIdentityKey]);
 
-  const rawBooks = useMemo(() => {
-    return query.data?.pages.flatMap((page) => page.items) ?? [];
-  }, [query.data]);
-
-  const maxPagesForAnchor = isSearching ? (options.maxPages ?? 20) : (options.maxPages ?? 50);
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: pages.length is the eviction signal; rawBooks identity alone does not change when maxPages drops leading pages.
-  const books = useMemo(() => {
-    // R6: prepend the anchor ONLY when it belongs to the current query
-    // identity AND eviction is proven. The effective total prefers the live
-    // window, then falls back to the preserved first-page total
-    // (totalForIdentity) once the first page is evicted. When no total is
-    // known at all, the full window (pages.length >= maxPages) alone proves
-    // eviction. Otherwise return rawBooks untouched — forward-only, no
-    // backward fetch.
-    if (!keepFirstPageAnchor) return rawBooks;
-    const stored = firstPageDataRef.current;
-    if (!stored || stored.key !== queryIdentityKey) return rawBooks;
-    const anchor = stored.items;
-    if (anchor.length === 0 || rawBooks.length === 0) return rawBooks;
-    const pagesLength = query.data?.pages.length ?? 0;
-    const total = (() => {
-      const pages = query.data?.pages;
-      if (pages) {
-        for (const p of pages) {
-          if (typeof p.total === "number") return p.total;
-        }
-      }
-      return stored.key === queryIdentityKey ? stored.total : null;
-    })();
-    const windowFull = pagesLength >= maxPagesForAnchor;
-    const evictionProven = windowFull && (total === null || rawBooks.length < total);
-    if (!evictionProven) return rawBooks;
-    if (rawBooks[0]?.id === anchor[0]?.id) return rawBooks;
-    const seen = new Set(rawBooks.map((b) => b.id));
-    const missing = anchor.filter((b) => !seen.has(b.id));
-    if (missing.length === 0) return rawBooks;
-    return [...missing, ...rawBooks];
-  }, [rawBooks, keepFirstPageAnchor, queryIdentityKey, query.data?.pages.length]);
-
-  const totalCount = useMemo(() => {
-    const pages = query.data?.pages;
-    if (pages && pages.length > 0) {
-      for (const page of pages) {
-        if (typeof page.total === "number") return page.total;
-      }
-    }
-    // Evicted window: fall back to the preserved first-page total for this
-    // query identity so the footer keeps "Showing X of Y (retained window)".
-    const stored = firstPageDataRef.current;
-    if (stored && stored.key === queryIdentityKey && typeof stored.total === "number") {
-      return stored.total;
-    }
-    return null;
-  }, [query.data, queryIdentityKey]);
-
+  const { books, totalCount, windowTruncated } = useMemo(
+    () =>
+      flattenBookWindow(
+        query.data?.pages,
+        query.data?.pageParams,
+        queryIdentityKey,
+        // Placeholder data belongs to the previous query and cannot be anchored.
+        isPlaceholderData ? null : anchor,
+        keepFirstPageAnchor,
+      ),
+    [query.data, queryIdentityKey, isPlaceholderData, anchor, keepFirstPageAnchor],
+  );
   const retainedCount = books.length;
-  const maxPages = maxPagesForAnchor;
-  // FUP8: windowTruncated reflects maxPages eviction. S7: when total is
-  // present (first page), the window is truncated while retained < total;
-  // when total is absent (later pages omit it), the full window
-  // (pages.length >= maxPages) alone signals truncation.
-  const pagesLength = query.data?.pages.length ?? 0;
-  const windowTruncated =
-    pagesLength >= maxPages && (totalCount === null || retainedCount < totalCount);
+  const maxPages = isSearching ? (options.maxPages ?? 20) : (options.maxPages ?? 50);
 
   // FUP8: backward fetch is NOT supported (forward-only server). No-op until
   // the server emits prevCursor — never claim it fetches.
@@ -495,8 +418,9 @@ export function useFlattenedBooks(
 
 // Hook for library stats
 export function useLibraryStats(enabled = true, scope: InfiniteScope = {}) {
+  const effectiveScope = useLibraryScope(scope);
   return useQuery({
-    queryKey: ["stats", ...scopeSuffix(scope)],
+    queryKey: ["stats", ...scopeSuffix(effectiveScope)],
     queryFn: ({ signal }) =>
       fetchJson<{
         totalBooks: number;
@@ -511,8 +435,9 @@ export function useLibraryStats(enabled = true, scope: InfiniteScope = {}) {
 
 // Hook for all tags with counts (tag filter UI)
 export function useTags(enabled = true, scope: InfiniteScope = {}) {
+  const effectiveScope = useLibraryScope(scope);
   return useQuery({
-    queryKey: ["tags", ...scopeSuffix(scope)],
+    queryKey: ["tags", ...scopeSuffix(effectiveScope)],
     queryFn: ({ signal }) => fetchJson<TagSummary[]>(`${API_BASE}/tags`, { signal }),
     enabled,
     staleTime: 1000 * 60 * 10,
@@ -521,8 +446,9 @@ export function useTags(enabled = true, scope: InfiniteScope = {}) {
 
 // Hook for all formats with counts (format filter UI)
 export function useFormats(enabled = true, scope: InfiniteScope = {}) {
+  const effectiveScope = useLibraryScope(scope);
   return useQuery({
-    queryKey: ["formats", ...scopeSuffix(scope)],
+    queryKey: ["formats", ...scopeSuffix(effectiveScope)],
     queryFn: ({ signal }) => fetchJson<FormatSummary[]>(`${API_BASE}/formats`, { signal }),
     enabled,
     staleTime: 1000 * 60 * 10,
@@ -530,8 +456,9 @@ export function useFormats(enabled = true, scope: InfiniteScope = {}) {
 }
 
 export function useLibraryConfig() {
+  const { user } = useCurrentUser();
   return useQuery({
-    queryKey: ["library-config"],
+    queryKey: ["library-config", user?.id ?? "anon"],
     queryFn: ({ signal }) =>
       fetchJson<LibraryConfigStatus>(`${API_BASE}/config/library`, { signal }),
     retry: false,
@@ -541,9 +468,10 @@ export function useLibraryConfig() {
 
 // Hook for single book
 export function useBook(id: number, scope: InfiniteScope = {}) {
+  const effectiveScope = useLibraryScope(scope);
   return useQuery({
-    queryKey: ["book", id, ...scopeSuffix(scope)],
+    queryKey: ["book", id, ...scopeSuffix(effectiveScope)],
     queryFn: ({ signal }) => fetchJson<BookWithDetails>(`${API_BASE}/books/${id}`, { signal }),
-    enabled: !Number.isNaN(id) && id > 0,
+    enabled: Number.isSafeInteger(id) && id > 0,
   });
 }

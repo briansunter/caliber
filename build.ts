@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
-import plugin from "bun-plugin-tailwind";
+import { frontendBuildConfig } from "./src/lib/frontend-assets";
 import { existsSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
@@ -43,14 +43,27 @@ const parseValue = (value: string): unknown => {
   if (/^\d+$/.test(value)) return parseInt(value, 10);
   if (/^\d*\.\d+$/.test(value)) return parseFloat(value);
 
-  if (value.includes(",")) return value.split(",").map((v) => v.trim());
-
   return value;
 };
 
 function parseArgs(): Partial<Bun.BuildConfig> {
   const config: Record<string, unknown> = {};
   const args = process.argv.slice(2);
+  const setOption = (rawKey: string, value: unknown) => {
+    const key = toCamelCase(rawKey);
+    if (!key.includes(".")) {
+      config[key] = value;
+      return;
+    }
+    const [parentKey, childKey] = key.split(".", 2);
+    if (!parentKey || !childKey) return;
+    const parent =
+      typeof config[parentKey] === "object" && config[parentKey] !== null
+        ? (config[parentKey] as Record<string, unknown>)
+        : {};
+    parent[childKey] = parentKey === "define" ? String(value) : value;
+    config[parentKey] = parent;
+  };
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -58,14 +71,12 @@ function parseArgs(): Partial<Bun.BuildConfig> {
     if (!arg.startsWith("--")) continue;
 
     if (arg.startsWith("--no-")) {
-      const key = toCamelCase(arg.slice(5));
-      config[key] = false;
+      setOption(arg.slice(5), false);
       continue;
     }
 
     if (!arg.includes("=") && (i === args.length - 1 || args[i + 1]?.startsWith("--"))) {
-      const key = toCamelCase(arg.slice(2));
-      config[key] = true;
+      setOption(arg.slice(2), true);
       continue;
     }
 
@@ -73,27 +84,26 @@ function parseArgs(): Partial<Bun.BuildConfig> {
     let value: string;
 
     if (arg.includes("=")) {
-      [key, value] = arg.slice(2).split("=", 2) as [string, string];
+      const separator = arg.indexOf("=");
+      key = arg.slice(2, separator);
+      value = arg.slice(separator + 1);
     } else {
       key = arg.slice(2);
       value = args[++i] ?? "";
     }
 
-    key = toCamelCase(key);
-
-    if (key.includes(".")) {
-      const [parentKey, childKey] = key.split(".", 2);
-      if (!parentKey || !childKey) continue;
-
-      const parent =
-        typeof config[parentKey] === "object" && config[parentKey] !== null
-          ? (config[parentKey] as Record<string, unknown>)
-          : {};
-      parent[childKey] = parseValue(value);
-      config[parentKey] = parent;
-    } else {
-      config[key] = parseValue(value);
-    }
+    setOption(
+      key,
+      ["external", "conditions"].includes(toCamelCase(key))
+        ? value
+            .split(",")
+            .map((item) => item.trim())
+            .filter(Boolean)
+        : key.startsWith("define.") ||
+            ["banner", "footer", "outdir", "publicPath"].includes(toCamelCase(key))
+          ? value
+          : parseValue(value),
+    );
   }
 
   return config as Partial<Bun.BuildConfig>;
@@ -115,43 +125,68 @@ const formatFileSize = (bytes: number): string => {
 console.log("\n🚀 Starting build process...\n");
 
 const cliConfig = parseArgs();
-const outdir =
-  typeof cliConfig.outdir === "string" ? cliConfig.outdir : path.join(process.cwd(), "dist");
-
-if (existsSync(outdir)) {
-  console.log(`🗑️ Cleaning previous build at ${outdir}`);
-  await rm(outdir, { recursive: true, force: true });
+const projectRoot = process.cwd();
+const outdir = path.resolve(typeof cliConfig.outdir === "string" ? cliConfig.outdir : "dist");
+const isWithin = (directory: string, candidate: string) => {
+  const relative = path.relative(directory, candidate);
+  return (
+    relative === "" ||
+    (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))
+  );
+};
+if (
+  isWithin(outdir, projectRoot) ||
+  isWithin(path.join(projectRoot, "src"), outdir) ||
+  isWithin(path.join(projectRoot, "node_modules"), outdir)
+) {
+  throw new Error(`Unsafe build output directory: ${outdir}`);
 }
+const outputMarker = ".caliber-build-output";
+if (
+  outdir !== path.join(projectRoot, "dist") &&
+  existsSync(outdir) &&
+  !existsSync(path.join(outdir, outputMarker)) &&
+  (await readdir(outdir)).length > 0
+) {
+  throw new Error(`Refusing to replace a non-build directory: ${outdir}`);
+}
+await mkdir(path.dirname(outdir), { recursive: true });
+const stagingDir = await mkdtemp(path.join(path.dirname(outdir), ".caliber-build-"));
 
 const start = performance.now();
 
-const entrypoints = [...new Bun.Glob("**.html").scanSync("src")]
-  .map((a) => path.resolve("src", a))
-  .filter((dir) => !dir.includes("node_modules"));
+const buildConfig = frontendBuildConfig({ sourcemap: "linked", ...cliConfig, outdir: stagingDir });
+const entrypoints = buildConfig.entrypoints;
 console.log(
   `📄 Found ${entrypoints.length} HTML ${entrypoints.length === 1 ? "file" : "files"} to process\n`,
 );
 
-const result = await Bun.build({
-  entrypoints,
-  outdir,
-  plugins: [plugin],
-  minify: true,
-  target: "browser",
-  sourcemap: "linked",
-  define: {
-    "process.env.NODE_ENV": JSON.stringify("production"),
-  },
-  ...cliConfig,
-});
+let result: Awaited<ReturnType<typeof Bun.build>>;
+let outputTable: { File: string; Type: string; Size: string }[] = [];
+try {
+  result = await Bun.build(buildConfig);
+  if (!result.success) {
+    for (const log of result.logs) console.error(log);
+    throw new Error("Build failed; previous output was preserved.");
+  }
+  // BuildArtifact reads its file lazily, so capture sizes before moving it.
+  outputTable = result.outputs.map((output) => ({
+    File: path.relative(process.cwd(), path.join(outdir, path.relative(stagingDir, output.path))),
+    Type: output.kind,
+    Size: formatFileSize(output.size),
+  }));
+  await writeFile(
+    path.join(stagingDir, outputMarker),
+    "Generated by Caliber. Safe to replace during a build.\n",
+  );
+  await rm(outdir, { recursive: true, force: true });
+  await rename(stagingDir, outdir);
+} catch (error) {
+  await rm(stagingDir, { recursive: true, force: true });
+  throw error;
+}
 
 const end = performance.now();
-
-const outputTable = result.outputs.map((output) => ({
-  File: path.relative(process.cwd(), output.path),
-  Type: output.kind,
-  Size: formatFileSize(output.size),
-}));
 
 console.table(outputTable);
 const buildTime = (end - start).toFixed(2);

@@ -2,7 +2,7 @@
 
 @layer base {
   body {
-    @apply min-w-[320px] min-h-screen relative m-0 overflow-x-hidden;
+    @apply min-w-[320px] min-h-screen relative m-0 overflow-x-clip;
     background-color: var(--bg);
     color: var(--text);
     font-family: var(--font-sans);

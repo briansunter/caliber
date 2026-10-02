@@ -4,6 +4,8 @@ import { lazy, Suspense, useCallback, useEffect } from "react";
 import { normalizeReaderLoadMode } from "@/components/reader-types";
 import { useBook } from "@/hooks/useBooksInfinite";
 import { loadReaderSettings } from "@/lib/reader-settings";
+import { getLibraryScopeId } from "@/lib/reading-progress";
+
 const EpubReader = lazy(() =>
   import("@/components/EpubReader").then((m) => ({ default: m.EpubReader })),
 );
@@ -20,13 +22,53 @@ export const Route = createFileRoute("/read/$id/$format")({
     mode: typeof search.mode === "string" ? search.mode : undefined,
   }),
   component: ReaderPage,
+  errorComponent: ReaderLoadError,
 });
+
+// React.lazy retains a rejected import promise. Resetting only the router's
+// error boundary would throw that same rejection again; a page reload fetches
+// the current HTML and creates a fresh reader import, including after updates.
+export function ReaderLoadError() {
+  return (
+    <main
+      id="main-content"
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-neutral-900 px-6"
+      tabIndex={-1}
+    >
+      <div className="w-full max-w-sm text-center">
+        <BookOpen
+          className="mx-auto h-10 w-10 text-white/50"
+          strokeWidth={1.5}
+          aria-hidden="true"
+        />
+        <h1 className="mt-5 text-xl font-semibold text-white">The reader could not be loaded</h1>
+        <p className="mt-3 text-sm leading-relaxed text-white/65" role="alert">
+          Check your connection, then reload the page to try again.
+        </p>
+        <button
+          type="button"
+          onClick={() => window.location.reload()}
+          className="mt-6 inline-flex min-h-11 items-center justify-center rounded-lg bg-white px-5 py-2.5 text-sm font-semibold text-neutral-900 hover:bg-white/90"
+        >
+          Reload reader
+        </button>
+        <a
+          href="/"
+          className="mt-4 flex min-h-11 items-center justify-center text-sm text-white/75 underline underline-offset-4 hover:text-white"
+        >
+          Back to library
+        </a>
+      </div>
+    </main>
+  );
+}
 
 function isSafeReturnTo(value: unknown): value is string {
   return (
     typeof value === "string" &&
     value.startsWith("/") &&
     !value.startsWith("//") &&
+    !value.includes("\\") &&
     !value.startsWith("/read")
   );
 }
@@ -34,7 +76,9 @@ function isSafeReturnTo(value: unknown): value is string {
 function ReaderPage() {
   const { id, format } = useParams({ from: "/read/$id/$format" });
   const { from, mode: modeParam } = Route.useSearch();
-  const bookId = /^\d+$/.test(id) ? Number(id) : Number.NaN;
+  const parsedId = Number(id);
+  const bookId =
+    /^\d+$/.test(id) && Number.isSafeInteger(parsedId) && parsedId > 0 ? parsedId : Number.NaN;
   const navigate = useNavigate();
   const fmt = format.toUpperCase();
   const { data: book, isLoading, error } = useBook(bookId);
@@ -105,6 +149,7 @@ function ReaderPage() {
     return (
       <Suspense fallback={readerFallback}>
         <EpubReader
+          key={`${getLibraryScopeId()}-${bookId}-${fmt}`}
           streamUrl={`/api/books/${bookId}/epub/`}
           fullUrl={bookUrl}
           bookId={bookId}
@@ -120,6 +165,7 @@ function ReaderPage() {
     return (
       <Suspense fallback={readerFallback}>
         <PdfReader
+          key={`${getLibraryScopeId()}-${bookId}-${fmt}`}
           url={bookUrl}
           bookId={bookId}
           onBack={goBack}
@@ -134,6 +180,7 @@ function ReaderPage() {
     return (
       <Suspense fallback={readerFallback}>
         <ComicReader
+          key={`${getLibraryScopeId()}-${bookId}-${fmt}`}
           bookId={bookId}
           onBack={goBack}
           title={bookTitle}

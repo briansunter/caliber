@@ -2,31 +2,31 @@
 @source "../src";
 
 /* ============================================================================
-   CALIBER - PAPER, INK, AND INDIGO
+   CALIBER - WARM PAPER AND FOREST INK
    A quiet library surface with enough contrast to keep cards, controls, and
    the reading list legible at a glance.
    ============================================================================ */
 
 @theme inline {
   /* Base colors - Clean slate with subtle warmth */
-  --color-bg: #fafafa;
+  --color-bg: #f8f7f3;
   --color-bg-elevated: #ffffff;
-  --color-bg-muted: #f5f5f5;
-  --color-bg-subtle: #f0f0f0;
+  --color-bg-muted: #f0eee7;
+  --color-bg-subtle: #e9e6dc;
   --color-surface: var(--color-bg-elevated);
   --color-surface-foreground: var(--color-text);
 
   /* Text colors - Strong contrast for readability */
-  --color-text: #171717;
-  --color-text-secondary: #525252;
-  --color-text-tertiary: #737373;
-  --color-text-muted: #a3a3a3;
+  --color-text: #242923;
+  --color-text-secondary: #565e53;
+  --color-text-tertiary: #73796d;
+  --color-text-muted: #858b7f;
 
   /* Accent - Subtle indigo */
-  --color-accent: #4f46e5;
-  --color-accent-hover: #4338ca;
-  --color-accent-subtle: rgba(79, 70, 229, 0.08);
-  --color-accent-border: rgba(79, 70, 229, 0.2);
+  --color-accent: #285a48;
+  --color-accent-hover: #1e4738;
+  --color-accent-subtle: rgba(40, 90, 72, 0.08);
+  --color-accent-border: rgba(40, 90, 72, 0.2);
 
   /* Semantic mappings */
   --color-background: var(--color-bg);
@@ -65,6 +65,7 @@
   --radius-lg: 14px;
 
   /* Typography - Clean sans-serif throughout */
+  --font-display: Georgia, 'Times New Roman', serif;
   --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 }
 
@@ -72,21 +73,21 @@
    CSS VARIABLES
    ============================================================================ */
 :root {
-  --bg: #fafafa;
+  --bg: #f8f7f3;
   --bg-elevated: #ffffff;
-  --bg-muted: #f5f5f5;
-  --bg-subtle: #f0f0f0;
+  --bg-muted: #f0eee7;
+  --bg-subtle: #e9e6dc;
   --surface: var(--bg-elevated);
 
-  --text: #171717;
-  --text-secondary: #525252;
-  --text-tertiary: #737373;
-  --text-muted: #a3a3a3;
+  --text: #242923;
+  --text-secondary: #565e53;
+  --text-tertiary: #73796d;
+  --text-muted: #858b7f;
 
-  --accent: #4f46e5;
-  --accent-hover: #4338ca;
-  --accent-subtle: rgba(79, 70, 229, 0.08);
-  --accent-border: rgba(79, 70, 229, 0.2);
+  --accent: #285a48;
+  --accent-hover: #1e4738;
+  --accent-subtle: rgba(40, 90, 72, 0.08);
+  --accent-border: rgba(40, 90, 72, 0.2);
 
   --border-subtle: rgba(0, 0, 0, 0.06);
   --border-default: rgba(0, 0, 0, 0.08);
@@ -451,7 +452,7 @@
 
   .stat-card:hover {
     border-color: var(--accent-border);
-    box-shadow: 0 2px 8px rgba(79, 70, 229, 0.06);
+    box-shadow: 0 2px 8px rgba(40, 90, 72, 0.06);
   }
 
   .stat-value {
@@ -514,5 +515,145 @@
   *, ::before, ::after {
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+/* Library workspace. Reader canvases retain their own dark controls. */
+@layer components {
+  .library-shell { min-height: 100vh; background: var(--bg); }
+  .library-sidebar {
+    position: fixed; inset: 0 auto 0 0; z-index: 20; width: 232px;
+    display: flex; flex-direction: column; padding: 34px 20px 20px;
+    border-right: 1px solid var(--border-default); background: #f1f0e9;
+    overflow-y: auto;
+  }
+  .library-brand { display: flex; align-items: center; gap: 11px; padding: 0 10px; color: var(--text); font-size: 28px; font-weight: 650; letter-spacing: -1.4px; text-decoration: none; }
+  .brand-mark { display: grid; place-items: center; width: 38px; height: 42px; border-radius: 10px; background: var(--accent); color: white; }
+  .brand-period { color: var(--accent); }
+  .sidebar-eyebrow { margin: 32px 12px 12px; font-size: 10px; text-transform: uppercase; letter-spacing: .16em; color: var(--text-tertiary); font-weight: 600; }
+  .sidebar-nav { display: flex; flex-direction: column; gap: 4px; }
+  .sidebar-link { display: flex; align-items: center; gap: 11px; width: 100%; min-height: 43px; padding: 10px 12px; border: 0; border-radius: 7px; color: var(--text-secondary); background: transparent; font-size: 12px; text-align: left; cursor: pointer; text-decoration: none; transition: background-color .15s, color .15s; }
+  .sidebar-link:hover { background: #e8e7df; color: var(--text); }
+  .sidebar-link.is-active { background: #e1e8df; color: var(--accent); font-weight: 600; }
+  .sidebar-link svg, .tag-dot { flex-shrink: 0; }
+  .nav-count { margin-left: auto; padding-left: 4px; color: var(--text-tertiary); font-size: 10px; font-variant-numeric: tabular-nums; }
+  .sidebar-section-heading { display: flex; justify-content: space-between; align-items: center; margin: 30px 12px 12px; color: var(--text-tertiary); font-size: 10px; text-transform: uppercase; font-weight: 600; letter-spacing: .12em; }
+  .tag-link { min-height: 37px; font-size: 11px; text-transform: capitalize; }
+  .tag-dot { width: 6px; height: 6px; border-radius: 50%; background: #b3b9aa; margin: 0 6px; }
+  .is-active .tag-dot { background: var(--accent); }
+  .sidebar-note { margin: auto 10px 24px; padding-top: 48px; color: var(--accent); }
+  .sidebar-note p { font-family: var(--font-display); font-size: 17px; line-height: 1.55; margin: 12px 0 16px; color: var(--text-secondary); }
+  .sidebar-note a { display: inline-flex; align-items: center; gap: 5px; color: var(--text-tertiary); font-size: 10px; text-decoration: none; }
+  .sidebar-note a:hover { color: var(--accent); }
+  .sidebar-library { display: flex; align-items: center; gap: 9px; border-top: 1px solid var(--border-default); padding: 18px 8px 0; }
+  .sidebar-library > div { min-width: 0; }
+  .sidebar-library p { margin: 0; font-size: 11px; font-weight: 600; }
+  .sidebar-library span:not(.connection-dot) { font-size: 9px; color: var(--text-tertiary); }
+  .connection-dot { display: inline-block; flex-shrink: 0; width: 6px; height: 6px; background: #588d67; border-radius: 50%; }
+  .library-workspace { margin-left: 232px; }
+  .library-topbar { display: flex; justify-content: space-between; align-items: center; min-height: 76px; padding: 16px 40px; border-bottom: 1px solid var(--border-default); }
+  .topbar-breadcrumb { display: flex; align-items: center; gap: 12px; font-size: 11px; color: var(--text-tertiary); }
+  .topbar-breadcrumb span:first-of-type { color: var(--text-secondary); }
+  .breadcrumb-divider { color: #bdc0b6; }
+  .topbar-actions { display: flex; align-items: center; gap: 20px; }
+  .library-status { display: flex; align-items: center; gap: 7px; color: var(--text-tertiary); font-size: 10px; }
+  .mobile-brand, .mobile-settings { display: none; }
+  .library-main { max-width: 1500px; margin: 0 auto; padding: 0 40px; }
+  .library-intro { display: flex; justify-content: space-between; align-items: center; gap: 32px; padding: 48px 0 42px; }
+  .eyebrow { margin: 0 0 12px; color: var(--accent); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .18em; }
+  .display-title { font-family: var(--font-display); font-weight: 400; letter-spacing: -.045em; font-size: clamp(32px, 3.2vw, 48px); line-height: 1.15; }
+  .display-title span { color: var(--accent); }
+  .intro-description { margin-top: 13px; color: var(--text-tertiary); font-size: 12px; }
+  .library-statistics { margin: 0; padding: 0; border: 0; display: flex; flex-shrink: 0; gap: 26px; }
+  .library-statistics > div { display: flex; flex-direction: column; gap: 6px; }
+  .library-statistics > div + div { border-left: 1px solid var(--border-strong); padding-left: 26px; }
+  .library-statistics strong { font-size: 23px; line-height: 1; font-weight: 500; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+  .library-statistics span { color: var(--text-tertiary); font-size: 10px; }
+  .catalogue-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; border-top: 1px solid var(--border-default); padding: 26px 0 20px; }
+  .catalogue-heading h2 { font-size: 19px; letter-spacing: -.025em; font-weight: 600; }
+  .catalogue-heading p { margin-top: 4px; font-size: 11px; color: var(--text-tertiary); }
+  .collection-label { display: flex; align-items: center; gap: 7px; color: var(--text-tertiary); font-size: 10px; }
+  .catalogue-toolbar { position: sticky; top: 0; z-index: 40; background: var(--bg); padding: 12px 0 18px; border-bottom: 1px solid var(--border-default); }
+  .catalogue-controls { display: flex; align-items: center; gap: 9px; }
+  .catalogue-search { flex: 1; min-width: 130px; }
+  .catalogue-search input { padding-inline: 44px; height: 44px; font-size: 12px; border-color: var(--border-strong); border-radius: 7px; background: var(--bg-elevated); }
+  .catalogue-filters { display: flex; gap: 7px; }
+  .catalogue-filters > div > button { min-height: 42px; font-size: 11px; }
+  .catalogue-view-controls { display: flex; align-items: center; gap: 8px; margin-left: 8px; }
+  .catalogue-sort { max-width: 156px; height: 42px; padding: 0 26px 0 10px; color: var(--text-secondary); background: var(--bg-elevated); border: 1px solid var(--border-strong); border-radius: 7px; font-size: 11px; cursor: pointer; }
+  .view-switch { display: flex; padding: 3px; gap: 2px; margin: 0; border: 1px solid var(--border-strong); border-radius: 7px; background: var(--bg-elevated); }
+  .view-switch button { display: grid; place-items: center; height: 34px; width: 34px; background: transparent; color: var(--text-tertiary); border: 0; border-radius: 4px; cursor: pointer; }
+  .view-switch button:hover { background: var(--bg-muted); }
+  .view-switch button[aria-pressed="true"] { background: var(--accent-subtle); color: var(--accent); }
+  .density-toggle { display: grid; place-items: center; width: 40px; height: 42px; border: 1px solid var(--border-strong); border-radius: 7px; background: var(--bg-elevated); color: var(--text-secondary); cursor: pointer; }
+  .density-toggle[aria-pressed="true"] { color: var(--accent); background: var(--accent-subtle); }
+  .selected-filter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0 12px; }
+  .catalogue-grid { padding-top: 28px; }
+  .catalogue-grid > div > div:last-child { margin-top: 12px; border-radius: 7px; background: transparent; }
+  .catalogue-table-header { position: sticky; z-index: 30; background: var(--bg-muted); }
+  .catalogue-table { background: var(--bg-elevated); border: 1px solid var(--border-default); border-top: 0; border-radius: 0 0 8px 8px; }
+  .library-footer { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 28px 0 30px; color: var(--text-tertiary); font-size: 10px; }
+  .library-footer > span:last-child { display: inline-flex; align-items: center; gap: 6px; }
+  .recently-read-section { margin-bottom: 28px; scroll-margin-top: 24px; }
+  .recently-read-section h2 { font-size: 17px; font-weight: 600; text-transform: none; letter-spacing: -.02em; }
+  .recent-reading-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+  .recent-reading-card { border: 1px solid var(--border-default); border-radius: 9px; background: var(--bg-elevated); }
+  .recent-reading-link { display: flex; gap: 14px; padding: 14px; border-radius: 9px; }
+  .recent-reading-cover { position: relative; width: 65px; height: 98px; flex-shrink: 0; border-radius: 4px; overflow: hidden; }
+  .recent-reading-info { display: flex; flex-direction: column; min-width: 0; flex: 1; padding: 2px 14px 2px 0; }
+  .recent-reading-title { font-size: 12px; font-weight: 600; line-height: 1.5; }
+  .recent-reading-author { margin-top: 4px; color: var(--text-tertiary); font-size: 10px; }
+  .recent-reading-progress { margin-top: auto; padding-top: 12px; color: var(--accent); font-size: 10px; }
+  .recent-reading-track { margin-top: 5px; height: 3px; background: var(--bg-muted); border-radius: 2px; overflow: hidden; }
+  .recent-reading-track > div { height: 100%; background: var(--accent); }
+  @media (max-width: 1199px) {
+    .library-topbar { padding-inline: 28px; }
+    .library-main { padding-inline: 28px; }
+    .library-statistics { gap: 16px; }
+    .library-statistics > div + div { padding-left: 16px; }
+    .library-intro { gap: 20px; }
+    .catalogue-controls { flex-wrap: wrap; }
+    .catalogue-view-controls { margin-left: auto; }
+    .catalogue-search { flex-basis: 50%; }
+    .recent-reading-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (max-width: 1023px) {
+    .library-sidebar { display: none; }
+    .library-workspace { margin-left: 0; }
+    .topbar-breadcrumb { display: none; }
+    .mobile-brand { display: flex; align-items: center; gap: 8px; font-size: 21px; font-weight: 650; color: var(--accent); text-decoration: none; letter-spacing: -.04em; }
+    .mobile-settings { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 6px; color: var(--text-secondary); }
+    .library-intro { padding-block: 36px; }
+  }
+  @media (max-width: 639px) {
+    .library-main { padding-inline: 20px; }
+    .library-topbar { min-height: 64px; padding: 12px 20px; }
+    .topbar-actions { gap: 8px; }
+    .library-status { display: none; }
+    .library-intro { align-items: flex-start; flex-direction: column; gap: 24px; padding-block: 32px; }
+    .eyebrow { font-size: 9px; margin-bottom: 10px; }
+    .display-title { font-size: 37px; }
+    .intro-description { font-size: 11px; }
+    .library-statistics { width: 100%; justify-content: flex-start; gap: 32px; }
+    .library-statistics > div + div { padding-left: 32px; }
+    .library-statistics strong { font-size: 22px; }
+    .catalogue-heading { padding-top: 22px; }
+    .collection-label { display: none; }
+    .catalogue-search { flex-basis: 100%; }
+    .catalogue-view-controls { flex-grow: 1; gap: 6px; margin-left: 0; }
+    .catalogue-view-controls .catalogue-sort { flex: 1; max-width: none; }
+    .catalogue-sort { width: 124px; font-size: 10px; padding-left: 7px; padding-right: 12px; }
+    .catalogue-filters { gap: 6px; }
+    .view-switch button { width: 30px; }
+    .density-toggle { width: 32px; }
+    .catalogue-grid { padding-top: 22px; }
+    .library-footer { align-items: flex-start; flex-direction: column; gap: 8px; }
+    .recent-reading-grid { grid-template-columns: minmax(0, 1fr); }
+  }
+  @media (max-width: 359px) {
+    .library-main, .library-topbar { padding-inline: 14px; }
+    .display-title { font-size: 33px; }
+    .catalogue-sort { width: 108px; }
+    .catalogue-controls { gap: 6px; }
   }
 }

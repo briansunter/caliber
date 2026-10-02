@@ -1,10 +1,27 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { BookTableInfinite, TableHeader, SortHeader } from "@/components/BookTableInfinite";
+import { useState, useCallback, useMemo, useEffect, useRef } from "react";
+import {
+  ArrowUpRight,
+  BookOpen,
+  Check,
+  Clock3,
+  FolderOpen,
+  LayoutGrid,
+  Library,
+  List,
+  Rows3,
+  Settings,
+  Tags,
+  X,
+} from "lucide-react";
+import { BookTableInfinite, TableHeader } from "@/components/BookTableInfinite";
 import { BookGridInfinite } from "@/components/BookGridInfinite";
 import { BookSearch } from "@/components/BookSearch";
 import { LibraryConfigPanel } from "@/components/LibraryConfigPanel";
-import { useState, useCallback, useMemo } from "react";
-import { BookOpen, Users, Layers, Library, LayoutGrid, List, Settings, X } from "lucide-react";
+import { UserMenu } from "@/components/UserMenu";
+import { TagFilter } from "@/components/TagFilter";
+import { FormatFilter } from "@/components/FormatFilter";
+import { RecentlyRead } from "@/components/RecentlyRead";
 import {
   useLibraryConfig,
   useLibraryStats,
@@ -12,170 +29,38 @@ import {
   useFormats,
   type SortConfig,
   type SortField,
+  type SortOrder,
 } from "@/hooks/useBooksInfinite";
-import { UserMenu } from "@/components/UserMenu";
-import { TagFilter } from "@/components/TagFilter";
-import { FormatFilter } from "@/components/FormatFilter";
-import { RecentlyRead } from "@/components/RecentlyRead";
+import { parseLibrarySearch, type LibrarySearch } from "@/lib/library-state";
+import { useReadingList } from "@/lib/reading-progress";
 
-type ViewMode = "list" | "grid";
 type Density = "comfortable" | "compact";
-
 const DENSITY_KEY = "caliber-density";
-
-interface CanonicalState {
-  view: ViewMode;
-  sort: SortConfig;
-  search: string;
-  tags: number[];
-  formats: string[];
-}
-
-const SORT_FIELDS: SortField[] = ["title", "author", "added", "rating"];
-
-function toSearchParams(state: CanonicalState): Record<string, unknown> {
-  const params: Record<string, unknown> = {};
-  if (state.search) params.q = state.search;
-  params.view = state.view;
-  params.sortBy = state.sort.field;
-  params.sortOrder = state.sort.order;
-  if (state.tags.length > 0) params.tag = state.tags.map(String);
-  if (state.formats.length > 0) params.format = state.formats;
-  return params;
-}
 
 function loadDensity(): Density {
   try {
-    const saved = sessionStorage.getItem(DENSITY_KEY);
-    if (saved === "compact" || saved === "comfortable") return saved;
-  } catch {}
-  return "comfortable";
-}
-
-function saveDensity(density: Density) {
-  try {
-    // sessionStorage holds density prefs only; q/sort/view/tags live in the URL.
-    sessionStorage.setItem(DENSITY_KEY, density);
-  } catch {}
+    return sessionStorage.getItem(DENSITY_KEY) === "compact" ? "compact" : "comfortable";
+  } catch {
+    return "comfortable";
+  }
 }
 
 export const Route = createFileRoute("/")({
-  // Canonical URL params for q/sort/view/tags so links are shareable.
-  validateSearch: (search: Record<string, unknown>) => {
-    const pick = (v: unknown): string | undefined =>
-      typeof v === "string" ? v : Array.isArray(v) && typeof v[0] === "string" ? v[0] : undefined;
-    const tags = search.tag;
-    const tagList = Array.isArray(tags) ? tags : tags === undefined ? [] : [tags];
-    const formats = search.format;
-    const formatList = Array.isArray(formats) ? formats : formats === undefined ? [] : [formats];
-    return {
-      q: pick(search.q) ?? "",
-      view: pick(search.view) === "grid" ? "grid" : "list",
-      sortBy: SORT_FIELDS.includes(pick(search.sortBy) as SortField)
-        ? (pick(search.sortBy) as SortField)
-        : "added",
-      sortOrder: pick(search.sortOrder) === "asc" ? "asc" : "desc",
-      tag: tagList.filter(
-        (t): t is string => typeof t === "string" && /^\d+$/.test(t) && Number(t) > 0,
-      ),
-      format: formatList.filter(
-        (f): f is string => typeof f === "string" && /^[A-Za-z0-9]{1,10}$/.test(f),
-      ),
-    };
-  },
+  validateSearch: parseLibrarySearch,
   component: IndexComponent,
 });
 
 function IndexComponent() {
   const search = Route.useSearch();
   const navigate = useNavigate();
-  const defaultView: ViewMode =
-    typeof window !== "undefined" && window.innerWidth < 768 ? "grid" : "list";
-  // Stable numeric tag ids for query keys.
-  const tagNumbers = useMemo(() => {
-    const list: unknown[] = Array.isArray(search.tag) ? search.tag : [];
-    return list.filter((t): t is string => typeof t === "string" && /^\d+$/.test(t)).map(Number);
-  }, [search.tag]);
-  // Normalized uppercase format names for query keys (?format= is case-insensitive).
-  const formatNames = useMemo(() => {
-    const list: unknown[] = Array.isArray(search.format) ? search.format : [];
-    const seen = new Set<string>();
-    for (const f of list) {
-      if (typeof f === "string" && /^[A-Za-z0-9]{1,10}$/.test(f)) {
-        seen.add(f.toUpperCase());
-      }
-    }
-    return Array.from(seen);
-  }, [search.format]);
-  const uiState: CanonicalState = useMemo(
-    () => ({
-      view: search.view === "grid" ? "grid" : search.view === "list" ? "list" : defaultView,
-      search: typeof search.q === "string" ? search.q : "",
-      sort: {
-        field: SORT_FIELDS.includes(search.sortBy as SortField)
-          ? (search.sortBy as SortField)
-          : "added",
-        order: search.sortOrder === "asc" ? "asc" : "desc",
-      },
-      tags: tagNumbers,
-      formats: formatNames,
-    }),
-    [search.q, search.view, search.sortBy, search.sortOrder, tagNumbers, formatNames, defaultView],
-  );
   const [density, setDensity] = useState<Density>(loadDensity);
-  const searchQuery = uiState.search;
-  const viewMode = uiState.view;
-  const sortConfig = uiState.sort;
-  // Selected tag/format chips render inside the sticky toolbar, growing its height.
-  // The sticky table header offset must grow with it or the rows slide under.
-  const hasSelectedTags = uiState.tags.length > 0;
-  const hasSelectedFormats = uiState.formats.length > 0;
-  const hasSelectedFilters = hasSelectedTags || hasSelectedFormats;
-
-  const updateCanonical = useCallback(
-    (patch: Partial<CanonicalState>) => {
-      const next: CanonicalState = {
-        view: uiState.view,
-        search: uiState.search,
-        sort: uiState.sort,
-        tags: uiState.tags,
-        formats: uiState.formats,
-        ...patch,
-      };
-      void navigate({ to: "/", search: toSearchParams(next) as never, replace: true });
-    },
-    [navigate, uiState],
+  const toolbarRef = useRef<HTMLDivElement>(null);
+  const [toolbarHeight, setToolbarHeight] = useState(120);
+  const tagIds = useMemo(() => search.tag.map(Number), [search.tag]);
+  const sortConfig = useMemo<SortConfig>(
+    () => ({ field: search.sortBy, order: search.sortOrder }),
+    [search.sortBy, search.sortOrder],
   );
-
-  const setSearchQuery = useCallback(
-    (q: string) => updateCanonical({ search: q }),
-    [updateCanonical],
-  );
-  const setViewMode = useCallback((v: ViewMode) => updateCanonical({ view: v }), [updateCanonical]);
-  const setSortConfig = useCallback(
-    (config: SortConfig) => updateCanonical({ sort: config }),
-    [updateCanonical],
-  );
-  const setTags = useCallback((tags: number[]) => updateCanonical({ tags }), [updateCanonical]);
-  const setFormats = useCallback(
-    (formats: string[]) => updateCanonical({ formats }),
-    [updateCanonical],
-  );
-  const clearSearchAndFilters = useCallback(
-    () => updateCanonical({ search: "", tags: [], formats: [] }),
-    [updateCanonical],
-  );
-  const toggleDensity = useCallback(() => {
-    setDensity((prev) => {
-      const next: Density = prev === "compact" ? "comfortable" : "compact";
-      saveDensity(next);
-      return next;
-    });
-  }, []);
-
-  // Anchor-based scroll restore lives in BookGridInfinite/BookTableInfinite
-  // (they fetch the required window, then scroll to the stored book anchor).
-
   const {
     data: libraryConfig,
     error: libraryConfigError,
@@ -183,202 +68,375 @@ function IndexComponent() {
     refetch: refetchLibraryConfig,
   } = useLibraryConfig();
   const libraryReady = libraryConfig?.ready === true;
-  const { data: stats, isLoading: statsLoading } = useLibraryStats(libraryReady);
-  const { data: tags, isLoading: tagsLoading } = useTags(libraryReady);
-  const { data: formats, isLoading: formatsLoading } = useFormats(libraryReady);
+  const {
+    data: stats,
+    isLoading: statsLoading,
+    isError: statsError,
+  } = useLibraryStats(libraryReady);
+  const {
+    data: tags,
+    isLoading: tagsLoading,
+    error: tagsError,
+    refetch: refetchTags,
+  } = useTags(libraryReady);
+  const {
+    data: formats,
+    isLoading: formatsLoading,
+    error: formatsError,
+    refetch: refetchFormats,
+  } = useFormats(libraryReady);
+  const { data: readingList } = useReadingList();
+  const recentCount = readingList?.items.length ?? 0;
+  const hasFilters = Boolean(search.q || search.tag.length || search.format.length);
 
-  if (libraryConfigLoading || !libraryConfig) {
+  // Functional URL updates preserve other controls changed in the same render.
+  const updateSearch = useCallback(
+    (patch: Partial<LibrarySearch>) => {
+      void navigate({
+        to: "/",
+        search: (previous) => parseLibrarySearch({ ...previous, ...patch }),
+        replace: true,
+      });
+    },
+    [navigate],
+  );
+  const setSearchQuery = useCallback((q: string) => updateSearch({ q }), [updateSearch]);
+  const setTags = useCallback(
+    (ids: number[]) => updateSearch({ tag: ids.map(String) }),
+    [updateSearch],
+  );
+  const setFormats = useCallback((format: string[]) => updateSearch({ format }), [updateSearch]);
+  const setSortConfig = useCallback(
+    (config: SortConfig) => updateSearch({ sortBy: config.field, sortOrder: config.order }),
+    [updateSearch],
+  );
+  const clearSearchAndFilters = useCallback(
+    () => updateSearch({ q: "", tag: [], format: [] }),
+    [updateSearch],
+  );
+  const toggleDensity = useCallback(() => {
+    setDensity((previous) => {
+      const next = previous === "comfortable" ? "compact" : "comfortable";
+      try {
+        sessionStorage.setItem(DENSITY_KEY, next);
+      } catch {}
+      return next;
+    });
+  }, []);
+
+  // Filter chips wrap on small screens. Measure actual chrome instead of guessing
+  // a fixed offset, keeping the list header visible for every filter combination.
+  useEffect(() => {
+    if (!libraryReady) return;
+    const element = toolbarRef.current;
+    if (!element) return;
+    const measure = () => setToolbarHeight(Math.ceil(element.getBoundingClientRect().height));
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [libraryReady]);
+
+  if (libraryConfigLoading || !libraryConfig || !libraryReady) {
     return (
       <LibraryOnboarding
-        isLoading
+        isLoading={libraryConfigLoading}
         error={libraryConfigError instanceof Error ? libraryConfigError.message : null}
-        onRetry={() => refetchLibraryConfig()}
+        onRetry={() => void refetchLibraryConfig()}
       />
     );
   }
 
-  if (!libraryReady) {
-    return (
-      <LibraryOnboarding
-        error={libraryConfigError instanceof Error ? libraryConfigError.message : null}
-        onRetry={() => refetchLibraryConfig()}
-      />
-    );
-  }
+  const count = (value: number | undefined) =>
+    statsLoading || statsError ? "—" : (value ?? 0).toLocaleString();
+  const libraryName =
+    libraryConfig.libraryPath.split(/[\\/]/).filter(Boolean).pop() || "Calibre Library";
 
   return (
-    <div
-      className={`min-h-screen bg-parchment paper-texture${density === "compact" ? " density-compact" : ""}`}
-    >
-      {/* Main Content - Unified Scroll */}
-      <main id="main-content" className="max-w-7xl mx-auto px-3 sm:px-6 pt-4 sm:pt-8 pb-10">
-        {/* Welcome Section */}
-        <div className="mb-3 sm:mb-6">
-          <div className="flex items-center gap-2 sm:gap-3 mb-1 sm:mb-2">
-            <div className="w-7 h-7 sm:w-9 sm:h-9 bg-ink rounded-lg flex items-center justify-center">
-              <Library className="h-3.5 w-3.5 sm:h-4 sm:w-4 text-white" strokeWidth={1.5} />
-            </div>
-            <h1 className="text-lg sm:text-2xl font-semibold text-ink tracking-tight">Caliber</h1>
-            <div className="ml-auto flex items-center gap-1.5">
-              <UserMenu />
-              <Link
-                to="/settings"
-                className="p-2 rounded-lg text-ink-muted hover:text-ink hover:bg-ink/5 transition-colors"
-                aria-label="Settings"
-                title="Settings"
-              >
-                <Settings className="h-5 w-5" strokeWidth={1.5} />
-              </Link>
-            </div>
-          </div>
-          <p className="hidden sm:block text-sm text-ink-tertiary max-w-2xl">
-            Browse, search, and download from your personal digital library.
-            {stats?.totalBooks && ` ${stats.totalBooks.toLocaleString()} volumes.`}
-          </p>
-        </div>
-
-        {/* Stats */}
-        <div className="grid grid-cols-3 gap-1.5 sm:gap-4 mb-3 sm:mb-6">
-          <StatCard
-            icon={<BookOpen className="h-4 w-4 text-accent" strokeWidth={2} />}
-            value={statsLoading ? "—" : stats?.totalBooks.toLocaleString() || "0"}
-            label="Books"
-          />
-          <StatCard
-            icon={<Users className="h-4 w-4 text-accent" strokeWidth={2} />}
-            value={statsLoading ? "—" : stats?.totalAuthors.toLocaleString() || "0"}
-            label="Authors"
-          />
-          <StatCard
-            icon={<Layers className="h-4 w-4 text-accent" strokeWidth={2} />}
-            value={statsLoading ? "—" : stats?.totalSeries.toLocaleString() || "0"}
-            label="Series"
-          />
-        </div>
-
-        {/* Recently read shelf (only shown when signed in with history) */}
-        <RecentlyRead />
-
-        {/* Search Bar + View Toggle - Sticky at top */}
-        <div className="sticky top-0 z-40 -mx-1 sm:-mx-2 px-1 sm:px-2 py-1.5 sm:py-2.5 bg-parchment border-y border-ink-strong shadow-sm">
-          <div className="flex items-center gap-2 sm:gap-3">
-            <div className="flex-1 min-w-0">
-              <BookSearch onSearch={setSearchQuery} initialValue={searchQuery} />
-            </div>
-            <TagFilter
-              tags={tags}
-              selectedIds={uiState.tags}
-              onChange={setTags}
-              isLoading={tagsLoading}
-            />
-            <FormatFilter
-              formats={formats}
-              selected={uiState.formats}
-              onChange={setFormats}
-              isLoading={formatsLoading}
-            />
-            <fieldset
-              aria-label="View mode"
-              className="m-0 p-0 flex-shrink-0 flex items-center border border-ink rounded-lg overflow-hidden"
-            >
-              <button
-                type="button"
-                onClick={() => setViewMode("list")}
-                aria-pressed={viewMode === "list"}
-                aria-label="List view"
-                className={`p-2 transition-colors ${viewMode === "list" ? "bg-ink text-white" : "bg-surface text-ink-muted hover:text-ink"}`}
-                title="List view"
-              >
-                <List className="h-4 w-4" strokeWidth={1.5} />
-              </button>
-              <button
-                type="button"
-                onClick={() => setViewMode("grid")}
-                aria-pressed={viewMode === "grid"}
-                aria-label="Grid view"
-                className={`p-2 transition-colors ${viewMode === "grid" ? "bg-ink text-white" : "bg-surface text-ink-muted hover:text-ink"}`}
-                title="Grid view"
-              >
-                <LayoutGrid className="h-4 w-4" strokeWidth={1.5} />
-              </button>
-            </fieldset>
-            <button
-              type="button"
-              onClick={toggleDensity}
-              aria-pressed={density === "compact"}
-              aria-label="Compact density"
-              title="Toggle compact density"
-              className={`p-2 transition-colors flex-shrink-0 border border-ink rounded-lg ${density === "compact" ? "bg-ink text-white" : "bg-surface text-ink-muted hover:text-ink"}`}
-            >
-              <span aria-hidden="true" className="block text-xs font-semibold leading-none px-0.5">
-                ≡
-              </span>
-            </button>
-          </div>
-          {viewMode === "grid" && (
-            <GridSortBar sortConfig={sortConfig} onSortChange={setSortConfig} />
+    <div className={`library-shell${density === "compact" ? " density-compact" : ""}`}>
+      <aside className="library-sidebar" aria-label="Library navigation">
+        <a href="#main-content" className="library-brand" aria-label="Caliber home">
+          <span className="brand-mark">
+            <Library size={22} strokeWidth={1.6} />
+          </span>
+          <span>
+            caliber<span className="brand-period">.</span>
+          </span>
+        </a>
+        <p className="sidebar-eyebrow">Your reading space</p>
+        <nav className="sidebar-nav" aria-label="Browse">
+          <button
+            type="button"
+            onClick={clearSearchAndFilters}
+            aria-current={!hasFilters ? "page" : undefined}
+            className={`sidebar-link${!hasFilters ? " is-active" : ""}`}
+          >
+            <Library size={18} strokeWidth={1.6} />
+            <span>All books</span>
+            <span className="nav-count">{count(stats?.totalBooks)}</span>
+          </button>
+          {recentCount > 0 && (
+            <a href="#recently-read" className="sidebar-link">
+              <Clock3 size={18} strokeWidth={1.6} />
+              <span>Recently read</span>
+              <span className="nav-count">{recentCount}</span>
+            </a>
           )}
-          <SelectedTagChips
-            selectedIds={uiState.tags}
-            tags={tags}
-            onRemove={(id) => setTags(uiState.tags.filter((t) => t !== id))}
-            onClear={() => setTags([])}
-          />
-          <SelectedFormatChips
-            selected={uiState.formats}
-            onRemove={(name) => setFormats(uiState.formats.filter((f) => f !== name))}
-            onClear={() => setFormats([])}
-          />
-        </div>
-
-        {viewMode === "list" && (
+          <Link to="/settings" className="sidebar-link">
+            <Settings size={18} strokeWidth={1.6} />
+            <span>Settings</span>
+          </Link>
+        </nav>
+        {(tags?.length ?? 0) > 0 && (
           <>
-            {/* Table Header - Sticky below search; offset grows when the
-                selected-tag chips add a row to the sticky toolbar. */}
-            <div
-              className={
-                hasSelectedFilters
-                  ? "sticky top-[80px] sm:top-[90px] z-30 bg-parchment-dark"
-                  : "sticky top-[46px] sm:top-[56px] z-30 bg-parchment-dark"
-              }
-            >
-              <TableHeader sortConfig={sortConfig} onSortChange={setSortConfig} />
+            <div className="sidebar-section-heading">
+              <span>Browse by tag</span>
+              <Tags size={14} strokeWidth={1.6} />
             </div>
-
-            {/* Table Section */}
-            <div className="bg-surface border-x border-b border-ink rounded-b-lg shadow-sm">
-              <BookTableInfinite
-                searchQuery={searchQuery}
-                sortConfig={sortConfig}
-                tagIds={uiState.tags}
-                formats={uiState.formats}
-                onClearFilters={clearSearchAndFilters}
-              />
-            </div>
+            <nav className="sidebar-nav" aria-label="Popular tags">
+              {tags?.slice(0, 6).map((tag) => (
+                <button
+                  key={tag.id}
+                  type="button"
+                  aria-pressed={tagIds.includes(tag.id)}
+                  onClick={() =>
+                    setTags(
+                      tagIds.includes(tag.id)
+                        ? tagIds.filter((id) => id !== tag.id)
+                        : [...tagIds, tag.id],
+                    )
+                  }
+                  className={`sidebar-link tag-link${tagIds.includes(tag.id) ? " is-active" : ""}`}
+                >
+                  <span className="tag-dot" />
+                  <span className="truncate">{tag.name}</span>
+                  <span className="nav-count">{tag.bookCount.toLocaleString()}</span>
+                </button>
+              ))}
+            </nav>
           </>
         )}
-
-        {viewMode === "grid" && (
-          <div className="bg-surface border-x border-b border-ink rounded-b-lg shadow-sm pt-4">
-            <BookGridInfinite
-              searchQuery={searchQuery}
-              sortConfig={sortConfig}
-              tagIds={uiState.tags}
-              formats={uiState.formats}
-              onClearFilters={clearSearchAndFilters}
-            />
-          </div>
-        )}
-      </main>
-
-      {/* Footer */}
-      <footer className="border-t border-ink bg-surface">
-        <div className="max-w-7xl mx-auto px-6 py-8">
-          <div className="ornament text-ink-muted">
-            <span className="text-sm">Caliber Library Manager</span>
+        <div className="sidebar-note">
+          <BookOpen size={24} strokeWidth={1.3} />
+          <p>
+            A little less scrolling.
+            <br />A little more reading.
+          </p>
+          <a href="/opds">
+            Connect your reading app <ArrowUpRight size={14} />
+          </a>
+        </div>
+        <div className="sidebar-library">
+          <span className="connection-dot" />
+          <div>
+            <p className="truncate" title={libraryConfig.libraryPath}>
+              {libraryName}
+            </p>
+            <span>Your library, on your device</span>
           </div>
         </div>
-      </footer>
+      </aside>
+
+      <div className="library-workspace">
+        <header className="library-topbar">
+          <a href="#main-content" className="mobile-brand">
+            <Library size={20} />
+            <span>caliber.</span>
+          </a>
+          <div className="topbar-breadcrumb">
+            <FolderOpen size={16} strokeWidth={1.6} />
+            <span>My library</span>
+            <span className="breadcrumb-divider">/</span>
+            <span>Overview</span>
+          </div>
+          <div className="topbar-actions">
+            <span className="library-status">
+              <span className="connection-dot" />
+              Library connected
+            </span>
+            <UserMenu />
+            <Link to="/settings" className="mobile-settings" aria-label="Settings">
+              <Settings size={19} />
+            </Link>
+          </div>
+        </header>
+
+        <main id="main-content" tabIndex={-1} className="library-main">
+          <section className="library-intro" aria-labelledby="library-title">
+            <div>
+              <p className="eyebrow">A home for your books</p>
+              <h1 id="library-title" className="display-title">
+                Your next chapter<span>.</span>
+              </h1>
+              <p className="intro-description">Old favorites, new discoveries. All within reach.</p>
+            </div>
+            <fieldset className="library-statistics" aria-label="Library statistics">
+              <div>
+                <strong>{count(stats?.totalBooks)}</strong>
+                <span>Books</span>
+              </div>
+              <div>
+                <strong>{count(stats?.totalAuthors)}</strong>
+                <span>Authors</span>
+              </div>
+              <div>
+                <strong>{count(stats?.totalSeries)}</strong>
+                <span>Series</span>
+              </div>
+            </fieldset>
+          </section>
+
+          <RecentlyRead libraryId={libraryConfig.libraryId} />
+
+          <section className="catalogue-section" aria-label="Book catalogue">
+            <div className="catalogue-heading">
+              <div>
+                <h2>{hasFilters ? "Find your next read" : "The bookshelf"}</h2>
+                <p>
+                  {hasFilters
+                    ? "Explore the books that match your search and filters."
+                    : "A good book is always waiting."}
+                </p>
+              </div>
+              <span className="collection-label">
+                <BookOpen size={15} strokeWidth={1.6} />
+                Personal collection
+              </span>
+            </div>
+            <div ref={toolbarRef} className="catalogue-toolbar">
+              <div className="catalogue-controls">
+                <div className="catalogue-search">
+                  <BookSearch onSearch={setSearchQuery} initialValue={search.q} />
+                </div>
+                <div className="catalogue-filters">
+                  <TagFilter
+                    tags={tags}
+                    selectedIds={tagIds}
+                    onChange={setTags}
+                    isLoading={tagsLoading}
+                    error={tagsError}
+                    onRetry={() => void refetchTags()}
+                  />
+                  <FormatFilter
+                    formats={formats}
+                    selected={search.format}
+                    onChange={setFormats}
+                    isLoading={formatsLoading}
+                    error={formatsError}
+                    onRetry={() => void refetchFormats()}
+                  />
+                </div>
+                <div className="catalogue-view-controls">
+                  <label className="sr-only" htmlFor="library-sort">
+                    Sort books
+                  </label>
+                  <select
+                    id="library-sort"
+                    className="catalogue-sort"
+                    value={`${sortConfig.field}:${sortConfig.order}`}
+                    onChange={(event) => {
+                      const [field, order] = event.target.value.split(":");
+                      setSortConfig({ field: field as SortField, order: order as SortOrder });
+                    }}
+                  >
+                    <option value="added:desc">Recently added</option>
+                    <option value="added:asc">Oldest added</option>
+                    <option value="title:asc">Title: A–Z</option>
+                    <option value="title:desc">Title: Z–A</option>
+                    <option value="author:asc">Author: A–Z</option>
+                    <option value="author:desc">Author: Z–A</option>
+                    <option value="rating:desc">Highest rated</option>
+                    <option value="rating:asc">Lowest rated</option>
+                  </select>
+                  <fieldset aria-label="View mode" className="view-switch">
+                    <button
+                      type="button"
+                      onClick={() => updateSearch({ view: "grid" })}
+                      aria-pressed={search.view === "grid"}
+                      aria-label="Grid view"
+                      title="Grid view"
+                    >
+                      <LayoutGrid size={17} strokeWidth={1.7} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => updateSearch({ view: "list" })}
+                      aria-pressed={search.view === "list"}
+                      aria-label="List view"
+                      title="List view"
+                    >
+                      <List size={18} strokeWidth={1.7} />
+                    </button>
+                  </fieldset>
+                  {search.view === "list" && (
+                    <button
+                      type="button"
+                      onClick={toggleDensity}
+                      aria-pressed={density === "compact"}
+                      aria-label="Compact density"
+                      title="Compact density"
+                      className="density-toggle"
+                    >
+                      <Rows3 size={17} />
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div className="selected-filter-row">
+                <SelectedTagChips
+                  selectedIds={tagIds}
+                  tags={tags}
+                  onRemove={(id) => setTags(tagIds.filter((tag) => tag !== id))}
+                  onClear={() => setTags([])}
+                />
+                <SelectedFormatChips
+                  selected={search.format}
+                  onRemove={(format) => setFormats(search.format.filter((name) => name !== format))}
+                  onClear={() => setFormats([])}
+                />
+              </div>
+            </div>
+            {search.view === "list" ? (
+              <>
+                <div className="catalogue-table-header" style={{ top: toolbarHeight }}>
+                  <TableHeader sortConfig={sortConfig} onSortChange={setSortConfig} />
+                </div>
+                <div className="catalogue-table">
+                  <BookTableInfinite
+                    searchQuery={search.q}
+                    sortConfig={sortConfig}
+                    tagIds={tagIds}
+                    formats={search.format}
+                    onClearFilters={clearSearchAndFilters}
+                    stickyOffset={toolbarHeight + 64}
+                    rowHeight={density === "compact" ? 56 : 72}
+                    libraryId={libraryConfig.libraryId}
+                  />
+                </div>
+              </>
+            ) : (
+              <div className="catalogue-grid">
+                <BookGridInfinite
+                  searchQuery={search.q}
+                  sortConfig={sortConfig}
+                  tagIds={tagIds}
+                  formats={search.format}
+                  onClearFilters={clearSearchAndFilters}
+                  stickyOffset={toolbarHeight + 16}
+                  libraryId={libraryConfig.libraryId}
+                />
+              </div>
+            )}
+          </section>
+          <footer className="library-footer">
+            <span>Made for the love of reading.</span>
+            <span>
+              <Check size={13} />
+              Your Calibre library stays untouched
+            </span>
+          </footer>
+        </main>
+      </div>
     </div>
   );
 }
@@ -394,7 +452,11 @@ function LibraryOnboarding({
 }) {
   return (
     <div className="min-h-screen bg-parchment paper-texture">
-      <main id="main-content" className="max-w-xl mx-auto px-4 sm:px-6 pt-12 sm:pt-24 pb-16">
+      <main
+        id="main-content"
+        tabIndex={-1}
+        className="max-w-xl mx-auto px-4 sm:px-6 pt-12 sm:pt-24 pb-16"
+      >
         <div className="flex items-center gap-3 mb-8">
           <div className="w-10 h-10 bg-ink rounded-xl flex items-center justify-center">
             <Library className="h-5 w-5 text-white" strokeWidth={1.5} />
@@ -436,45 +498,6 @@ function LibraryOnboarding({
           in your user Documents folder on Windows.
         </p>
       </main>
-    </div>
-  );
-}
-
-interface StatCardProps {
-  icon: React.ReactNode;
-  value: string | number;
-  label: string;
-}
-
-function GridSortBar({
-  sortConfig,
-  onSortChange,
-}: {
-  sortConfig: SortConfig;
-  onSortChange: (config: SortConfig) => void;
-}) {
-  const handleSort = useCallback(
-    (field: SortField) => {
-      if (sortConfig.field === field) {
-        onSortChange({ field, order: sortConfig.order === "asc" ? "desc" : "asc" });
-      } else {
-        onSortChange({ field, order: "asc" });
-      }
-    },
-    [sortConfig, onSortChange],
-  );
-
-  return (
-    <div className="flex items-center gap-3 mt-2 pt-2 border-t border-ink">
-      <span className="text-xs text-ink-secondary uppercase tracking-wider font-semibold shrink-0">
-        Sort
-      </span>
-      <div className="flex items-center gap-2 overflow-x-auto">
-        <SortHeader label="Title" field="title" currentSort={sortConfig} onSort={handleSort} />
-        <SortHeader label="Author" field="author" currentSort={sortConfig} onSort={handleSort} />
-        <SortHeader label="Rating" field="rating" currentSort={sortConfig} onSort={handleSort} />
-        <SortHeader label="Added" field="added" currentSort={sortConfig} onSort={handleSort} />
-      </div>
     </div>
   );
 }
@@ -578,19 +601,5 @@ function SelectedFormatChips({
         </button>
       </li>
     </ul>
-  );
-}
-
-function StatCard({ icon, value, label }: StatCardProps) {
-  return (
-    <div className="stat-card flex items-center gap-2 sm:gap-3">
-      <div className="hidden sm:flex w-10 h-10 bg-parchment-dark rounded-lg items-center justify-center border border-ink">
-        {icon}
-      </div>
-      <div>
-        <p className="stat-value">{value}</p>
-        <p className="stat-label">{label}</p>
-      </div>
-    </div>
   );
 }

@@ -10,7 +10,7 @@ export interface ReaderSettings {
   prefetchBehind: number;
   // Cap the device-pixel-ratio used when rasterizing PDF pages. Retina screens
   // report 2-3; capping at 2 roughly halves the canvas backing-store size on a
-  // 3x phone. 0 means "use the device ratio uncapped".
+  // 3x phone. Values are bounded to 1–3 to keep memory usage predictable.
   maxRenderScale: number;
   // Default loading strategy for readers that support full-file mode.
   defaultLoadMode: ReaderLoadMode;
@@ -84,7 +84,7 @@ export function loadReaderSettings(): ReaderSettings {
 }
 
 export function saveReaderSettings(next: Partial<ReaderSettings>): ReaderSettings {
-  const normalized = normalizeReaderSettings(next);
+  const normalized = normalizeReaderSettings({ ...loadReaderSettings(), ...next });
   snapshot = normalized;
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
@@ -102,12 +102,20 @@ export function resetReaderSettings(): ReaderSettings {
 // --- React binding ---------------------------------------------------------
 
 function subscribe(callback: () => void): () => void {
+  if (typeof window === "undefined") return () => {};
   const onChange = () => {
-    snapshot = null; // invalidate so the next getSnapshot re-reads storage
+    // saveReaderSettings already updates the snapshot. Re-reading storage here
+    // loses the new value when writes are unavailable (e.g. private browsing).
     callback();
   };
   const onStorage = (e: StorageEvent) => {
-    if (e.key === STORAGE_KEY) onChange();
+    if (e.key !== STORAGE_KEY && e.key !== null) return;
+    // Ignore sessionStorage events. Access to localStorage can itself throw.
+    try {
+      if (e.storageArea && e.storageArea !== window.localStorage) return;
+    } catch {}
+    snapshot = null;
+    onChange();
   };
   window.addEventListener(CHANGE_EVENT, onChange);
   window.addEventListener("storage", onStorage);

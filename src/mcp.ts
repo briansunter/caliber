@@ -4,6 +4,7 @@
  */
 
 import { handleJSONRPC, type MCPRequest } from "./lib/mcp-core";
+import { readRequestJson, RequestBodyTooLargeError } from "./lib/request-body";
 
 export async function handleMCPRequest(req: Request): Promise<Response> {
   if (req.method === "OPTIONS") {
@@ -24,7 +25,7 @@ export async function handleMCPRequest(req: Request): Promise<Response> {
   }
 
   try {
-    const body = await req.json();
+    const body = await readRequestJson(req);
 
     if (Array.isArray(body)) {
       const responses = await Promise.all(
@@ -43,6 +44,12 @@ export async function handleMCPRequest(req: Request): Promise<Response> {
     }
     return Response.json(response);
   } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      return Response.json(
+        { jsonrpc: "2.0", error: { code: -32600, message: error.message } },
+        { status: 413 },
+      );
+    }
     const message = error instanceof Error ? error.message : String(error);
 
     return Response.json(

@@ -1,5 +1,12 @@
-import { useEffect, useRef, type CSSProperties, type ReactNode, type RefObject } from "react";
 import { ArrowLeft, Download, Wifi } from "lucide-react";
+import {
+  type CSSProperties,
+  type ReactNode,
+  type RefObject,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import type { ReaderLoadMode } from "./reader-types";
 
 // Shared reader chrome for the EPUB / PDF / comic readers (batch 4, item 8).
@@ -37,29 +44,48 @@ export function useDialogFocusTrap(
   onCloseRef.current = onClose;
   // biome-ignore lint/correctness/useExhaustiveDependencies: dialogRef/returnFocusTo are stable refs read at activation; onClose rides onCloseRef.
   useEffect(() => {
-    if (!active) return;
+    if (!active || typeof document === "undefined") return;
     const opener =
       returnFocusTo?.current ??
       (document.activeElement instanceof HTMLElement ? document.activeElement : null);
     const dialog = dialogRef.current;
-    dialog?.querySelector<HTMLElement>("button")?.focus();
+    if (!dialog) return;
+    const previousTabIndex = dialog.getAttribute("tabindex");
+    if (previousTabIndex === null) dialog.tabIndex = -1;
+    const focusables = () =>
+      Array.from(
+        dialog.querySelectorAll<HTMLElement>("button, [href], input, select, textarea, [tabindex]"),
+      ).filter(
+        (el) =>
+          el.tabIndex >= 0 &&
+          !el.matches(":disabled") &&
+          !el.closest('[hidden], [inert], [aria-hidden="true"]') &&
+          el.getClientRects().length > 0 &&
+          getComputedStyle(el).visibility === "visible",
+      );
+    const initialItems = focusables();
+    (initialItems.find((el) => el.tagName === "BUTTON") ?? initialItems[0] ?? dialog).focus();
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        e.preventDefault();
         e.stopPropagation();
         onCloseRef.current();
         return;
       }
-      if (e.key !== "Tab" || !dialogRef.current) return;
-      const dialogEl = dialogRef.current;
-      const focusables = dialogEl.querySelectorAll<HTMLElement>(
-        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-      );
-      const items = Array.from(focusables).filter((el) => !el.hasAttribute("disabled"));
-      if (items.length === 0) return;
+      if (e.key !== "Tab") return;
+      const items = focusables();
+      if (items.length === 0) {
+        e.preventDefault();
+        dialog.focus();
+        return;
+      }
       const first = items[0];
       const last = items[items.length - 1];
       if (!first || !last) return;
-      if (e.shiftKey && document.activeElement === first) {
+      if (!items.includes(document.activeElement as HTMLElement)) {
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+      } else if (e.shiftKey && document.activeElement === first) {
         e.preventDefault();
         last.focus();
       } else if (!e.shiftKey && document.activeElement === last) {
@@ -70,7 +96,14 @@ export function useDialogFocusTrap(
     document.addEventListener("keydown", onKeyDown, true);
     return () => {
       document.removeEventListener("keydown", onKeyDown, true);
-      opener?.focus?.();
+      if (previousTabIndex === null) dialog.removeAttribute("tabindex");
+      if (
+        opener?.isConnected &&
+        !opener.closest('[hidden], [inert], [aria-hidden="true"]') &&
+        opener.getClientRects().length > 0
+      ) {
+        opener.focus();
+      }
     };
     // dialogRef/returnFocusTo are stable refs; onClose rides onCloseRef.
   }, [active]);
@@ -279,6 +312,8 @@ export function ReaderHeader({
   const chrome = tone.kind === "themed" ? tone.chrome : null;
   return (
     <div
+      aria-hidden={!showUI}
+      inert={!showUI}
       className={
         overlay
           ? "fixed top-0 left-0 right-0 z-[108] transition-transform duration-200"
@@ -287,11 +322,13 @@ export function ReaderHeader({
       style={
         dark
           ? {
+              display: !showUI && !overlay ? "none" : undefined,
               transform: showUI ? "translateY(0)" : "translateY(-100%)",
               background: "rgba(0,0,0,0.85)",
               backdropFilter: "blur(12px)",
               borderBottom: "1px solid rgba(255,255,255,0.1)",
               paddingTop: "env(safe-area-inset-top, 0px)",
+              pointerEvents: showUI ? "auto" : "none",
             }
           : {
               transform: showUI ? "translateY(0)" : "translateY(-100%)",
@@ -347,6 +384,8 @@ export function ReaderFooterShell({
   const chrome = tone.kind === "themed" ? tone.chrome : null;
   return (
     <div
+      aria-hidden={!showUI}
+      inert={!showUI}
       className={
         overlay
           ? "fixed bottom-0 left-0 right-0 z-[108] transition-transform duration-200"
@@ -355,11 +394,13 @@ export function ReaderFooterShell({
       style={
         dark
           ? {
+              display: !showUI && !overlay ? "none" : undefined,
               transform: showUI ? "translateY(0)" : "translateY(100%)",
               background: "rgba(0,0,0,0.85)",
               backdropFilter: "blur(12px)",
               borderTop: "1px solid rgba(255,255,255,0.1)",
               paddingBottom: "env(safe-area-inset-bottom, 0px)",
+              pointerEvents: showUI ? "auto" : "none",
             }
           : {
               transform: showUI ? "translateY(0)" : "translateY(100%)",
@@ -414,6 +455,13 @@ export function ReaderLoadModeToggle({
 
 // Shared numeric page input (batch 4, item 11): numeric keyboard on touch
 // devices plus a programmatic description of the total page count.
+export function parseReaderPageInput(text: string, max: number): number | null {
+  if (!text.trim()) return null;
+  const page = Number(text);
+  const lastPage = Number.isSafeInteger(max) && max > 0 ? max : 1;
+  return Number.isSafeInteger(page) && page >= 1 && page <= lastPage ? page : null;
+}
+
 export function ReaderPageInput({
   value,
   max,
@@ -425,21 +473,35 @@ export function ReaderPageInput({
   onCommit: (page: number) => void;
   describedById: string;
 }) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const cancelCommit = useRef(false);
   return (
     <input
       type="number"
       min={1}
       max={max || 1}
-      value={value}
+      value={draft ?? String(value)}
       inputMode="numeric"
-      onChange={(e) => {
-        const val = parseInt(e.target.value, 10);
-        if (Number.isInteger(val) && val >= 1 && val <= (max || 1)) {
-          onCommit(val);
-        }
+      onFocus={() => {
+        cancelCommit.current = false;
+      }}
+      onChange={(e) => setDraft(e.currentTarget.value)}
+      onBlur={(e) => {
+        const page = parseReaderPageInput(e.currentTarget.value, max);
+        setDraft(null);
+        if (!cancelCommit.current && page !== null && page !== value) onCommit(page);
+        cancelCommit.current = false;
       }}
       onKeyDown={(e) => {
-        if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+        if (e.key === "Enter") {
+          e.preventDefault();
+          e.currentTarget.blur();
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          cancelCommit.current = true;
+          setDraft(null);
+          e.currentTarget.blur();
+        }
         e.stopPropagation();
       }}
       onClick={(e) => e.stopPropagation()}

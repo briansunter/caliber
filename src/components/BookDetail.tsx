@@ -14,9 +14,10 @@ import {
   User,
 } from "lucide-react";
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { CoverFallback } from "@/components/CoverFallback";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { useBook } from "@/hooks/useBooksInfinite";
+import { useBook, useLibraryConfig } from "@/hooks/useBooksInfinite";
 import { cn, stripHtmlTags } from "@/lib/utils";
 
 interface BookDetailProps {
@@ -28,17 +29,19 @@ const RATING_STAR_KEYS = ["star-1", "star-2", "star-3", "star-4", "star-5"] as c
 // Single theme-token action style shared by the Read and Download buttons.
 // Uses parchment/ink tokens only (no hardcoded hex) so both actions match.
 const BOOK_ACTION_BUTTON_CLASS =
-  "bg-ink text-white border-ink hover:bg-ink-secondary shadow-sm transition-colors duration-150 rounded text-xs uppercase tracking-wider font-semibold cursor-pointer";
+  "bg-accent text-white border-accent hover:bg-accent-hover shadow-sm transition-colors duration-150 rounded-lg text-xs font-semibold cursor-pointer min-h-10";
 
 // Elegant book cover with leather-bound shadow and spine effect
 const BookCover = memo(function BookCover({
   bookId,
   title,
   hasCover,
+  libraryId,
 }: {
   bookId: number;
   title: string;
   hasCover: boolean;
+  libraryId?: string;
 }) {
   const [isLoaded, setIsLoaded] = useState(false);
   const [hasError, setHasError] = useState(false);
@@ -55,8 +58,7 @@ const BookCover = memo(function BookCover({
   if (!hasCover || hasError) {
     return (
       <div className="relative w-full aspect-[2/3] bg-parchment-dark rounded-lg flex flex-col items-center justify-center text-ink-muted border border-ink">
-        <BookText className="h-12 w-12 mb-2 text-ink-muted/40" strokeWidth={1.5} />
-        <span className="text-xs text-ink-muted/60">No Cover</span>
+        <CoverFallback title={title} />
       </div>
     );
   }
@@ -72,7 +74,7 @@ const BookCover = memo(function BookCover({
             </div>
           )}
           <img
-            src={`/api/books/${bookId}/cover`}
+            src={`/api/books/${bookId}/cover${libraryId ? `?library=${encodeURIComponent(libraryId)}` : ""}`}
             alt={title}
             width={480}
             height={720}
@@ -167,7 +169,12 @@ const FormatButton = memo(function FormatButton({
   bookId: number;
 }) {
   return (
-    <Button asChild size="sm" className={BOOK_ACTION_BUTTON_CLASS}>
+    <Button
+      asChild
+      variant="outline"
+      size="sm"
+      className="min-h-10 rounded-lg border-ink bg-surface text-ink-secondary hover:bg-parchment-dark text-xs"
+    >
       <a
         href={`/api/books/${bookId}/download/${format}`}
         download
@@ -205,7 +212,9 @@ const OrnamentalDivider = memo(function OrnamentalDivider() {
 });
 
 export function BookDetail({ bookId }: BookDetailProps) {
-  const { data: book, isLoading, error } = useBook(bookId);
+  const { data: book, isLoading, error, refetch } = useBook(bookId);
+  const { data: libraryConfig } = useLibraryConfig();
+  const libraryId = libraryConfig?.libraryId;
 
   const formattedPubDate = useMemo(() => {
     if (!book?.pubdate) return null;
@@ -229,7 +238,9 @@ export function BookDetail({ bookId }: BookDetailProps) {
 
   const formattedTimestamp = useMemo(() => {
     if (!book?.timestamp) return "";
-    return new Date(book.timestamp).toLocaleDateString(undefined, {
+    const date = new Date(book.timestamp);
+    if (Number.isNaN(date.getTime())) return "";
+    return date.toLocaleDateString(undefined, {
       year: "numeric",
       month: "short",
       day: "numeric",
@@ -263,12 +274,15 @@ export function BookDetail({ bookId }: BookDetailProps) {
   if (error) {
     return (
       <div className="min-h-[60vh] flex items-center justify-center">
-        <div className="text-center">
+        <div className="text-center" role="alert">
           <div className="inline-flex items-center justify-center w-14 h-14 rounded bg-error/10 mb-3">
             <FileText className="h-6 w-6 text-error" strokeWidth={1.5} />
           </div>
           <h3 className="text-base font-semibold text-error mb-1">Error loading book</h3>
           <p className="text-sm text-ink-muted">{error.message}</p>
+          <Button type="button" variant="outline" className="mt-4" onClick={() => void refetch()}>
+            Try again
+          </Button>
         </div>
       </div>
     );
@@ -299,7 +313,13 @@ export function BookDetail({ bookId }: BookDetailProps) {
           <div className="lg:sticky lg:top-24 space-y-6">
             {/* Book Cover */}
             <div className="max-w-[250px] mx-auto lg:max-w-none">
-              <BookCover bookId={bookId} title={book.title} hasCover={book.has_cover} />
+              <BookCover
+                key={`${bookId}:${libraryId ?? ""}`}
+                bookId={bookId}
+                title={book.title}
+                hasCover={book.has_cover}
+                libraryId={libraryId}
+              />
             </div>
 
             {/* Read button */}
@@ -314,19 +334,18 @@ export function BookDetail({ bookId }: BookDetailProps) {
                   {book.formats
                     .filter((f) => f === "EPUB" || f === "PDF" || f === "CBZ" || f === "CBR")
                     .map((format) => (
-                      <Link
-                        key={format}
-                        to="/read/$id/$format"
-                        params={{ id: String(bookId), format: format.toLowerCase() }}
-                        search={{ from: `/book/${bookId}`, mode: undefined }}
-                      >
-                        <Button size="sm" className={BOOK_ACTION_BUTTON_CLASS}>
+                      <Button asChild key={format} size="sm" className={BOOK_ACTION_BUTTON_CLASS}>
+                        <Link
+                          to="/read/$id/$format"
+                          params={{ id: String(bookId), format: format.toLowerCase() }}
+                          search={{ from: `/book/${bookId}`, mode: undefined }}
+                        >
                           <span className="flex items-center gap-2">
                             <BookOpen className="h-3.5 w-3.5" strokeWidth={2} />
                             <span>Read {format}</span>
                           </span>
-                        </Button>
-                      </Link>
+                        </Link>
+                      </Button>
                     ))}
                 </div>
               </div>
@@ -348,7 +367,7 @@ export function BookDetail({ bookId }: BookDetailProps) {
 
             {/* Quick metadata */}
             <div className="pt-4 border-t border-ink space-y-1">
-              {book.rating && book.rating > 0 && (
+              {book.rating != null && book.rating > 0 && (
                 <MetadataRow
                   icon={Star}
                   label="Rating"
@@ -382,7 +401,7 @@ export function BookDetail({ bookId }: BookDetailProps) {
             )}
 
             {/* Title */}
-            <h1 className="text-2xl sm:text-3xl lg:text-4xl font-semibold tracking-tight leading-tight text-ink">
+            <h1 className="font-display text-3xl sm:text-4xl lg:text-5xl font-normal tracking-tight leading-tight text-ink break-words">
               {book.title}
             </h1>
 

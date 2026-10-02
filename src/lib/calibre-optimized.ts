@@ -16,7 +16,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { CONFIG_DIR_PATH, DB_NAME, DB_REFRESH_INTERVAL_MS, LIBRARY_PATH } from "./config";
-import { type SourceSignature, getDatabaseSignature, isSameSignature } from "./file-signature";
+import {
+  type SourceSignature,
+  getDatabaseSignature,
+  isSameSignature,
+  isSourceSignature,
+} from "./file-signature";
 
 let DB_PATH = join(LIBRARY_PATH, DB_NAME);
 
@@ -126,7 +131,7 @@ export function getSnapshotStatus(): {
       snapshot.sourcePath !== resolve(DB_PATH) ||
       !isSameSignature(snapshot.signature, sig);
   } catch {
-    // If stat fails we cannot prove freshness; report not-stale.
+    stale = true;
   }
   return {
     generation: activeGeneration.id,
@@ -166,7 +171,7 @@ function readSnapshotMetadata(): SnapshotMetadata | null {
     const raw: unknown = JSON.parse(readFileSync(DB_SOURCE_SIGNATURE_PATH, "utf8"));
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
     const record = raw as Record<string, unknown>;
-    if (typeof record.sourcePath !== "string" || typeof record.signature !== "object") {
+    if (typeof record.sourcePath !== "string" || !isSourceSignature(record.signature)) {
       return null;
     }
     return {
@@ -196,6 +201,10 @@ function copyDbToWritable(): void {
   // {db path, revision, fts version} at WRITABLE_DB_PATH.
   const nextId = generationCounter + 1;
   const temporaryPath = `${WRITABLE_DB_PATH}.gen-${nextId}.tmp-${process.pid}`;
+  // Record freshness before serialization. A concurrent Calibre write during
+  // indexing must trigger another refresh, rather than stamp older bytes with
+  // the newer source signature after the build completes.
+  const signature = getDatabaseSignature(DB_PATH);
   // SQLite can have committed changes in the source WAL. serialize() asks
   // SQLite for a consistent snapshot instead of copying only metadata.db.
   const sourceDb = new Database(DB_PATH, { readonly: true });
@@ -305,7 +314,6 @@ function copyDbToWritable(): void {
     throw error;
   }
 
-  const signature = getDatabaseSignature(DB_PATH);
   writeFileSync(
     DB_SOURCE_SIGNATURE_PATH,
     `${JSON.stringify({ sourcePath: resolve(DB_PATH), signature })}\n`,

@@ -1,7 +1,17 @@
-import { useCallback, useEffect, useRef, useState } from "react";
 import JSZip from "jszip";
 import { ChevronLeft, ChevronRight, Wifi, ZoomIn, ZoomOut } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { waitForReaderImage } from "@/lib/reader-image";
+import { useReaderSettings } from "@/lib/reader-settings";
 import {
+  fetchBookProgress,
+  flushBookProgress,
+  progressPosKey,
+  readScopedPos,
+  saveBookProgress,
+} from "@/lib/reading-progress";
+import {
+  darkTone,
   ReaderErrorPanel,
   ReaderFooterShell,
   ReaderHeader,
@@ -9,17 +19,14 @@ import {
   ReaderLoadModeToggle,
   ReaderPageInput,
   ReaderRoot,
-  darkTone,
 } from "./ReaderChrome";
-import { useReaderSettings } from "@/lib/reader-settings";
 import {
-  flushBookProgress,
-  fetchBookProgress,
-  saveBookProgress,
-  progressPosKey,
-  readScopedPos,
-} from "@/lib/reading-progress";
-import { getNextReaderLoadMode, prefetchOrder, type ReaderLoadMode } from "./reader-types";
+  getNextReaderLoadMode,
+  getReaderKeyboardAction,
+  normalizeReaderPage,
+  prefetchOrder,
+  type ReaderLoadMode,
+} from "./reader-types";
 
 interface ComicPage {
   index: number;
@@ -108,8 +115,10 @@ export function ComicReader({
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [pages, setPages] = useState<ComicPage[]>([]);
-  const [currentPage, setCurrentPage] = useState(
-    () => readScopedPos<{ page: number }>(bookId, `comic-${format}`, { page: 1 }).page as number,
+  const [currentPage, setCurrentPage] = useState(() =>
+    normalizeReaderPage(
+      readScopedPos<{ page: number }>(bookId, `comic-${format}`, { page: 1 }).page,
+    ),
   );
   const [showUI, setShowUI] = useState(true);
   const [zoom, setZoom] = useState(1);
@@ -117,6 +126,7 @@ export function ComicReader({
   const [pagePending, setPagePending] = useState(false);
   const [pageError, setPageError] = useState(false);
   const [retryToken, setRetryToken] = useState(0);
+  const [reloadToken, setReloadToken] = useState(0);
 
   const totalPages = pages.length;
   const page = pages[currentPage - 1];
@@ -155,6 +165,7 @@ export function ComicReader({
     setLoadMode(supportsFullFile ? initialLoadMode : "stream");
   }, [initialLoadMode, supportsFullFile]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies(reloadToken): retries reload the same archive or manifest.
   useEffect(() => {
     let cancelled = false;
     const abort = new AbortController();
@@ -164,6 +175,7 @@ export function ComicReader({
       setLoadError(null);
       setPages([]);
       setDisplayed(null);
+      setPagePending(false);
       setPageError(false);
       clearObjectUrls();
       clearPreloadedImages();
@@ -174,8 +186,14 @@ export function ComicReader({
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           const manifest = (await response.json()) as ComicManifest;
           if (cancelled) return;
-          setPages(manifest.pages);
-          setCurrentPage((p) => Math.min(Math.max(p, 1), manifest.pageCount || 1));
+          if (!Array.isArray(manifest?.pages) || manifest.pages.length === 0) {
+            throw new Error("The comic contains no pages");
+          }
+          if (manifest.pages.some((entry) => typeof entry?.href !== "string" || !entry.href)) {
+            throw new Error("The comic page list is invalid");
+          }
+          setPages(manifest.pages.map((entry, offset) => ({ ...entry, index: offset + 1 })));
+          setCurrentPage((p) => normalizeReaderPage(p, manifest.pages.length));
         } else {
           // F06: CBR has no full-file JSZip path — capability-gated, never
           // attempt a full-file fetch for CBR.
@@ -188,51 +206,29 @@ export function ComicReader({
           const entries = Object.values(zip.files)
             .filter((entry) => !entry.dir && IMAGE_EXTENSIONS.has(extension(entry.name)))
             .sort((a, b) => sortPageNames(a.name, b.name));
+          if (entries.length === 0) throw new Error("The comic contains no supported images");
 
           const fullPages: ComicPage[] = [];
-          const objectUrls: string[] = [];
-          let abortedInLoop = false;
-          try {
-            for (const [offset, entry] of entries.entries()) {
-              if (cancelled || abort.signal.aborted) {
-                abortedInLoop = true;
-                break;
-              }
-              const blob = await entry.async("blob");
-              if (cancelled || abort.signal.aborted) {
-                abortedInLoop = true;
-                break;
-              }
-              // F19: retain the blob for windowed pagination; only the visible
-              // window keeps live object URLs (see windowing effect below).
-              fullBlobsRef.current.set(offset + 1, blob);
-              const href = URL.createObjectURL(blob);
-              objectUrls.push(href);
-              fullPages.push({
-                index: offset + 1,
-                href,
-                type: imageType(entry.name),
-                name: entry.name.split("/").pop() || `Page ${offset + 1}`,
-              });
-            }
-          } catch (loopError) {
-            abortedInLoop = cancelled || abort.signal.aborted;
-            if (!abortedInLoop) throw loopError;
-          }
-          if (abortedInLoop || cancelled || abort.signal.aborted) {
-            // F06: never leak object URLs on cancellation/failure.
-            for (const href of objectUrls) URL.revokeObjectURL(href);
-            return;
+          const blobs = new Map<number, Blob>();
+          for (const [offset, entry] of entries.entries()) {
+            if (cancelled || abort.signal.aborted) return;
+            const blob = await entry.async("blob");
+            if (cancelled || abort.signal.aborted) return;
+            // Commit only a complete archive. The windowing effect creates
+            // URLs on demand; extraction failures have nothing to revoke.
+            blobs.set(offset + 1, blob);
+            fullPages.push({
+              index: offset + 1,
+              href: "",
+              type: imageType(entry.name),
+              name: entry.name.split("/").pop() || `Page ${offset + 1}`,
+            });
           }
 
-          if (cancelled) {
-            for (const href of objectUrls) URL.revokeObjectURL(href);
-            return;
-          }
-
-          objectUrlsRef.current = objectUrls;
+          if (cancelled) return;
+          fullBlobsRef.current = blobs;
           setPages(fullPages);
-          setCurrentPage((p) => Math.min(Math.max(p, 1), fullPages.length || 1));
+          setCurrentPage((p) => normalizeReaderPage(p, fullPages.length));
         }
 
         if (!cancelled) setIsLoading(false);
@@ -262,6 +258,7 @@ export function ComicReader({
     loadMode,
     format,
     supportsFullFile,
+    reloadToken,
     clearObjectUrls,
     clearPreloadedImages,
   ]);
@@ -280,8 +277,11 @@ export function ComicReader({
   useEffect(() => {
     if (loadMode !== "full" || pages.length === 0) return;
     if (fullBlobsRef.current.size === 0) return;
-    const lo = Math.max(1, currentPage - FULL_BLOB_WINDOW);
-    const hi = Math.min(pages.length, currentPage + FULL_BLOB_WINDOW);
+    const lo = Math.max(1, currentPage - Math.max(FULL_BLOB_WINDOW, settings.prefetchBehind));
+    const hi = Math.min(
+      pages.length,
+      currentPage + Math.max(FULL_BLOB_WINDOW, settings.prefetchAhead),
+    );
     let changed = false;
     const next = pages.map((p) => {
       const inWindow = p.index >= lo && p.index <= hi;
@@ -304,7 +304,7 @@ export function ComicReader({
       return p;
     });
     if (changed) setPages(next);
-  }, [loadMode, currentPage, pages]);
+  }, [loadMode, currentPage, pages, settings.prefetchAhead, settings.prefetchBehind]);
 
   useEffect(() => {
     if (isLoading || pages.length === 0) return;
@@ -327,7 +327,7 @@ export function ComicReader({
       for (const pageNumber of warmOrder) {
         if (cancelled) return;
         const candidate = pages[pageNumber - 1];
-        if (!candidate) continue;
+        if (!candidate?.href) continue;
 
         keep.add(candidate.href);
         let image = preloadedImagesRef.current.get(candidate.href);
@@ -337,10 +337,12 @@ export function ComicReader({
           image.src = candidate.href;
           preloadedImagesRef.current.set(candidate.href, image);
         }
-        await image
-          .decode?.()
-          .then(() => decodedHrefsRef.current.add(candidate.href))
+        await waitForReaderImage(image)
+          .then(() => {
+            if (!cancelled) decodedHrefsRef.current.add(candidate.href);
+          })
           .catch(() => {
+            if (cancelled) return;
             preloadedImagesRef.current.delete(candidate.href);
             decodedHrefsRef.current.delete(candidate.href);
           });
@@ -430,6 +432,7 @@ export function ComicReader({
     if (totalPages === 0) return;
     if (serverTarget !== undefined) return;
     let cancelled = false;
+    const initialPage = currentPageRef.current;
 
     void (async () => {
       let timerId: ReturnType<typeof setTimeout> | null = null;
@@ -441,6 +444,10 @@ export function ComicReader({
       ]);
       if (timerId) clearTimeout(timerId);
       if (cancelled) return;
+      if (currentPageRef.current !== initialPage) {
+        setServerTarget(null);
+        return;
+      }
       if (!record?.location) {
         setServerTarget(null);
         return;
@@ -449,8 +456,8 @@ export function ComicReader({
         setServerTarget(null);
         return;
       }
-      const restored = Number.parseInt(record.location, 10);
-      if (Number.isFinite(restored) && restored >= 1 && restored <= totalPages) {
+      const restored = Number(record.location);
+      if (Number.isSafeInteger(restored) && restored >= 1 && restored <= totalPages) {
         setServerTarget(restored);
         if (restored !== currentPageRef.current) {
           setCurrentPage(restored);
@@ -475,9 +482,14 @@ export function ComicReader({
     if (!displayed) return;
     if (serverTarget === undefined) return;
     if (restoreState === "ready") return;
-    if (serverTarget !== null && displayed.index !== serverTarget) return;
+    if (
+      serverTarget !== null &&
+      displayed.index !== serverTarget &&
+      displayed.index !== currentPage
+    )
+      return;
     setRestoreState("ready");
-  }, [displayed, serverTarget, restoreState]);
+  }, [displayed, serverTarget, restoreState, currentPage]);
 
   // Double-buffer page turns: if the target page is already decoded (warm
   // buffer), swap instantly with no flash. Otherwise hold the old page only
@@ -485,7 +497,7 @@ export function ComicReader({
   // and swap the real image in when it finishes decoding.
   // biome-ignore lint/correctness/useExhaustiveDependencies(retryToken): retryToken re-triggers the decode after a failed page load
   useEffect(() => {
-    if (isLoading || !page) return;
+    if (isLoading || !page?.href) return;
     if (displayed?.href === page.href) return;
 
     setPageError(false);
@@ -513,29 +525,19 @@ export function ComicReader({
       preloadedImagesRef.current.set(page.href, image);
     }
 
-    const ready: Promise<void> =
-      typeof image.decode === "function"
-        ? image.decode()
-        : image.complete
-          ? Promise.resolve()
-          : new Promise((resolve, reject) => {
-              image.addEventListener("load", () => resolve(), { once: true });
-              image.addEventListener("error", () => reject(new Error("load failed")), {
-                once: true,
-              });
-            });
-
-    ready
+    waitForReaderImage(image)
       .then(() => {
-        decodedHrefsRef.current.add(page.href);
         if (cancelled) return;
+        clearTimeout(placeholderTimer);
+        decodedHrefsRef.current.add(page.href);
         setDisplayed(page);
         setPagePending(false);
       })
       .catch(() => {
+        if (cancelled) return;
+        clearTimeout(placeholderTimer);
         preloadedImagesRef.current.delete(page.href);
         decodedHrefsRef.current.delete(page.href);
-        if (cancelled) return;
         setPageError(true);
         setPagePending(false);
       });
@@ -549,13 +551,22 @@ export function ComicReader({
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
-      if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
-      if (e.key === "ArrowLeft" || e.key === "ArrowUp") goPrev();
-      else if (e.key === "ArrowRight" || e.key === "ArrowDown" || e.key === " ") goNext();
-      else if (e.key === "Escape") onBack();
+      if (
+        target?.isContentEditable ||
+        target?.closest("button, a, input, textarea, select") ||
+        e.defaultPrevented
+      )
+        return;
+      const action = getReaderKeyboardAction(e);
+      if (!action || action === "immersive") return;
+      e.preventDefault();
+      if (e.repeat) return;
+      if (action === "previous") goPrev();
+      else if (action === "next") goNext();
+      else if (action === "back") onBack();
     };
-    document.addEventListener("keyup", handleKey);
-    return () => document.removeEventListener("keyup", handleKey);
+    document.addEventListener("keydown", handleKey);
+    return () => document.removeEventListener("keydown", handleKey);
   }, [goPrev, goNext, onBack]);
 
   const onTouchStart = useCallback((e: React.TouchEvent) => {
@@ -628,10 +639,8 @@ export function ComicReader({
         <ReaderErrorPanel
           kindLabel="comic"
           detail={loadError}
-          // "Try streaming" is a no-op state set when already streaming
-          // (e.g. CBR, which has no full-file path), so hide the retry
-          // button there instead of showing a dead control.
-          onRetry={loadMode === "stream" ? undefined : () => setLoadMode("stream")}
+          onRetry={() => setReloadToken((token) => token + 1)}
+          retryLabel="Retry"
           onBack={onBack}
           downloadHref={`/api/books/${bookId}/download/${format}`}
           bgClassName="bg-neutral-950"
@@ -736,6 +745,12 @@ export function ComicReader({
             onTouchStart={onTouchStart}
             onTouchEnd={onTouchEnd}
             onClick={onClick}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                if (!event.repeat) toggleUI();
+              }
+            }}
           />
         )}
       </section>

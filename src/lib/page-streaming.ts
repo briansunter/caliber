@@ -1,6 +1,17 @@
 import JSZip from "jszip";
+import { JobSemaphore } from "./job-semaphore";
+import { ByteLruCache } from "./byte-lru-cache";
+import { type CachedPage, type PageCacheMeta, isPageCacheMeta } from "./page-cache-meta";
 import { createExtractorFromData, type FileHeader } from "node-unrar-js/esm";
-import { type Dirent, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
+import {
+  type Dirent,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { basename, extname, join } from "node:path";
 import { CONFIG_DIR_PATH, LIBRARY_PATH } from "./config";
 import { getBookFormatPath, getLibraryPath, getSnapshotRevision } from "./calibre-optimized";
@@ -25,26 +36,6 @@ const COMMAND_TIMEOUT_MS = 30_000;
 const CBR_MANIFEST_VERSION = 2;
 
 // Global job semaphore: max 3 concurrent PDF renders, max 2 archive extracts.
-class JobSemaphore {
-  private running = 0;
-  private readonly queue: Array<() => void> = [];
-
-  constructor(private readonly max: number) {}
-
-  async run<T>(task: () => Promise<T>): Promise<T> {
-    if (this.running >= this.max) {
-      await new Promise<void>((resolve) => this.queue.push(resolve));
-    }
-    this.running += 1;
-    try {
-      return await task();
-    } finally {
-      this.running -= 1;
-      const next = this.queue.shift();
-      if (next) next();
-    }
-  }
-}
 
 export const pdfRenderSemaphore = new JobSemaphore(3);
 export const archiveExtractSemaphore = new JobSemaphore(2);
@@ -66,7 +57,12 @@ export function acquirePageLease(path: string): () => void {
   };
 }
 
-export function pageSingleFlightKey(bookId: number, op: string, page: string, library?: string): string {
+export function pageSingleFlightKey(
+  bookId: number,
+  op: string,
+  page: string,
+  library?: string,
+): string {
   let resolved = library;
   let rev = 0;
   if (resolved === undefined) {
@@ -78,7 +74,9 @@ export function pageSingleFlightKey(bookId: number, op: string, page: string, li
   }
   try {
     rev = getSnapshotRevision();
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
   return `${resolved}|${bookId}|${rev}|${op}|${page}`;
 }
 
@@ -86,11 +84,27 @@ export function pageSingleFlightKey(bookId: number, op: string, page: string, li
 export function assertPixelCountGuard(data: Uint8Array, fileName: string): void {
   if (extname(fileName).toLowerCase() !== ".png" || data.byteLength < 33) return;
   if (
-    data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47 &&
-    data[12] === 0x49 && data[13] === 0x48 && data[14] === 0x44 && data[15] === 0x52
+    data[0] === 0x89 &&
+    data[1] === 0x50 &&
+    data[2] === 0x4e &&
+    data[3] === 0x47 &&
+    data[12] === 0x49 &&
+    data[13] === 0x48 &&
+    data[14] === 0x44 &&
+    data[15] === 0x52
   ) {
-    const w = (((data[16] ?? 0) * 2 ** 24 + (data[17] ?? 0) * 2 ** 16 + (data[18] ?? 0) * 2 ** 8 + (data[19] ?? 0)) >>> 0);
-    const h = (((data[20] ?? 0) * 2 ** 24 + (data[21] ?? 0) * 2 ** 16 + (data[22] ?? 0) * 2 ** 8 + (data[23] ?? 0)) >>> 0);
+    const w =
+      ((data[16] ?? 0) * 2 ** 24 +
+        (data[17] ?? 0) * 2 ** 16 +
+        (data[18] ?? 0) * 2 ** 8 +
+        (data[19] ?? 0)) >>>
+      0;
+    const h =
+      ((data[20] ?? 0) * 2 ** 24 +
+        (data[21] ?? 0) * 2 ** 16 +
+        (data[22] ?? 0) * 2 ** 8 +
+        (data[23] ?? 0)) >>>
+      0;
     if (Number.isFinite(w) && Number.isFinite(h) && w * h > MAX_IMAGE_PIXELS) {
       throw new PageStreamingError(413, "Page image exceeds the pixel-count limit");
     }
@@ -135,7 +149,9 @@ export function sweepPageCacheQuota(): void {
           if (entry.name === CACHE_META_FILE) continue;
           if ((activePageLeases.get(p) ?? 0) > 0) continue;
           files.push({ path: p, mtime: st.mtimeMs });
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
       }
     };
     let books: Dirent[] | undefined;
@@ -155,41 +171,20 @@ export function sweepPageCacheQuota(): void {
       if ((activePageLeases.get(path) ?? 0) > 0) continue;
       try {
         total -= statSync(path).size;
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
       try {
         rmSync(path, { force: true });
-      } catch { /* ignore */ }
-    }
-    // Eviction orphans in-memory metas: drop any entry whose pages no longer
-    // all exist on disk so the next read re-validates or lazily regenerates
-    // instead of serving a path to a deleted file.
-    for (const [key, entry] of metaMemCache) {
-      const dir = metaCacheDirForKey(key);
-      if (!dir) continue;
-      if (entry.meta.pages.some((page) => !existsSync(join(dir, page.fileName)))) {
-        metaMemCache.delete(key);
+      } catch {
+        /* ignore */
       }
     }
-  } catch { /* ignore */ }
-}
-
-interface CachedPage {
-  index: number;
-  name: string;
-  fileName: string;
-  contentType: string;
-  /** Full archive entry path for lazy on-demand extraction (CBZ). */
-  sourceName?: string;
-}
-
-interface PageCacheMeta {
-  source: SourceSignature;
-  pageCount: number;
-  pages: CachedPage[];
-  /** Library hash owning this scoped dir; entries without it predate scoping. */
-  libHash?: string;
-  /** CBR manifest version (CBR_MANIFEST_VERSION); absent on pre-version metas. */
-  version?: number;
+    // Manifests remain valid after byte eviction: page readers check file
+    // existence and regenerate missing pages on demand.
+  } catch {
+    /* ignore */
+  }
 }
 
 // S6: pages must be dense and 1-based with no gaps for positional lookup
@@ -234,27 +229,50 @@ interface MetaMemEntry {
 }
 const metaMemCache = new Map<string, MetaMemEntry>();
 
+function rememberPageMeta(key: string, entry: MetaMemEntry): void {
+  metaMemCache.delete(key);
+  let pageTotal = entry.meta.pageCount;
+  for (const cached of metaMemCache.values()) pageTotal += cached.meta.pageCount;
+  while (metaMemCache.size > 0 && (metaMemCache.size >= 100 || pageTotal > 50_000)) {
+    const oldest = metaMemCache.entries().next().value;
+    if (!oldest) break;
+    pageTotal -= oldest[1].meta.pageCount;
+    metaMemCache.delete(oldest[0]);
+  }
+  metaMemCache.set(key, entry);
+}
+const MAX_OPEN_CBZ_BYTES = 128 * 1024 * 1024;
+const openCbzs = new ByteLruCache<string, { signature: SourceSignature; zip: JSZip }>(
+  3,
+  MAX_OPEN_CBZ_BYTES,
+);
+
+async function getOpenCbz(sourcePath: string, source: SourceSignature): Promise<JSZip> {
+  const cached = openCbzs.get(sourcePath);
+  if (cached && isSameSignature(cached.signature, source)) {
+    return cached.zip;
+  }
+  openCbzs.delete(sourcePath);
+  return runSingleFlight(`open-cbz:${sourcePath}:${source.size}:${source.mtimeMs}`, async () => {
+    let zip: JSZip;
+    try {
+      zip = await JSZip.loadAsync(await Bun.file(sourcePath).arrayBuffer());
+    } catch {
+      throw new PageStreamingError(422, "Invalid CBZ archive");
+    }
+    // JSZip retains compressed archive bytes. Keep a bounded LRU so moving
+    // between pages avoids re-reading and parsing the complete comic.
+    openCbzs.set(sourcePath, { signature: source, zip }, source.size);
+    return zip;
+  });
+}
+
 function metaCacheKey(bookId: number, format: string, library?: string): string {
   // F04: scope the in-memory + singleflight key by library so switching
   // libraries never serves another library's validated meta. Pass the
   // entry-captured library (see coherence rule in epub-cache.ts) instead of
   // re-reading mid-await; the default covers best-effort callers.
   return `${library ?? LIBRARY_PATH}::${bookId}/${format.toUpperCase()}`;
-}
-
-// Reverse a metaCacheKey back to its on-disk cache dir so quota eviction can
-// invalidate the in-memory meta whose pages were deleted. Returns null for
-// foreign/malformed keys (never invalidate what we cannot attribute).
-function metaCacheDirForKey(key: string): string | null {
-  const sepIdx = key.lastIndexOf("::");
-  if (sepIdx < 0) return null;
-  const rest = key.slice(sepIdx + 2);
-  const slashIdx = rest.lastIndexOf("/");
-  if (slashIdx < 0) return null;
-  const bookId = Number(rest.slice(0, slashIdx));
-  const format = rest.slice(slashIdx + 1);
-  if (!Number.isInteger(bookId) || bookId <= 0 || !format) return null;
-  return getCacheDir(bookId, format);
 }
 
 async function readJson<T>(path: string): Promise<T | null> {
@@ -265,6 +283,11 @@ async function readJson<T>(path: string): Promise<T | null> {
   } catch {
     return null;
   }
+}
+
+async function readPageCacheMeta(path: string): Promise<PageCacheMeta | null> {
+  const value = await readJson<unknown>(path);
+  return isPageCacheMeta(value) ? value : null;
 }
 
 function getCacheDir(bookId: number, format: string, libHash: string = cacheLibraryHash()): string {
@@ -329,7 +352,7 @@ function sortPageNames(a: string, b: string): number {
 async function ensureCbzCache(
   bookId: number,
   library?: string,
-): Promise<{ cacheDir: string; meta: PageCacheMeta }> {
+): Promise<{ cacheDir: string; meta: PageCacheMeta; sourcePath: string }> {
   // Capture the coherent catalog context at entry (see epub-cache.ts).
   const resolvedLibrary = library ?? getLibraryPath();
   const libHash = cacheLibraryHash(resolvedLibrary);
@@ -343,21 +366,24 @@ async function ensureCbzCache(
   const cacheKey = metaCacheKey(bookId, format, resolvedLibrary);
 
   const memEntry = metaMemCache.get(cacheKey);
-  if (memEntry && memEntry.meta.libHash === libHash && isSameSignature(memEntry.signature, source)) {
-    return { cacheDir, meta: memEntry.meta };
+  if (
+    memEntry &&
+    memEntry.meta.libHash === libHash &&
+    isSameSignature(memEntry.signature, source)
+  ) {
+    return { cacheDir, meta: memEntry.meta, sourcePath };
   }
 
   return runSingleFlight(cacheKey, async () => {
-    const existingMeta = await readJson<PageCacheMeta>(metaPath);
+    const existingMeta = await readPageCacheMeta(metaPath);
 
     if (
       existingMeta &&
       existingMeta.libHash === libHash &&
-      isSameSignature(existingMeta.source, source) &&
-      existingMeta.pages.every((page) => existsSync(join(cacheDir, page.fileName)))
+      isSameSignature(existingMeta.source, source)
     ) {
-      metaMemCache.set(cacheKey, { meta: existingMeta, signature: source });
-      return { cacheDir, meta: existingMeta };
+      rememberPageMeta(cacheKey, { meta: existingMeta, signature: source });
+      return { cacheDir, meta: existingMeta, sourcePath };
     }
 
     // CBZ pages materialize lazily; legacy dirs are purged, never adopted.
@@ -367,7 +393,7 @@ async function ensureCbzCache(
     rmSync(cacheDir, { recursive: true, force: true });
     mkdirSync(cacheDir, { recursive: true });
 
-    const zip = await JSZip.loadAsync(await Bun.file(sourcePath).arrayBuffer());
+    const zip = await archiveExtractSemaphore.run(() => getOpenCbz(sourcePath, source));
     const skippedSvg = Object.values(zip.files).filter(
       (entry) => !entry.dir && extname(entry.name).toLowerCase() === SKIPPED_SVG_EXTENSION,
     ).length;
@@ -421,9 +447,9 @@ async function ensureCbzCache(
       pages,
     };
     await Bun.write(metaPath, `${JSON.stringify(meta)}\n`);
-    metaMemCache.set(cacheKey, { meta, signature: source });
+    rememberPageMeta(cacheKey, { meta, signature: source });
 
-    return { cacheDir, meta };
+    return { cacheDir, meta, sourcePath };
   });
 }
 
@@ -450,62 +476,78 @@ async function extractCbzPage(
   // Thread the entry-captured library (see epub-cache.ts coherence rule) so
   // the singleflight key cannot mix generations across a library switch.
   const resolvedLibrary = library ?? getLibraryPath();
-  return runSingleFlight(pageSingleFlightKey(bookId, "cbz", String(pageNumber), resolvedLibrary), () =>
-    archiveExtractSemaphore.run(async () => {
-      if (existsSync(outputPath)) {
+  return runSingleFlight(
+    pageSingleFlightKey(bookId, "cbz", String(pageNumber), resolvedLibrary),
+    () =>
+      archiveExtractSemaphore.run(async () => {
+        if (existsSync(outputPath)) {
+          return { path: outputPath, contentType: cachedPage.contentType };
+        }
+        // Never publish for a stale generation.
+        const fresh = getSourceSignature(sourcePath);
+        if (!isSameSignature(fresh, source)) {
+          throw new PageStreamingError(409, "Reader source changed during extraction");
+        }
+        const zip = await getOpenCbz(sourcePath, source);
+        const entryName =
+          cachedPage.sourceName ??
+          Object.values(zip.files).find((e) => basename(e.name) === cachedPage.name)?.name;
+        const entry = entryName ? zip.files[entryName] : undefined;
+        if (!entry || entry.dir) throw new PageStreamingError(404, "Page not found");
+        const declared = entryUncompressedSize(entry);
+        if (declared !== null && declared > MAX_CACHE_BYTES) {
+          throw new PageStreamingError(413, "CBZ expands beyond the reader cache limit");
+        }
+        const data = await entry.async("uint8array");
+        if (data.byteLength > MAX_CACHE_BYTES) {
+          throw new PageStreamingError(413, "CBZ expands beyond the reader cache limit");
+        }
+        assertPixelCountGuard(data, cachedPage.fileName);
+        const tmpPath = `${outputPath}.tmp-${process.pid}`;
+        await Bun.write(tmpPath, data);
+        const beforePublish = getSourceSignature(sourcePath);
+        if (!isSameSignature(beforePublish, source)) {
+          try {
+            rmSync(tmpPath, { force: true });
+          } catch {
+            /* ignore */
+          }
+          throw new PageStreamingError(409, "Reader source changed during extraction");
+        }
+        try {
+          renameSync(tmpPath, outputPath);
+        } catch {
+          await Bun.write(outputPath, data);
+          try {
+            rmSync(tmpPath, { force: true });
+          } catch {
+            /* ignore */
+          }
+        }
+        sweepPageCacheQuota();
         return { path: outputPath, contentType: cachedPage.contentType };
-      }
-      // Never publish for a stale generation.
-      const fresh = getSourceSignature(sourcePath);
-      if (!isSameSignature(fresh, source)) {
-        throw new PageStreamingError(409, "Reader source changed during extraction");
-      }
-      const zip = await JSZip.loadAsync(await Bun.file(sourcePath).arrayBuffer());
-      const entryName = cachedPage.sourceName
-        ?? Object.values(zip.files).find((e) => basename(e.name) === cachedPage.name)?.name;
-      const entry = entryName ? zip.files[entryName] : undefined;
-      if (!entry || entry.dir) throw new PageStreamingError(404, "Page not found");
-      const declared = entryUncompressedSize(entry);
-      if (declared !== null && declared > MAX_CACHE_BYTES) {
-        throw new PageStreamingError(413, "CBZ expands beyond the reader cache limit");
-      }
-      const data = await entry.async("uint8array");
-      if (data.byteLength > MAX_CACHE_BYTES) {
-        throw new PageStreamingError(413, "CBZ expands beyond the reader cache limit");
-      }
-      assertPixelCountGuard(data, cachedPage.fileName);
-      const tmpPath = `${outputPath}.tmp-${process.pid}`;
-      await Bun.write(tmpPath, data);
-      const beforePublish = getSourceSignature(sourcePath);
-      if (!isSameSignature(beforePublish, source)) {
-        try {
-          rmSync(tmpPath, { force: true });
-        } catch { /* ignore */ }
-        throw new PageStreamingError(409, "Reader source changed during extraction");
-      }
-      try {
-        renameSync(tmpPath, outputPath);
-      } catch {
-        await Bun.write(outputPath, data);
-        try {
-          rmSync(tmpPath, { force: true });
-        } catch { /* ignore */ }
-      }
-      sweepPageCacheQuota();
-      return { path: outputPath, contentType: cachedPage.contentType };
-    }),
+      }),
   );
 }
 
 async function getUnrarWasmBinary(): Promise<ArrayBuffer> {
-  const wasmPath = join(import.meta.dir, "..", "..", "node_modules", "node-unrar-js", "esm", "js", "unrar.wasm");
+  const wasmPath = join(
+    import.meta.dir,
+    "..",
+    "..",
+    "node_modules",
+    "node-unrar-js",
+    "esm",
+    "js",
+    "unrar.wasm",
+  );
   return Bun.file(wasmPath).arrayBuffer();
 }
 
 async function ensureCbrCache(
   bookId: number,
   library?: string,
-): Promise<{ cacheDir: string; meta: PageCacheMeta }> {
+): Promise<{ cacheDir: string; meta: PageCacheMeta; sourcePath: string }> {
   const resolvedLibrary = library ?? getLibraryPath();
   const libHash = cacheLibraryHash(resolvedLibrary);
   const format = "CBR";
@@ -526,11 +568,11 @@ async function ensureCbrCache(
     isContiguousPages(memEntry.meta.pages) &&
     isSameSignature(memEntry.signature, source)
   ) {
-    return { cacheDir, meta: memEntry.meta };
+    return { cacheDir, meta: memEntry.meta, sourcePath };
   }
 
   return runSingleFlight(cacheKey, async () => {
-    const existingMeta = await readJson<PageCacheMeta>(metaPath);
+    const existingMeta = await readPageCacheMeta(metaPath);
 
     if (
       existingMeta &&
@@ -538,11 +580,10 @@ async function ensureCbrCache(
       existingMeta.version === CBR_MANIFEST_VERSION &&
       existingMeta.pageCount === existingMeta.pages.length &&
       isContiguousPages(existingMeta.pages) &&
-      isSameSignature(existingMeta.source, source) &&
-      existingMeta.pages.every((page) => existsSync(join(cacheDir, page.fileName)))
+      isSameSignature(existingMeta.source, source)
     ) {
-      metaMemCache.set(cacheKey, { meta: existingMeta, signature: source });
-      return { cacheDir, meta: existingMeta };
+      rememberPageMeta(cacheKey, { meta: existingMeta, signature: source });
+      return { cacheDir, meta: existingMeta, sourcePath };
     }
 
     // CBR extracts eagerly; legacy dirs are purged, never adopted.
@@ -561,13 +602,17 @@ async function ensureCbrCache(
     // fileHeaders is a one-shot generator: materialize once and reuse.
     const fileHeaders = [...list.fileHeaders];
     const skippedSvg = fileHeaders.filter(
-      (header) => !header.flags.directory && extname(header.name).toLowerCase() === SKIPPED_SVG_EXTENSION,
+      (header) =>
+        !header.flags.directory && extname(header.name).toLowerCase() === SKIPPED_SVG_EXTENSION,
     ).length;
     if (skippedSvg > 0) {
       console.warn(`[page-streaming] skipped ${skippedSvg} SVG page(s) in CBR source`);
     }
     const imageNames = fileHeaders
-      .filter((header) => !header.flags.directory && IMAGE_EXTENSIONS.has(extname(header.name).toLowerCase()))
+      .filter(
+        (header) =>
+          !header.flags.directory && IMAGE_EXTENSIONS.has(extname(header.name).toLowerCase()),
+      )
       .map((header) => header.name)
       .sort(sortPageNames);
 
@@ -605,7 +650,9 @@ async function ensureCbrCache(
     // calls. Buffers are never collected into a map first (that would hold
     // the whole archive in memory before any cap is enforced).
     const pages: CachedPage[] = await archiveExtractSemaphore.run(async () => {
-      const extracted = await extractor.extract({ files: (header) => imageNameSet.has(header.name) });
+      const extracted = await extractor.extract({
+        files: (header) => imageNameSet.has(header.name),
+      });
 
       const retained: CachedPage[] = [];
       let retainedBytes = 0;
@@ -623,7 +670,10 @@ async function ensureCbrCache(
             throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
           }
         }
-        if (data.byteLength > MAX_CACHE_BYTES || retainedBytes + data.byteLength > MAX_CACHE_BYTES) {
+        if (
+          data.byteLength > MAX_CACHE_BYTES ||
+          retainedBytes + data.byteLength > MAX_CACHE_BYTES
+        ) {
           throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
         }
         retainedBytes += data.byteLength;
@@ -638,7 +688,9 @@ async function ensureCbrCache(
         if (!isSameSignature(beforePublish, source)) {
           try {
             rmSync(tmpPath, { force: true });
-          } catch { /* ignore */ }
+          } catch {
+            /* ignore */
+          }
           throw new PageStreamingError(409, "Reader source changed during extraction");
         }
         try {
@@ -647,7 +699,9 @@ async function ensureCbrCache(
           await Bun.write(outputPath, data);
           try {
             rmSync(tmpPath, { force: true });
-          } catch { /* ignore */ }
+          } catch {
+            /* ignore */
+          }
         }
         retained.push({
           index,
@@ -679,9 +733,9 @@ async function ensureCbrCache(
       pages,
     };
     await Bun.write(metaPath, `${JSON.stringify(meta)}\n`);
-    metaMemCache.set(cacheKey, { meta, signature: source });
+    rememberPageMeta(cacheKey, { meta, signature: source });
 
-    return { cacheDir, meta };
+    return { cacheDir, meta, sourcePath };
   });
 }
 
@@ -706,72 +760,78 @@ async function extractCbrPage(
     return { path: outputPath, contentType: cachedPage.contentType };
   }
   const resolvedLibrary = library ?? getLibraryPath();
-  return runSingleFlight(pageSingleFlightKey(bookId, "cbr", String(pageNumber), resolvedLibrary), () =>
-    archiveExtractSemaphore.run(async () => {
-      if (existsSync(outputPath)) {
-        return { path: outputPath, contentType: cachedPage.contentType };
-      }
-      // Never publish for a stale generation.
-      const fresh = getSourceSignature(sourcePath);
-      if (!isSameSignature(fresh, source)) {
-        throw new PageStreamingError(409, "Reader source changed during extraction");
-      }
-      const archiveData = await Bun.file(sourcePath).arrayBuffer();
-      const extractor = await createExtractorFromData({
-        data: archiveData,
-        wasmBinary: await getUnrarWasmBinary(),
-      });
-      const entryName = cachedPage.sourceName ?? cachedPage.name;
-      const extracted = await extractor.extract({
-        files: (header) => header.name === entryName || basename(header.name) === cachedPage.name,
-      });
-      let data: Uint8Array | undefined;
-      // One-shot generator: yields one file at a time, so peak memory is one
-      // page. The declared-size gate runs BEFORE retaining each buffer —
-      // abort before assignment/Bun.write, never after collecting.
-      for (const file of extracted.files) {
-        const declared = declaredOf(file.fileHeader);
-        if (declared !== null && declared > MAX_CACHE_BYTES) {
-          throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
+  return runSingleFlight(
+    pageSingleFlightKey(bookId, "cbr", String(pageNumber), resolvedLibrary),
+    () =>
+      archiveExtractSemaphore.run(async () => {
+        if (existsSync(outputPath)) {
+          return { path: outputPath, contentType: cachedPage.contentType };
         }
-        if (file.extraction && file.fileHeader.name === entryName) {
-          data = file.extraction;
-          break;
+        // Never publish for a stale generation.
+        const fresh = getSourceSignature(sourcePath);
+        if (!isSameSignature(fresh, source)) {
+          throw new PageStreamingError(409, "Reader source changed during extraction");
         }
-      }
-      if (!data) {
+        const archiveData = await Bun.file(sourcePath).arrayBuffer();
+        const extractor = await createExtractorFromData({
+          data: archiveData,
+          wasmBinary: await getUnrarWasmBinary(),
+        });
+        const entryName = cachedPage.sourceName ?? cachedPage.name;
+        const extracted = await extractor.extract({
+          files: (header) => header.name === entryName || basename(header.name) === cachedPage.name,
+        });
+        let data: Uint8Array | undefined;
+        // One-shot generator: yields one file at a time, so peak memory is one
+        // page. The declared-size gate runs BEFORE retaining each buffer —
+        // abort before assignment/Bun.write, never after collecting.
         for (const file of extracted.files) {
-          if (file.extraction && basename(file.fileHeader.name) === cachedPage.name) {
+          const declared = declaredOf(file.fileHeader);
+          if (declared !== null && declared > MAX_CACHE_BYTES) {
+            throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
+          }
+          if (file.extraction && file.fileHeader.name === entryName) {
             data = file.extraction;
             break;
           }
         }
-      }
-      if (!data) throw new PageStreamingError(404, "Page not found");
-      if (data.byteLength > MAX_CACHE_BYTES) {
-        throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
-      }
-      assertPixelCountGuard(data, cachedPage.fileName);
-      const tmpPath = `${outputPath}.tmp-${process.pid}`;
-      await Bun.write(tmpPath, data);
-      const beforePublish = getSourceSignature(sourcePath);
-      if (!isSameSignature(beforePublish, source)) {
+        if (!data) {
+          for (const file of extracted.files) {
+            if (file.extraction && basename(file.fileHeader.name) === cachedPage.name) {
+              data = file.extraction;
+              break;
+            }
+          }
+        }
+        if (!data) throw new PageStreamingError(404, "Page not found");
+        if (data.byteLength > MAX_CACHE_BYTES) {
+          throw new PageStreamingError(413, "CBR expands beyond the reader cache limit");
+        }
+        assertPixelCountGuard(data, cachedPage.fileName);
+        const tmpPath = `${outputPath}.tmp-${process.pid}`;
+        await Bun.write(tmpPath, data);
+        const beforePublish = getSourceSignature(sourcePath);
+        if (!isSameSignature(beforePublish, source)) {
+          try {
+            rmSync(tmpPath, { force: true });
+          } catch {
+            /* ignore */
+          }
+          throw new PageStreamingError(409, "Reader source changed during extraction");
+        }
         try {
-          rmSync(tmpPath, { force: true });
-        } catch { /* ignore */ }
-        throw new PageStreamingError(409, "Reader source changed during extraction");
-      }
-      try {
-        renameSync(tmpPath, outputPath);
-      } catch {
-        await Bun.write(outputPath, data);
-        try {
-          rmSync(tmpPath, { force: true });
-        } catch { /* ignore */ }
-      }
-      sweepPageCacheQuota();
-      return { path: outputPath, contentType: cachedPage.contentType };
-    }),
+          renameSync(tmpPath, outputPath);
+        } catch {
+          await Bun.write(outputPath, data);
+          try {
+            rmSync(tmpPath, { force: true });
+          } catch {
+            /* ignore */
+          }
+        }
+        sweepPageCacheQuota();
+        return { path: outputPath, contentType: cachedPage.contentType };
+      }),
   );
 }
 
@@ -798,7 +858,10 @@ const PDFTOPPM_BIN = executable(
   "pdftoppm",
 );
 
-async function runCommand(command: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+async function runCommand(
+  command: string,
+  args: string[],
+): Promise<{ stdout: string; stderr: string }> {
   let proc: ReturnType<typeof Bun.spawn>;
   try {
     proc = Bun.spawn([command, ...args], {
@@ -874,9 +937,13 @@ async function ensurePdfCache(
   const cacheKey = metaCacheKey(bookId, format, resolvedLibrary);
 
   return runSingleFlight(cacheKey, async () => {
-    const existingMeta = await readJson<PageCacheMeta>(metaPath);
+    const existingMeta = await readPageCacheMeta(metaPath);
 
-    if (existingMeta && existingMeta.libHash === libHash && isSameSignature(existingMeta.source, source)) {
+    if (
+      existingMeta &&
+      existingMeta.libHash === libHash &&
+      isSameSignature(existingMeta.source, source)
+    ) {
       return {
         cacheDir,
         sourcePath,
@@ -925,70 +992,80 @@ async function getPdfPageFile(bookId: number, page: number, library?: string): P
   }
 
   // Per-key singleflight: library|book|rev|op|page shares one render.
-  return runSingleFlight(pageSingleFlightKey(bookId, "pdf", String(pageNumber), resolvedLibrary), () =>
-    pdfRenderSemaphore.run(async () => {
-      if (existsSync(outputPath)) {
-        return { path: outputPath, contentType: "image/png" };
-      }
-      const fresh = getSourceSignature(sourcePath);
-      if (!isSameSignature(fresh, source)) {
-        throw new PageStreamingError(409, "Reader source changed during rendering");
-      }
-      // Render to tmp.$pid prefix then rename so readers never see partial PNGs.
-      const tmpPrefix = `${outputPrefix}.tmp-${process.pid}`;
-      const tmpPath = `${tmpPrefix}.png`;
-      try {
-        rmSync(tmpPath, { force: true });
-      } catch { /* ignore */ }
-      await runCommand(PDFTOPPM_BIN, [
-        "-f",
-        String(pageNumber),
-        "-l",
-        String(pageNumber),
-        "-singlefile",
-        "-png",
-        "-r",
-        "150",
-        sourcePath,
-        tmpPrefix,
-      ]);
-      // Recheck generation before publish: never publish a stale generation.
-      const beforePublish = getSourceSignature(sourcePath);
-      if (!isSameSignature(beforePublish, source)) {
+  return runSingleFlight(
+    pageSingleFlightKey(bookId, "pdf", String(pageNumber), resolvedLibrary),
+    () =>
+      pdfRenderSemaphore.run(async () => {
+        if (existsSync(outputPath)) {
+          return { path: outputPath, contentType: "image/png" };
+        }
+        const fresh = getSourceSignature(sourcePath);
+        if (!isSameSignature(fresh, source)) {
+          throw new PageStreamingError(409, "Reader source changed during rendering");
+        }
+        // Render to tmp.$pid prefix then rename so readers never see partial PNGs.
+        const tmpPrefix = `${outputPrefix}.tmp-${process.pid}`;
+        const tmpPath = `${tmpPrefix}.png`;
         try {
           rmSync(tmpPath, { force: true });
-        } catch { /* ignore */ }
-        throw new PageStreamingError(409, "Reader source changed during rendering");
-      }
-      if (!existsSync(tmpPath)) {
-        throw new PageStreamingError(500, "Page extraction failed");
-      }
-      try {
-        const rendered = await Bun.file(tmpPath).arrayBuffer();
-        assertPixelCountGuard(new Uint8Array(rendered), outputPath);
-      } catch (error) {
-        if (error instanceof PageStreamingError) {
+        } catch {
+          /* ignore */
+        }
+        await runCommand(PDFTOPPM_BIN, [
+          "-f",
+          String(pageNumber),
+          "-l",
+          String(pageNumber),
+          "-singlefile",
+          "-png",
+          "-r",
+          "150",
+          sourcePath,
+          tmpPrefix,
+        ]);
+        // Recheck generation before publish: never publish a stale generation.
+        const beforePublish = getSourceSignature(sourcePath);
+        if (!isSameSignature(beforePublish, source)) {
           try {
             rmSync(tmpPath, { force: true });
-          } catch { /* ignore */ }
-          throw error;
+          } catch {
+            /* ignore */
+          }
+          throw new PageStreamingError(409, "Reader source changed during rendering");
         }
-      }
-      try {
-        renameSync(tmpPath, outputPath);
-      } catch {
-        await Bun.write(outputPath, await Bun.file(tmpPath).arrayBuffer());
+        if (!existsSync(tmpPath)) {
+          throw new PageStreamingError(500, "Page extraction failed");
+        }
         try {
-          rmSync(tmpPath, { force: true });
-        } catch { /* ignore */ }
-      }
-      sweepPageCacheQuota();
+          const rendered = await Bun.file(tmpPath).arrayBuffer();
+          assertPixelCountGuard(new Uint8Array(rendered), outputPath);
+        } catch (error) {
+          if (error instanceof PageStreamingError) {
+            try {
+              rmSync(tmpPath, { force: true });
+            } catch {
+              /* ignore */
+            }
+            throw error;
+          }
+        }
+        try {
+          renameSync(tmpPath, outputPath);
+        } catch {
+          await Bun.write(outputPath, await Bun.file(tmpPath).arrayBuffer());
+          try {
+            rmSync(tmpPath, { force: true });
+          } catch {
+            /* ignore */
+          }
+        }
+        sweepPageCacheQuota();
 
-      return {
-        path: outputPath,
-        contentType: "image/png",
-      };
-    }),
+        return {
+          path: outputPath,
+          contentType: "image/png",
+        };
+      }),
   );
 }
 
@@ -1051,23 +1128,26 @@ export async function getPageManifest(bookId: number, formatParam: string): Prom
   return unsupportedFormat(format);
 }
 
-export async function getPageFile(bookId: number, formatParam: string, page: number): Promise<PageFile> {
+export async function getPageFile(
+  bookId: number,
+  formatParam: string,
+  page: number,
+): Promise<PageFile> {
   const format = formatParam.toUpperCase();
   // Same entry-captured library discipline as getPageManifest.
   const library = getLibraryPath();
 
   if (format === "CBZ") {
-    const { cacheDir, meta } = await ensureCbzCache(bookId, library);
+    const { cacheDir, meta, sourcePath } = await ensureCbzCache(bookId, library);
     const pageNumber = normalizePageNumber(page, meta.pageCount);
     const cachedPage = meta.pages[pageNumber - 1];
     if (!cachedPage) throw new PageStreamingError(404, "Page not found");
-    const sourcePath = getSourcePath(bookId, format);
-    const source = getSourceSignature(sourcePath);
+    const source = meta.source;
     return extractCbzPage(bookId, cacheDir, meta, sourcePath, source, pageNumber, library);
   }
 
   if (format === "CBR") {
-    const { cacheDir, meta } = await ensureCbrCache(bookId, library);
+    const { cacheDir, meta, sourcePath } = await ensureCbrCache(bookId, library);
     const pageNumber = normalizePageNumber(page, meta.pageCount);
     const cachedPage = meta.pages[pageNumber - 1];
     if (!cachedPage) throw new PageStreamingError(404, "Page not found");
@@ -1079,8 +1159,7 @@ export async function getPageFile(bookId: number, formatParam: string, page: num
     if (existsSync(outputPath)) {
       return { path: outputPath, contentType: cachedPage.contentType };
     }
-    const sourcePath = getSourcePath(bookId, format);
-    const source = getSourceSignature(sourcePath);
+    const source = meta.source;
     try {
       return await extractCbrPage(bookId, cacheDir, meta, sourcePath, source, pageNumber, library);
     } catch (error) {
@@ -1093,13 +1172,13 @@ export async function getPageFile(bookId: number, formatParam: string, page: num
       if (existsSync(rePath)) {
         return { path: rePath, contentType: rePage.contentType };
       }
-      const reSourcePath = getSourcePath(bookId, format);
+      const reSourcePath = reensured.sourcePath;
       return extractCbrPage(
         bookId,
         reensured.cacheDir,
         reensured.meta,
         reSourcePath,
-        getSourceSignature(reSourcePath),
+        reensured.meta.source,
         pageNumber,
         library,
       );

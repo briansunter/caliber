@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { DOMParser } from "@xmldom/xmldom";
 import JSZip from "jszip";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
@@ -401,14 +401,14 @@ async function seedValidCoreFiles() {
 // Deterministic gradient PNG: big enough that a 256px JPEG thumbnail is
 // strictly smaller than the source, so the test can distinguish a real
 // resize from a full-bytes fallback.
-function createCoverPng(width: number, height: number): Uint8Array {
+function createCoverPng(width: number, height: number, colorOffset = 0): Uint8Array {
   const raw = Buffer.alloc(width * height * 3);
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       const i = (y * width + x) * 3;
-      raw[i] = x % 256;
-      raw[i + 1] = y % 256;
-      raw[i + 2] = (x + y) % 256;
+      raw[i] = (x + colorOffset) % 256;
+      raw[i + 1] = (y + colorOffset) % 256;
+      raw[i + 2] = (x + y + colorOffset) % 256;
     }
   }
   const scanlines = Buffer.alloc(height * (1 + width * 3));
@@ -565,6 +565,7 @@ beforeAll(async () => {
       CALIBRE_LIBRARY_PATH: libraryPath,
       PORT: String(port),
       NODE_ENV: "test",
+      CALIBER_MCP_ENABLED: "true",
     }),
     stdout: "pipe",
     stderr: "pipe",
@@ -585,6 +586,316 @@ afterAll(async () => {
     await serverProcess.exited.catch(() => {});
   }
   if (tempDir) rmSync(tempDir, { recursive: true, force: true });
+});
+
+describe("request body limits", () => {
+  test("rejects oversized fixed and chunked JSON before processing REST or MCP requests", async () => {
+    const content = JSON.stringify({ padding: "x".repeat(1_400_000) });
+    const bytes = new TextEncoder().encode(content);
+    for (const [endpoint, method] of [["/api/config/library", "PUT"], ["/mcp", "POST"]]) {
+      for (const chunked of [false, true]) {
+        let offset = 0;
+        const body = chunked
+          ? new ReadableStream<Uint8Array>({
+              pull(controller) {
+                if (offset >= bytes.length) controller.close();
+                else {
+                  controller.enqueue(bytes.subarray(offset, offset + 700_000));
+                  offset += 700_000;
+                }
+              },
+            })
+          : content;
+        const response = await fetch(`${baseUrl}${endpoint}`, {
+          method,
+          headers: { "Content-Type": "application/json" },
+          body,
+        });
+        expect(response.status).toBe(413);
+      }
+    }
+    const invalidJson = await fetch(`${baseUrl}/api/config/library`, { method: "PUT", body: "{" });
+    expect(invalidJson.status).toBe(400);
+    const health = await fetch(`${baseUrl}/api/health`);
+    expect(health.status).toBe(200);
+  });
+});
+
+describe("runtime library selection", () => {
+  test("GET and PUT expose the same canonical identity when connecting and switching libraries", async () => {
+    const switchHome = join(tempDir, "switch-home");
+    const secondLibrary = join(tempDir, "second-library");
+    mkdirSync(switchHome, { recursive: true });
+    mkdirSync(secondLibrary, { recursive: true });
+    const source = new Database(join(libraryPath, "metadata.db"), { readonly: true });
+    try {
+      writeFileSync(join(secondLibrary, "metadata.db"), source.serialize());
+    } finally {
+      source.close();
+    }
+    const secondDb = new Database(join(secondLibrary, "metadata.db"));
+    try {
+      secondDb.query("UPDATE books SET title = ? WHERE id = 1").run("Switched library edition");
+    } finally {
+      secondDb.close();
+    }
+
+    // Preserve size and timestamps while changing bytes: stat-only validators
+    // and startup-library thumbnail keys would collide after this switch.
+    const secondBookDir = join(secondLibrary, "Alpha Book");
+    mkdirSync(secondBookDir, { recursive: true });
+    const firstCoverPath = join(libraryPath, "Alpha Book", "cover.jpg");
+    const secondCoverPath = join(secondBookDir, "cover.jpg");
+    const originalCover = readFileSync(firstCoverPath);
+    const changedCover = Buffer.from(createCoverPng(800, 600, 64));
+    const coverSize = Math.max(originalCover.length, changedCover.length);
+    const paddedCover = (bytes: Buffer) => {
+      const padded = Buffer.alloc(coverSize);
+      bytes.copy(padded);
+      return padded;
+    };
+    writeFileSync(firstCoverPath, paddedCover(originalCover));
+    writeFileSync(secondCoverPath, paddedCover(changedCover));
+    const firstPdfPath = join(libraryPath, "Alpha Book", "Alpha Book.pdf");
+    const secondPdfPath = join(secondBookDir, "Alpha Book.pdf");
+    writeFileSync(secondPdfPath, readFileSync(firstPdfPath, "utf8").replace("Caliber PDF fixture", "Swapped PDF fixture"));
+    const modified = new Date("2020-01-01T00:00:00Z");
+    for (const path of [firstCoverPath, secondCoverPath, firstPdfPath, secondPdfPath]) {
+      utimesSync(path, modified, modified);
+    }
+
+    const port = await freePort();
+    const selectionUrl = `http://127.0.0.1:${port}`;
+    const selectionServer = Bun.spawn([process.execPath, "src/index.ts"], {
+      cwd: process.cwd(),
+      // Omit library environment overrides so the loopback settings API can
+      // exercise the same first-connect/switch path as the browser.
+      env: childEnv({
+        HOME: switchHome,
+        CALIBER_CONFIG_DIR: join(switchHome, ".config", "caliber"),
+        CALIBER_HOST: "127.0.0.1",
+        PORT: String(port),
+        NODE_ENV: "test",
+      }),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    tapPipe(selectionServer.stdout, (chunk) => { serverStdout += chunk; });
+    tapPipe(selectionServer.stderr, (chunk) => { serverStderr += chunk; });
+    type LibraryStatus = {
+      libraryId: string;
+      libraryPath: string;
+      ready: boolean;
+      applied?: boolean;
+      environmentOverride: boolean;
+    };
+    const getStatus = async () => {
+      const response = await fetch(`${selectionUrl}/api/config/library`);
+      expect(response.status).toBe(200);
+      return await response.json() as LibraryStatus;
+    };
+    const selectLibrary = async (selection: { libraryPath: string } | { databasePath: string }) => {
+      const response = await fetch(`${selectionUrl}/api/config/library`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(selection),
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      return await response.json() as LibraryStatus;
+    };
+
+    try {
+      await waitForServer(selectionUrl);
+      const before = await getStatus();
+      expect(before.environmentOverride).toBe(false);
+      expect(before.ready).toBe(false);
+      expect(before.libraryId).toMatch(/^lib-/);
+
+      const connected = await selectLibrary({ libraryPath });
+      expect(connected).toMatchObject({
+        libraryId: `lib-${Bun.hash(libraryPath).toString(36)}`,
+        libraryPath,
+        ready: true,
+        applied: true,
+      });
+      expect(connected.libraryId).not.toBe(before.libraryId);
+      expect(await getStatus()).toMatchObject({ libraryId: connected.libraryId, ready: true });
+
+      const assets = ["cover", "thumb?size=small", "download/PDF"];
+      const originalAssets = await Promise.all(assets.map(async (asset) => {
+        const response = await fetch(`${selectionUrl}/api/books/1/${asset}`);
+        if (response.status !== 200) {
+          throw new Error(`${asset}: ${response.status} ${await response.text()}\n${lastLines(serverStderr, 20)}`);
+        }
+        expect(response.status).toBe(200);
+        return { etag: response.headers.get("etag") ?? "", bytes: Buffer.from(await response.arrayBuffer()) };
+      }));
+
+      const switched = await selectLibrary({ databasePath: join(secondLibrary, "metadata.db") });
+      expect(switched).toMatchObject({
+        libraryId: `lib-${Bun.hash(secondLibrary).toString(36)}`,
+        libraryPath: secondLibrary,
+        ready: true,
+        applied: true,
+      });
+      expect(switched.libraryId).not.toBe(connected.libraryId);
+      expect(await getStatus()).toMatchObject({ libraryId: switched.libraryId, ready: true });
+      const book = await fetch(`${selectionUrl}/api/books/1`);
+      expect(book.status).toBe(200);
+      expect(await book.json()).toMatchObject({ title: "Switched library edition" });
+      for (const [index, asset] of assets.entries()) {
+        const original = originalAssets[index];
+        if (!original) throw new Error("Missing original asset");
+        const response = await fetch(`${selectionUrl}/api/books/1/${asset}`, {
+          headers: { "If-None-Match": original.etag },
+        });
+        expect(response.status).toBe(200);
+        expect(response.headers.get("etag")).not.toBe(original.etag);
+        expect(Buffer.from(await response.arrayBuffer()).equals(original.bytes)).toBe(false);
+        if (asset === "download/PDF") {
+          expect(response.headers.get("content-disposition")).toContain("Switched_library_edition.pdf");
+        }
+        const conditional = await fetch(`${selectionUrl}/api/books/1/${asset}`, {
+          headers: { "If-None-Match": `W/${response.headers.get("etag")}` },
+        });
+        expect(conditional.status).toBe(304);
+      }
+    } finally {
+      selectionServer.kill();
+      await selectionServer.exited.catch(() => {});
+    }
+  }, TEST_TIMEOUT);
+});
+
+describe("optimized frontend serving", () => {
+  const startFrontendServer = async (name: string, extra: Record<string, string>) => {
+    const port = await freePort();
+    const url = `http://127.0.0.1:${port}`;
+    const child = Bun.spawn([process.execPath, "src/index.ts"], {
+      cwd: process.cwd(),
+      env: childEnv({
+        HOME: homePath,
+        CALIBER_CONFIG_DIR: join(homePath, ".config", name),
+        CALIBRE_LIBRARY_PATH: libraryPath,
+        CALIBER_HOST: "127.0.0.1",
+        PORT: String(port),
+        ...extra,
+      }),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    tapPipe(child.stdout, (chunk) => { serverStdout += chunk; });
+    tapPipe(child.stderr, (chunk) => { serverStderr += chunk; });
+    try {
+      await waitForServer(url);
+      return { child, url };
+    } catch (error) {
+      child.kill();
+      await child.exited.catch(() => {});
+      throw error;
+    }
+  };
+  const assetPaths = (html: string) =>
+    [...html.matchAll(/\b(?:src|href)=["']?([^"'\s>]+)["']?/g)]
+      .map((match) => match[1] ?? "")
+      .filter((path) => /\.(?:js|css|svg)$/.test(path));
+
+  test("serves split assets and SPA routes while preserving host and auth guards", async () => {
+    const { child, url } = await startFrontendServer("caliber-production", {
+      NODE_ENV: "production",
+      CALIBER_AUTH_ENABLED: "true",
+    });
+    try {
+      const shell = await fetch(`${url}/book/1`);
+      expect(shell.status).toBe(200);
+      expect(shell.headers.get("content-type")).toContain("text/html");
+      expect(shell.headers.get("cache-control")).toBe("no-cache");
+      const html = await shell.text();
+      expect(html).toContain('id="root"');
+      expect(html).not.toContain("frontend.tsx");
+      const assets = assetPaths(html);
+      expect(assets.some((path) => path.endsWith(".js"))).toBe(true);
+      expect(assets.some((path) => path.endsWith(".css"))).toBe(true);
+      for (const path of assets) {
+        const response = await fetch(new URL(path, url));
+        expect(response.status).toBe(200);
+        expect(response.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+        expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+        const contentType = response.headers.get("content-type") ?? "";
+        expect(contentType).toContain(path.endsWith(".js") ? "javascript" : path.endsWith(".css") ? "text/css" : "image/svg+xml");
+        const bytes = await response.arrayBuffer();
+        expect(bytes.byteLength).toBeGreaterThan(0);
+        const etag = response.headers.get("etag");
+        expect(etag).toBeTruthy();
+        const head = await fetch(new URL(path, url), { method: "HEAD" });
+        expect(head.status).toBe(200);
+        expect(head.headers.get("content-length")).toBe(String(bytes.byteLength));
+        expect(await head.text()).toBe("");
+        const unchanged = await fetch(new URL(path, url), {
+          headers: { "If-None-Match": `W/${etag}` },
+        });
+        expect(unchanged.status).toBe(304);
+        expect(await unchanged.text()).toBe("");
+      }
+      const shellHead = await fetch(`${url}/settings`, { method: "HEAD" });
+      expect(shellHead.status).toBe(200);
+      expect(await shellHead.text()).toBe("");
+      const unchangedShell = await fetch(`${url}/`, {
+        headers: { "If-None-Match": shell.headers.get("etag") ?? "" },
+      });
+      expect(unchangedShell.status).toBe(304);
+      for (const path of ["/chunk-missing.js", "/src/index.ts", "/missing.css"]) {
+        expect((await fetch(`${url}${path}`)).status).toBe(404);
+      }
+      expect((await fetch(`${url}/api/books`)).status).toBe(401);
+      expect((await fetch(`${url}/api/missing`)).status).toBe(401);
+      const opds = await fetch(`${url}/opds/missing`);
+      expect(opds.status).toBe(401);
+      expect(opds.headers.get("www-authenticate")).toContain("Basic");
+      for (const path of ["/", assets[0] ?? "/", "/api/health"]) {
+        expect((await fetch(`${url}${path}`, { headers: { Host: "untrusted.example" } })).status).toBe(421);
+      }
+      const setup = await fetch(`${url}/api/auth/setup`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "production-reader", password: "production-password-123" }),
+      });
+      expect(setup.status).toBe(200);
+      const cookie = setup.headers.get("set-cookie")?.split(";")[0] ?? "";
+      const unknownApi = await fetch(`${url}/api/missing`, { headers: { Cookie: cookie } });
+      expect(unknownApi.status).toBe(404);
+      expect(unknownApi.headers.get("content-type")).toContain("application/json");
+    } finally {
+      child.kill();
+      await child.exited.catch(() => {});
+    }
+  }, TEST_TIMEOUT);
+
+  test("packaged default uses immutable frontend assets without changing cookie defaults", async () => {
+    const { child, url } = await startFrontendServer("caliber-packaged-default", {
+      CALIBER_LAUNCHER_REEXEC: "1",
+    });
+    try {
+      const response = await fetch(url);
+      const html = await response.text();
+      const script = assetPaths(html).find((path) => path.endsWith(".js"));
+      expect(script).toBeTruthy();
+      const asset = await fetch(new URL(script ?? "", url));
+      expect(asset.status).toBe(200);
+      expect(asset.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+      const login = await fetch(`${url}/api/user/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "packaged-reader" }),
+      });
+      expect(login.status).toBe(200);
+      expect(login.headers.get("set-cookie")).not.toContain("; Secure");
+    } finally {
+      child.kill();
+      await child.exited.catch(() => {});
+    }
+  }, TEST_TIMEOUT);
 });
 
 describe("OPDS catalog", () => {
@@ -627,6 +938,21 @@ describe("OPDS catalog", () => {
 });
 
 describe("file and reader endpoints", () => {
+  test("honors validators for new and cached API responses", async () => {
+    const cold = await fetch(`${baseUrl}/api/books/count`, {
+      headers: { "If-None-Match": "*" },
+    });
+    expect(cold.status).toBe(304);
+    const response = await fetch(`${baseUrl}/api/books/count`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toHaveProperty("count");
+    const etag = response.headers.get("etag");
+    const cached = await fetch(`${baseUrl}/api/books/count`, {
+      headers: { "If-None-Match": `"other", W/${etag}` },
+    });
+    expect(cached.status).toBe(304);
+  });
+
   test("supports HEAD, ETags, byte ranges, If-Range, and no-cache revalidation", async () => {
     const head = await fetch(`${baseUrl}/api/books/1/file/PDF`, { method: "HEAD" });
     expect(head.status).toBe(200);
@@ -682,6 +1008,14 @@ describe("file and reader endpoints", () => {
     });
     expect(chapterRange.status).toBe(206);
     expect(chapterRange.headers.get("content-range")).toMatch(/^bytes 0-40\//);
+
+    for (const entry of [
+      ".caliber-epub-cache.json", "%2e%2e%2f.caliber-epub-cache.json",
+      "a%2f..%2f.caliber-epub-cache.json",
+    ]) {
+      const rejected = await fetch(`${baseUrl}/api/books/1/epub/${entry}`);
+      expect(rejected.status).toBe(404);
+    }
   });
 
   test("returns a non-500 response for malformed EPUB archives", async () => {
@@ -725,6 +1059,73 @@ describe("file and reader endpoints", () => {
     const pdfPage = await fetch(`${baseUrl}${pdf.pages[0]?.href}`);
     expect(pdfPage.status).toBe(200);
     expect(pdfPage.headers.get("content-type")).toContain("image/png");
+  }, TEST_TIMEOUT);
+
+  test("reuses lazy manifests on disk and recovers corrupt cache metadata", async () => {
+    await fetch(`${baseUrl}/api/books/1/pages/CBZ/manifest`);
+    const metaPath = join(
+      homePath, ".config", "caliber", "page-cache",
+      `${Bun.hash(libraryPath).toString(36)}-1`, "CBZ", ".caliber-page-cache.json",
+    );
+    const original = readFileSync(metaPath, "utf8");
+    const meta = JSON.parse(original) as { pages: { name: string; fileName: string }[] };
+    const firstPage = meta.pages[0];
+    if (!firstPage) throw new Error("Fixture manifest has no pages");
+    firstPage.name = "Persisted lazy page";
+    // A new process has no in-memory metadata. Missing materialized bytes
+    // must not force it to discard a perfectly valid lazy manifest.
+    rmSync(join(metaPath, "..", firstPage.fileName), { force: true });
+    const readManifest = async () => {
+      const workerProcess = Bun.spawn([
+        process.execPath, "-e",
+        'import { initFTS } from "./src/lib/calibre-optimized"; import { getPageManifest } from "./src/lib/page-streaming"; initFTS(); console.log(JSON.stringify(await getPageManifest(1, "CBZ")));',
+      ], {
+        cwd: process.cwd(),
+        env: childEnv({
+          CALIBRE_LIBRARY_PATH: libraryPath,
+          CALIBER_CONFIG_DIR: join(homePath, ".config", "caliber"),
+          CALIBER_DB_REFRESH_INTERVAL_MS: "0",
+        }),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(workerProcess.stdout).text(), new Response(workerProcess.stderr).text(), workerProcess.exited,
+      ]);
+      if (exitCode !== 0) throw new Error(stderr);
+      return JSON.parse(stdout) as { pages: { name: string }[]; pageCount: number };
+    };
+    try {
+      writeFileSync(metaPath, JSON.stringify(meta));
+      expect((await readManifest()).pages[0]?.name).toBe("Persisted lazy page");
+      writeFileSync(metaPath, JSON.stringify({ ...meta, pages: null }));
+      const rebuilt = await readManifest();
+      expect(rebuilt.pageCount).toBe(2);
+      expect(rebuilt.pages[0]?.name).toBe("001.png");
+    } finally {
+      writeFileSync(metaPath, original);
+    }
+  }, TEST_TIMEOUT);
+
+  test("regenerates comic pages after cache eviction", async () => {
+    for (const format of ["CBZ", "CBR"]) {
+      const manifest = await fetch(`${baseUrl}/api/books/1/pages/${format}/manifest`);
+      expect(manifest.status).toBe(200);
+      const cacheDir = join(
+        homePath, ".config", "caliber", "page-cache",
+        `${Bun.hash(libraryPath).toString(36)}-1`, format,
+      );
+      const meta = JSON.parse(readFileSync(join(cacheDir, ".caliber-page-cache.json"), "utf8")) as {
+        pages: { fileName: string }[];
+      };
+      const firstPage = meta.pages[0];
+      if (!firstPage) throw new Error("Fixture manifest has no pages");
+      rmSync(join(cacheDir, firstPage.fileName), { force: true });
+      const regenerated = await fetch(`${baseUrl}/api/books/1/pages/${format}/1`);
+      expect(regenerated.status).toBe(200);
+      expect(regenerated.headers.get("content-type")).toMatch(/^image\//);
+      expect((await regenerated.arrayBuffer()).byteLength).toBeGreaterThan(0);
+    }
   }, TEST_TIMEOUT);
 });
 
@@ -804,13 +1205,7 @@ describe("format variant fixtures", () => {
     const coverBytes = new Uint8Array(await cover.arrayBuffer());
     expect(coverBytes.byteLength).toBeGreaterThan(0);
 
-    // Retry on 500: a request racing server warmup can hit the catch-all
-    // before the snapshot is fully published.
-    let thumb = await fetch(`${baseUrl}/api/books/1/thumb?size=small`);
-    for (let attempt = 0; attempt < 4 && thumb.status === 500; attempt += 1) {
-      await Bun.sleep(250);
-      thumb = await fetch(`${baseUrl}/api/books/1/thumb?size=small`);
-    }
+    const thumb = await fetch(`${baseUrl}/api/books/1/thumb?size=small`);
     expect(thumb.status).toBe(200);
     expect(thumb.headers.get("content-type")).toContain("image/jpeg");
     const degraded = thumb.headers.get("x-thumbnail-degraded");

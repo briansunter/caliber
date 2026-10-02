@@ -55,6 +55,12 @@ import {
   getSafeBookFilename,
 } from "./lib/book-files";
 import { EpubCacheError, getEpubEntryPath } from "./lib/epub-cache";
+import { fileEntityTag, matchesEntityTag, serveLocalFile } from "./lib/file-response";
+import {
+  MAX_REQUEST_BODY_BYTES,
+  readRequestJson,
+  RequestBodyTooLargeError,
+} from "./lib/request-body";
 import { getPageFile, getPageManifest, PageStreamingError } from "./lib/page-streaming";
 import { handleMCPRequest } from "./mcp";
 import {
@@ -271,7 +277,7 @@ async function handleProgressWrite(
   libraryId: string,
   book: { formats: string[] },
 ): Promise<Response> {
-  const rawBody = await readJsonBodyOr400(req);
+  const rawBody = await readJsonBodyOrError(req);
   if (rawBody instanceof Response) return rawBody;
   if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
     return Response.json({ error: "Request body must be an object" }, { status: 400 });
@@ -385,12 +391,13 @@ class LRUCache<K extends string, V extends { data: string }> {
   }
 
   set(key: K, value: V): void {
-    const incoming = value.data.length;
+    const incoming = Buffer.byteLength(value.data);
     const existing = this.cache.get(key);
     if (existing !== undefined) {
-      this.totalBytes -= existing.data.length;
+      this.totalBytes -= Buffer.byteLength(existing.data);
       this.cache.delete(key);
     }
+    if (incoming > this.maxBytes) return;
     while (
       this.cache.size > 0 &&
       (this.cache.size >= this.maxSize || this.totalBytes + incoming > this.maxBytes)
@@ -398,7 +405,7 @@ class LRUCache<K extends string, V extends { data: string }> {
       const firstKey = this.cache.keys().next().value;
       if (firstKey === undefined) break;
       const evicted = this.cache.get(firstKey);
-      if (evicted !== undefined) this.totalBytes -= evicted.data.length;
+      if (evicted !== undefined) this.totalBytes -= Buffer.byteLength(evicted.data);
       this.cache.delete(firstKey);
     }
     this.cache.set(key, value);
@@ -472,7 +479,7 @@ function getCachedResponse(
 
   if (cached && now - cached.timestamp < CACHE_TTL) {
     const ifNoneMatch = req.headers.get("If-None-Match");
-    if (ifNoneMatch === cached.etag) {
+    if (matchesEntityTag(ifNoneMatch, cached.etag)) {
       return new Response(null, {
         status: 304,
         headers: { ETag: cached.etag, "Cache-Control": cacheControl },
@@ -498,6 +505,12 @@ function getCachedResponse(
   const etag = generateETag(jsonData);
 
   apiCache.set(key, { data: jsonData, etag, timestamp: now });
+  if (matchesEntityTag(req.headers.get("If-None-Match"), etag)) {
+    return new Response(null, {
+      status: 304,
+      headers: { ETag: etag, "Cache-Control": cacheControl },
+    });
+  }
 
   return new Response(jsonData, {
     headers: {
@@ -523,7 +536,7 @@ function getCachedTextResponse(
 
   if (cached && now - cached.timestamp < CACHE_TTL) {
     const ifNoneMatch = req.headers.get("If-None-Match");
-    if (ifNoneMatch === cached.etag) {
+    if (matchesEntityTag(ifNoneMatch, cached.etag)) {
       return new Response(null, {
         status: 304,
         headers: { ETag: cached.etag, "Cache-Control": effectiveControl },
@@ -544,6 +557,12 @@ function getCachedTextResponse(
 
   const etag = generateETag(data);
   apiCache.set(key, { data, etag, timestamp: now });
+  if (matchesEntityTag(req.headers.get("If-None-Match"), etag)) {
+    return new Response(null, {
+      status: 304,
+      headers: { ETag: etag, "Cache-Control": effectiveControl },
+    });
+  }
 
   return new Response(data, {
     headers: {
@@ -632,14 +651,13 @@ function parseBookId(value: string): number | null {
   return Number.isSafeInteger(id) && id > 0 ? id : null;
 }
 
-// Mirrors the 1MB stdio MCP frame limit in mcp-server.ts so both transports
-// accept the same maximum JSON-RPC payload.
-const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
-
-async function readJsonBodyOr400(req: Request): Promise<unknown> {
+async function readJsonBodyOrError(req: Request): Promise<unknown> {
   try {
-    return JSON.parse(await req.text()) as unknown;
-  } catch {
+    return await readRequestJson(req);
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      return Response.json({ error: error.message }, { status: 413 });
+    }
     return Response.json({ error: "Invalid JSON" }, { status: 400 });
   }
 }
@@ -738,148 +756,8 @@ function opdsAcquisitionResponse(
   );
 }
 
-interface ByteRange {
-  start: number;
-  end: number;
-}
-
-function parseByteRange(rangeHeader: string, size: number): ByteRange | null {
-  if (size <= 0 || !rangeHeader.startsWith("bytes=") || rangeHeader.includes(",")) {
-    return null;
-  }
-
-  const range = rangeHeader.slice("bytes=".length);
-  const [startPart, endPart] = range.split("-", 2);
-
-  if (startPart === undefined || endPart === undefined) return null;
-
-  if (startPart === "") {
-    if (!/^\d+$/.test(endPart)) return null;
-    const suffixLength = Number(endPart);
-    if (!Number.isFinite(suffixLength) || suffixLength <= 0) return null;
-
-    return {
-      start: Math.max(size - suffixLength, 0),
-      end: size - 1,
-    };
-  }
-
-  if (!/^\d+$/.test(startPart) || (endPart !== "" && !/^\d+$/.test(endPart))) {
-    return null;
-  }
-  const start = Number(startPart);
-  const end = endPart === "" ? size - 1 : Number(endPart);
-
-  if (
-    !Number.isFinite(start) ||
-    !Number.isFinite(end) ||
-    start < 0 ||
-    end < start ||
-    start >= size
-  ) {
-    return null;
-  }
-
-  return {
-    start,
-    end: Math.min(end, size - 1),
-  };
-}
-
 function contentDisposition(disposition: "attachment" | "inline", filename: string): string {
   return `${disposition}; filename="${filename}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
-}
-
-function ifRangeAllowsRange(ifRange: string | null, etag: string, mtimeMs: number): boolean {
-  if (!ifRange) return true;
-  if (ifRange.startsWith('"') || ifRange.startsWith("W/")) return ifRange === etag;
-
-  const parsed = Date.parse(ifRange);
-  return Number.isFinite(parsed) && Math.floor(mtimeMs / 1000) <= Math.floor(parsed / 1000);
-}
-
-async function serveLocalFile(
-  req: Request,
-  filePath: string,
-  options: {
-    contentType: string;
-    contentDisposition?: string;
-    cacheControl?: string;
-    contentSecurityPolicy?: string;
-  },
-): Promise<Response> {
-  const file = Bun.file(filePath);
-
-  if (!(await file.exists())) {
-    return Response.json({ error: "File not found" }, { status: 404 });
-  }
-
-  const fileStat = await file.stat();
-  const mtimeMs = fileStat.mtime?.getTime() || 0;
-  const lastModified = fileStat.mtime?.toUTCString();
-  const etag = `"${fileStat.size}-${mtimeMs}"`;
-  const includeBody = req.method !== "HEAD";
-  const rangeHeader = req.headers.get("Range");
-  const shouldAttemptRange = Boolean(
-    rangeHeader && ifRangeAllowsRange(req.headers.get("If-Range"), etag, mtimeMs),
-  );
-
-  const baseHeaders = new Headers({
-    "Content-Type": options.contentType,
-    "Cache-Control": options.cacheControl ?? "no-cache",
-    "Accept-Ranges": "bytes",
-    "X-Content-Type-Options": "nosniff",
-    ETag: etag,
-  });
-  if (lastModified) baseHeaders.set("Last-Modified", lastModified);
-  if (options.contentDisposition) {
-    baseHeaders.set("Content-Disposition", options.contentDisposition);
-  }
-  if (options.contentSecurityPolicy) {
-    baseHeaders.set("Content-Security-Policy", options.contentSecurityPolicy);
-  }
-
-  const ifNoneMatch = req.headers.get("If-None-Match");
-  if (!rangeHeader && ifNoneMatch === etag) {
-    return new Response(null, { status: 304, headers: baseHeaders });
-  }
-
-  if (shouldAttemptRange && rangeHeader) {
-    const range = parseByteRange(rangeHeader, fileStat.size);
-
-    if (!range) {
-      return new Response(null, {
-        status: 416,
-        headers: {
-          "Content-Range": `bytes */${fileStat.size}`,
-          "Accept-Ranges": "bytes",
-          "Cache-Control": options.cacheControl ?? "no-cache",
-          ETag: etag,
-        },
-      });
-    }
-
-    const length = range.end - range.start + 1;
-    baseHeaders.set("Content-Range", `bytes ${range.start}-${range.end}/${fileStat.size}`);
-    baseHeaders.set("Content-Length", String(length));
-
-    return new Response(includeBody ? file.slice(range.start, range.end + 1) : null, {
-      status: 206,
-      headers: baseHeaders,
-    });
-  }
-
-  baseHeaders.set("Content-Length", String(fileStat.size));
-
-  // Bun.serve auto-slices any BunFile body when the request carries a Range
-  // header — ignoring If-Range entirely. When the range was denied (stale
-  // If-Range), buffer the body so the runtime cannot re-slice it into a 206.
-  // This path only triggers on Range + failed If-Range, so the extra copy
-  // stays off the hot path.
-  const rangeDenied =
-    Boolean(rangeHeader) && !ifRangeAllowsRange(req.headers.get("If-Range"), etag, mtimeMs);
-  const body = !includeBody ? null : rangeDenied ? await file.arrayBuffer() : file;
-  return new Response(body, { headers: baseHeaders });
 }
 
 async function serveBookFile(
@@ -898,12 +776,8 @@ async function serveBookFile(
     return Response.json({ error: `Format ${format} not found` }, { status: 404 });
   }
 
-  const file = Bun.file(filePath);
-
-  if (!(await file.exists())) {
-    return Response.json({ error: "File not found" }, { status: 404 });
-  }
-
+  // Capture the title with the path before awaiting file I/O: a library
+  // switch during exists/stat must not mix another catalog's filename in.
   const title = getBookTitle(id);
   const filename = getSafeBookFilename(title, format);
   const contentType = getFormatContentType(format);
@@ -973,10 +847,10 @@ async function serveCoverById(req: Request, id: number): Promise<Response> {
   }
 
   const fileStat = await file.stat();
-  const etag = `"${fileStat.size}-${fileStat.mtime?.getTime() || 0}"`;
+  const etag = fileEntityTag(coverPath, fileStat.size, fileStat.mtime?.getTime() || 0);
 
   const ifNoneMatch = req.headers.get("If-None-Match");
-  if (ifNoneMatch === etag) {
+  if (matchesEntityTag(ifNoneMatch, etag)) {
     return new Response(null, {
       status: 304,
       headers: {
@@ -1012,12 +886,12 @@ async function serveThumbById(req: Request, id: number): Promise<Response> {
   // Revision key over (library, cover size, cover mtime).
   const fileStat = await coverFile.stat();
   const mtimeMs = fileStat.mtime?.getTime() || 0;
-  const sig = Bun.hash(`${LIBRARY_PATH}:${fileStat.size}:${mtimeMs}`).toString(36);
+  const sig = Bun.hash(`${coverPath}:${fileStat.size}:${mtimeMs}`).toString(36);
   const etag = `"t${size}-${sig}"`;
   const cacheControl = coverCacheControlFor(req);
 
   const ifNoneMatch = req.headers.get("If-None-Match");
-  if (ifNoneMatch === etag) {
+  if (matchesEntityTag(ifNoneMatch, etag)) {
     return new Response(null, {
       status: 304,
       headers: { ETag: etag, "Cache-Control": cacheControl },
@@ -1026,12 +900,12 @@ async function serveThumbById(req: Request, id: number): Promise<Response> {
 
   const thumbDir = join(WORK_DIR, "thumbs");
   const thumbPath = join(thumbDir, `${id}-${size}-${sig}.jpg`);
-  const thumbFile = Bun.file(thumbPath);
+  let thumbFile = Bun.file(thumbPath);
 
   if (!(await thumbFile.exists())) {
     let resizeUnavailable = false;
     await runThumbJob(async () => {
-      if (await thumbFile.exists()) return;
+      if (await Bun.file(thumbPath).exists()) return;
       const { mkdir } = await import("node:fs/promises");
       await mkdir(thumbDir, { recursive: true });
       const original = new Uint8Array(await coverFile.arrayBuffer());
@@ -1042,6 +916,9 @@ async function serveThumbById(req: Request, id: number): Promise<Response> {
       }
       await Bun.write(thumbPath, resized);
     });
+    // BunFile retains a missing stat result; refresh after another job (or
+    // this one) publishes so the first uncached request serves the new file.
+    thumbFile = Bun.file(thumbPath);
     if (resizeUnavailable && !(await thumbFile.exists())) {
       // Resize pipeline unavailable (e.g. Bun without image support):
       // degrade to the original cover bytes with a 200 + marker header so
@@ -1346,7 +1223,7 @@ const routes: RouteTable = {
           { status: 403, headers: { "Cache-Control": "no-store" } },
         );
       }
-      const rawBody = await readJsonBodyOr400(req);
+      const rawBody = await readJsonBodyOrError(req);
       if (rawBody instanceof Response) return rawBody;
       if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
         return Response.json({ error: "Request body must be an object" }, { status: 400 });
@@ -1367,7 +1244,7 @@ const routes: RouteTable = {
         libraryReady = true;
         apiCache.clear();
         return Response.json(
-          { ...status, ready: libraryReady, applied: true },
+          { ...status, libraryId: resolveLibraryId(), ready: libraryReady, applied: true },
           { headers: { "Cache-Control": "no-store" } },
         );
       } catch (error) {
@@ -1422,7 +1299,7 @@ const routes: RouteTable = {
         );
       }
 
-      const rawBody = await readJsonBodyOr400(req);
+      const rawBody = await readJsonBodyOrError(req);
       if (rawBody instanceof Response) return rawBody;
       if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
         return Response.json({ error: "Request body must be an object" }, { status: 400 });
@@ -1515,7 +1392,7 @@ const routes: RouteTable = {
         );
       }
 
-      const rawBody = await readJsonBodyOr400(req);
+      const rawBody = await readJsonBodyOrError(req);
       if (rawBody instanceof Response) return rawBody;
       if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
         return Response.json({ error: "Request body must be an object" }, { status: 400 });
@@ -1601,7 +1478,7 @@ const routes: RouteTable = {
         return Response.json({ error: "User not found" }, { status: 404 });
       }
 
-      const rawBody = await readJsonBodyOr400(req);
+      const rawBody = await readJsonBodyOrError(req);
       if (rawBody instanceof Response) return rawBody;
       if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
         return Response.json({ error: "Request body must be an object" }, { status: 400 });
@@ -1674,7 +1551,7 @@ const routes: RouteTable = {
   // reading progress.
   "/api/user/login": {
     POST: async (req) => {
-      const rawBody = await readJsonBodyOr400(req);
+      const rawBody = await readJsonBodyOrError(req);
       if (rawBody instanceof Response) return rawBody;
       if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
         return Response.json({ error: "Request body must be an object" }, { status: 400 });
@@ -1701,7 +1578,16 @@ const routes: RouteTable = {
           );
         }
         purgeExpiredSessions();
-        const session = createSessionToken(user.id);
+        let session: ReturnType<typeof createSessionToken>;
+        try {
+          session = createSessionToken(user.id, user.authEpoch);
+        } catch (error) {
+          if (!(error instanceof PasswordError)) throw error;
+          return Response.json(
+            { error: error.message },
+            { status: 401, headers: { "Cache-Control": "no-store" } },
+          );
+        }
         return Response.json(
           { user: publicUser(user) },
           {
@@ -1758,7 +1644,7 @@ const routes: RouteTable = {
           );
         }
 
-        const rawBody = await readJsonBodyOr400(req);
+        const rawBody = await readJsonBodyOrError(req);
         if (rawBody instanceof Response) return rawBody;
         if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
           return Response.json({ error: "Request body must be an object" }, { status: 400 });
@@ -1887,6 +1773,7 @@ const routes: RouteTable = {
           },
           progress: {
             format: row.format,
+            location: row.location,
             percentage: row.percentage,
             finished: row.finished,
             updatedAt: row.updatedAt,
@@ -3079,7 +2966,7 @@ function hostValidationErrorResponse(): Response {
 function withHostValidation(routeTable: Record<string, unknown>): Record<string, unknown> {
   const validated: Record<string, unknown> = {};
   for (const [pattern, route] of Object.entries(routeTable)) {
-    if (typeof route !== "object" || route === null || pattern === "/*") {
+    if (typeof route !== "object" || route === null || route === index) {
       validated[pattern] = route;
       continue;
     }
@@ -3155,12 +3042,81 @@ function withAuthGuard(routeTable: RouteTable): Record<string, unknown> {
   return guarded;
 }
 
+// Packaged launches serve the split frontend by default without changing
+// NODE_ENV: server configuration (including cookie defaults) stays intact.
+const productionFrontend =
+  process.env.NODE_ENV === "production" ||
+  (process.env.CALIBER_LAUNCHER_REEXEC === "1" &&
+    process.env.NODE_ENV !== "development" &&
+    process.env.NODE_ENV !== "test");
+let serverRoutes = routes;
+if (productionFrontend) {
+  const { buildProductionFrontend } = await import("./lib/frontend-assets");
+  const frontend = await buildProductionFrontend();
+  const frontendResponse = (
+    req: Request,
+    body: string | Blob,
+    etag: string,
+    contentType: string,
+    cacheControl: string,
+  ) => {
+    const headers = new Headers({
+      "Content-Type": contentType,
+      "Cache-Control": cacheControl,
+      "X-Content-Type-Options": "nosniff",
+      ETag: etag,
+    });
+    if (matchesEntityTag(req.headers.get("If-None-Match"), etag)) {
+      return new Response(null, { status: 304, headers });
+    }
+    headers.set(
+      "Content-Length",
+      String(typeof body === "string" ? Buffer.byteLength(body) : body.size),
+    );
+    return new Response(req.method === "HEAD" ? null : body, { headers });
+  };
+  const serveFrontend: RouteHandler = async (req) => {
+    const pathname = new URL(req.url).pathname;
+    // Missing backend routes and missing chunk/assets must not masquerade as
+    // HTML. Preserve auth challenges for protected namespaces on this fallback.
+    if (isAuthProtectedPattern(pathname)) {
+      if (AUTH_ENABLED && !PUBLIC_AUTH_PATHS.has(pathname)) {
+        const authenticated = await authenticateRequest(req);
+        if (!authenticated) return unauthorizedResponse(pathname);
+      }
+      return Response.json({ error: "Not found" }, { status: 404 });
+    }
+    if (/\.[a-z0-9]{1,10}$/i.test(pathname) || pathname.startsWith("/chunk-")) {
+      return Response.json({ error: "Asset not found" }, { status: 404 });
+    }
+    return frontendResponse(
+      req,
+      frontend.html,
+      frontend.htmlEtag,
+      "text/html; charset=utf-8",
+      "no-cache",
+    );
+  };
+  serverRoutes = { ...routes, "/*": { GET: serveFrontend, HEAD: serveFrontend } };
+  for (const [pathname, asset] of frontend.assets) {
+    const handler: RouteHandler = (req) =>
+      frontendResponse(
+        req,
+        asset.blob,
+        asset.etag,
+        asset.type,
+        "public, max-age=31536000, immutable",
+      );
+    serverRoutes[pathname] = { GET: handler, HEAD: handler };
+  }
+}
+
 const server = serve({
   hostname: HOST,
   port: parseBoundedInt(PORT, DEFAULT_PORT, { min: 1, max: 65535 }),
   maxRequestBodySize: MAX_REQUEST_BODY_BYTES,
-  routes: withHostValidation(withAuthGuard(routes)) as typeof routes,
-  development: process.env.NODE_ENV !== "production" && {
+  routes: withHostValidation(withAuthGuard(serverRoutes)) as typeof routes,
+  development: !productionFrontend && {
     hmr: true,
     console: true,
   },

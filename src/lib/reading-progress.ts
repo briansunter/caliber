@@ -29,6 +29,7 @@ export interface ReadingListItem {
   book: ReadingListBook;
   progress: {
     format: string;
+    location?: string | null;
     percentage: number;
     finished: boolean;
     updatedAt: number;
@@ -44,6 +45,8 @@ export type ReadingSort = "recent" | "title" | "progress";
 // surfaced (the server only accepts canonical `lib-<hash>` ids, so a path
 // would 409 every write).
 const LIB_SCOPE_KEY = "caliber-library-id";
+let runtimeLibraryScope: string | null = null;
+let lastObservedStoredScope: string | null | undefined;
 
 function isPathLikeLibraryId(value: string): boolean {
   return value.includes("/");
@@ -60,10 +63,23 @@ function readStoredScopeRaw(): string | null {
 
 export function getLibraryScopeId(): string {
   const stored = readStoredScopeRaw();
-  if (!stored) return "default";
-  // Never send a path as the scope/expectedLibraryId.
-  if (isPathLikeLibraryId(stored)) return "default";
-  return stored;
+  if (stored && !isPathLikeLibraryId(stored) && stored !== lastObservedStoredScope) {
+    runtimeLibraryScope = stored;
+    lastObservedStoredScope = stored;
+  }
+  return runtimeLibraryScope ?? "default";
+}
+
+export function setLibraryScopeId(value: string): void {
+  const scope = value.trim().slice(0, 200);
+  if (!scope || isPathLikeLibraryId(scope)) return;
+  runtimeLibraryScope = scope;
+  try {
+    localStorage.setItem(LIB_SCOPE_KEY, scope);
+  } catch {}
+  // Retain the server's canonical scope if storage is blocked or still holds
+  // an older value because a quota error prevented the write.
+  lastObservedStoredScope = readStoredScopeRaw();
 }
 
 export function progressPosKey(bookId: number, kind: string): string {
@@ -75,13 +91,21 @@ export function legacyPosKey(bookId: number, kind: string): string {
   return `caliber-pos-${bookId}-${kind}`;
 }
 
-export function readScopedPos<T>(bookId: number, kind: string, fallback: T): T {
+export function readScopedPos<T extends object>(bookId: number, kind: string, fallback: T): T {
   try {
     if (typeof localStorage === "undefined") return fallback;
     const scoped = localStorage.getItem(progressPosKey(bookId, kind));
-    if (scoped) return JSON.parse(scoped) as T;
+    if (scoped) {
+      const parsed: unknown = JSON.parse(scoped);
+      return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+        ? (parsed as T)
+        : fallback;
+    }
     const legacy = localStorage.getItem(legacyPosKey(bookId, kind));
-    return legacy ? (JSON.parse(legacy) as T) : fallback;
+    const parsed: unknown = legacy ? JSON.parse(legacy) : null;
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as T)
+      : fallback;
   } catch {
     return fallback;
   }
@@ -132,12 +156,15 @@ function migrateOutboxToScope(canonical: string, serverPath: string): void {
 }
 
 let libScopeRefreshPromise: Promise<string | null> | null = null;
+let libScopeRefreshEpoch = 0;
 export function refreshLibraryScopeId(): Promise<string | null> {
   if (typeof window === "undefined") return Promise.resolve(null);
   if (libScopeRefreshPromise) return libScopeRefreshPromise;
+  const epoch = libScopeRefreshEpoch;
   libScopeRefreshPromise = fetch("/api/config/library", { headers: { Accept: "application/json" } })
     .then((res) => (res.ok ? res.json() : null))
     .then((data: { libraryId?: unknown; libraryPath?: unknown } | null) => {
+      if (epoch !== libScopeRefreshEpoch) return null;
       const rawId = typeof data?.libraryId === "string" ? data.libraryId.trim() : "";
       // No canonical id (unreachable/legacy server): leave the stored scope
       // alone; getLibraryScopeId keeps returning "default", never a path.
@@ -154,8 +181,8 @@ export function refreshLibraryScopeId(): Promise<string | null> {
         ) {
           console.info("[reading-progress] replacing legacy path library scope with canonical id");
         }
-        localStorage.setItem(LIB_SCOPE_KEY, canonical);
       } catch {}
+      setLibraryScopeId(canonical);
       // Adopt queued checkpoints into the resolved scope (runs on every
       // successful refresh: pre-resolution captures land here as placeholders).
       migrateOutboxToScope(canonical, serverPath);
@@ -174,7 +201,7 @@ export function refreshLibraryScopeId(): Promise<string | null> {
     })
     .catch(() => null)
     .finally(() => {
-      libScopeRefreshPromise = null;
+      if (epoch === libScopeRefreshEpoch) libScopeRefreshPromise = null;
     });
   return libScopeRefreshPromise;
 }
@@ -191,25 +218,36 @@ export async function fetchBookProgress(
   bookId: number,
   format: ProgressFormat,
 ): Promise<ProgressRecord | null> {
+  const userId = lastKnownUserId;
+  const libraryId = getLibraryScopeId();
+  const generation = outboxGeneration;
   try {
     const res = await fetchJson<{
       progress: ProgressRecord | null;
       serverSeq?: unknown;
       deletionSeq?: unknown;
     }>(`/api/user/progress/${bookId}?format=${encodeURIComponent(format)}`);
+    // A request begun before an account/library switch must never seed the
+    // new identity's revision cache or restore the previous user's location.
+    if (
+      generation !== outboxGeneration ||
+      userId !== lastKnownUserId ||
+      libraryId !== getLibraryScopeId()
+    )
+      return null;
     const progress = res.progress ?? null;
     // S2: persist last known server_seq per identity for baseRevision.
     const seq =
       serverSeqOfProgress(progress) ?? (typeof res.serverSeq === "number" ? res.serverSeq : null);
     if (progress && seq !== null) {
-      setKnownServerSeq(lastKnownUserId, getLibraryScopeId(), bookId, format, seq);
+      setKnownServerSeq(userId, libraryId, bookId, format, seq);
     }
     // T5: persist last known deletion generation for baseDeletionSeq. A
     // fresh value (seen via re-read after a DELETE/clear) lets an
     // intentional post-deletion write resurrect; stale/absent is rejected.
     const delSeq = typeof res.deletionSeq === "number" ? Math.floor(res.deletionSeq) : null;
     if (delSeq !== null && Number.isFinite(delSeq)) {
-      setKnownDeletionSeq(lastKnownUserId, getLibraryScopeId(), bookId, format, delSeq);
+      setKnownDeletionSeq(userId, libraryId, bookId, format, delSeq);
     }
     return progress;
   } catch {
@@ -470,6 +508,22 @@ function writeTombstones(map: TombstoneMap): void {
   } catch {}
 }
 
+function rollbackTombstone(
+  key: string,
+  writtenAt: number | undefined,
+  previous: TombstoneMap | null,
+): void {
+  if (writtenAt === undefined || !previous) return;
+  const current = readTombstones();
+  // Another deletion may have arrived while the failed request was pending.
+  // Only undo this mutation's marker, preserving every other identity.
+  if (current[key] !== writtenAt) return;
+  const prev = previous[key];
+  if (prev === undefined) delete current[key];
+  else current[key] = prev;
+  writeTombstones(current);
+}
+
 function bookTombstoneKey(userId: number | null, libraryId: string, bookId: number): string {
   return `${userId ?? "anon"}:${libraryId}:${bookId}:*`;
 }
@@ -533,6 +587,7 @@ export function recordProgressDeletion(
   // predate the deletion; newer ops (created after) may resurrect.
   for (const [id, op] of [...pending]) {
     if (id !== bookId) continue;
+    if (op.userId !== userId || op.libraryId !== libraryId) continue;
     if (format && op.data.format !== format) continue;
     if (op.ts < now) {
       pending.delete(id);
@@ -1002,11 +1057,14 @@ if (typeof window !== "undefined") {
   // Library-switch events (e.g. after PUT /api/config/library elsewhere):
   // re-resolve the canonical scope; a changed scope migrates + drains.
   window.addEventListener("caliber:library-changed", () => {
+    libScopeRefreshEpoch += 1;
+    libScopeRefreshPromise = null;
     void refreshLibraryScopeId();
   });
   // Seed the principal, then drain only entries that match the established
   // principal+library (no blind auto-drain of foreign entries).
   void (async () => {
+    const generation = outboxGeneration;
     // Resolve the canonical library scope BEFORE the first drain so queued
     // checkpoints capture (and replay under) the server's library id.
     try {
@@ -1014,6 +1072,7 @@ if (typeof window !== "undefined") {
     } catch {}
     try {
       const me = await fetchJson<{ user: { id: number } | null }>("/api/user/me");
+      if (generation !== outboxGeneration) return;
       if (typeof me?.user?.id === "number") {
         setOutboxPrincipal(me.user.id);
       }
@@ -1529,9 +1588,16 @@ export function useRemoveFromReadingList() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (bookId: number) =>
-      fetchJson<{ removed: boolean }>(`/api/user/progress/${bookId}`, { method: "DELETE" }),
+      fetchJson<{ removed: boolean; deletionSeq?: number | null }>(`/api/user/progress/${bookId}`, {
+        method: "DELETE",
+      }),
     onMutate: async (bookId: number) => {
+      const userId = lastKnownUserId;
+      const libraryId = getLibraryScopeId();
       await qc.cancelQueries({ queryKey: ["reading-list"] });
+      if (userId !== lastKnownUserId || libraryId !== getLibraryScopeId()) {
+        throw new Error("The active account or library changed");
+      }
       const prev = qc.getQueryData<{ items: ReadingListItem[] }>(["reading-list"]);
       // S4: record the tombstone + cancel queued ops BEFORE the DELETE
       // resolves, so a concurrent flush cannot resurrect with a stale op.
@@ -1549,21 +1615,61 @@ export function useRemoveFromReadingList() {
         prevTombstones = null;
       }
       try {
-        recordProgressDeletion(lastKnownUserId, getLibraryScopeId(), bookId);
+        recordProgressDeletion(userId, libraryId, bookId);
       } catch {}
+      const tombstoneKey = bookTombstoneKey(userId, libraryId, bookId);
+      const tombstoneTs = readTombstones()[tombstoneKey];
       if (prev) {
         qc.setQueryData(["reading-list"], {
           items: prev.items.filter((i) => i.book.id !== bookId),
         });
       }
-      return { prev, prevOutbox, prevPending, prevTombstones };
+      return {
+        prev,
+        prevOutbox,
+        prevPending,
+        prevTombstones,
+        userId,
+        libraryId,
+        tombstoneKey,
+        tombstoneTs,
+      };
+    },
+    onSuccess: (result, bookId, ctx) => {
+      if (!ctx || ctx.userId !== lastKnownUserId || ctx.libraryId !== getLibraryScopeId()) return;
+      // Undo is an intentional write after this deletion. Acknowledge the
+      // returned generation before the UI's success callback can re-save it.
+      for (const format of ["EPUB", "PDF", "CBZ", "CBR"]) {
+        setKnownDeletionSeq(ctx.userId, ctx.libraryId, bookId, format, result.deletionSeq);
+      }
     },
     onError: (_e, _id, ctx) => {
-      if (ctx?.prev) qc.setQueryData(["reading-list"], ctx.prev);
+      if (!ctx || ctx.userId !== lastKnownUserId || ctx.libraryId !== getLibraryScopeId()) return;
+      if (ctx.prev) {
+        const previousItems = ctx.prev.items;
+        qc.setQueryData<{ items: ReadingListItem[] }>(["reading-list"], (current) => {
+          const items = current?.items ?? [];
+          if (items.some((item) => item.book.id === _id)) return current;
+          return { items: [...items, ...previousItems.filter((item) => item.book.id === _id)] };
+        });
+      }
       try {
-        if (ctx?.prevOutbox) writeOutbox(ctx.prevOutbox);
-        if (ctx?.prevTombstones) writeTombstones(ctx.prevTombstones);
-        if (ctx?.prevPending) {
+        if (ctx.prevOutbox) {
+          const current = readOutbox();
+          const seen = new Set(current.map((entry) => entry.mutationId));
+          writeOutbox([
+            ...current,
+            ...ctx.prevOutbox.filter(
+              (entry) =>
+                entry.userId === ctx.userId &&
+                entry.libraryId === ctx.libraryId &&
+                entry.bookId === _id &&
+                !seen.has(entry.mutationId),
+            ),
+          ]);
+        }
+        rollbackTombstone(ctx.tombstoneKey, ctx.tombstoneTs, ctx.prevTombstones);
+        if (ctx.prevPending && !pending.has(_id)) {
           pending.set(_id, ctx.prevPending);
           if (!timers.has(_id)) {
             timers.set(
@@ -1574,7 +1680,8 @@ export function useRemoveFromReadingList() {
         }
       } catch {}
     },
-    onSettled: () => {
+    onSettled: (_result, _error, _id, ctx) => {
+      if (!ctx || ctx.userId !== lastKnownUserId || ctx.libraryId !== getLibraryScopeId()) return;
       qc.invalidateQueries({ queryKey: ["reading-list"] });
     },
   });
@@ -1583,9 +1690,17 @@ export function useRemoveFromReadingList() {
 export function useClearReadingList() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: () => fetchJson<{ removed: number }>("/api/user/reading", { method: "DELETE" }),
+    mutationFn: () =>
+      fetchJson<{ removed: number; deletionSeq?: number | null }>("/api/user/reading", {
+        method: "DELETE",
+      }),
     onMutate: async () => {
+      const userId = lastKnownUserId;
+      const libraryId = getLibraryScopeId();
       await qc.cancelQueries({ queryKey: ["reading-list"] });
+      if (userId !== lastKnownUserId || libraryId !== getLibraryScopeId()) {
+        throw new Error("The active account or library changed");
+      }
       const prev = qc.getQueryData<{ items: ReadingListItem[] }>(["reading-list"]);
       // S4: library-level tombstone; same resurrection policy as above.
       // T5 optimistic rollback: snapshot outbox + pending + tombstones.
@@ -1598,16 +1713,55 @@ export function useClearReadingList() {
         prevTombstones = null;
       }
       try {
-        recordReadingListClear(lastKnownUserId, getLibraryScopeId());
+        recordReadingListClear(userId, libraryId);
       } catch {}
+      const tombstoneKey = libraryTombstoneKey(userId, libraryId);
+      const tombstoneTs = readTombstones()[tombstoneKey];
       qc.setQueryData(["reading-list"], { items: [] });
-      return { prev, prevOutbox, prevPending, prevTombstones };
+      return {
+        prev,
+        prevOutbox,
+        prevPending,
+        prevTombstones,
+        userId,
+        libraryId,
+        tombstoneKey,
+        tombstoneTs,
+      };
+    },
+    onSuccess: (result, _variables, ctx) => {
+      if (!ctx || ctx.userId !== lastKnownUserId || ctx.libraryId !== getLibraryScopeId()) return;
+      for (const item of ctx.prev?.items ?? []) {
+        for (const format of ["EPUB", "PDF", "CBZ", "CBR"]) {
+          setKnownDeletionSeq(ctx.userId, ctx.libraryId, item.book.id, format, result.deletionSeq);
+        }
+      }
     },
     onError: (_e, _v, ctx) => {
-      if (ctx?.prev) qc.setQueryData(["reading-list"], ctx.prev);
+      if (!ctx || ctx.userId !== lastKnownUserId || ctx.libraryId !== getLibraryScopeId()) return;
+      if (ctx.prev) {
+        const previousItems = ctx.prev.items;
+        qc.setQueryData<{ items: ReadingListItem[] }>(["reading-list"], (current) => {
+          const items = current?.items ?? [];
+          const seen = new Set(items.map((item) => item.book.id));
+          return { items: [...items, ...previousItems.filter((item) => !seen.has(item.book.id))] };
+        });
+      }
       try {
-        if (ctx?.prevOutbox) writeOutbox(ctx.prevOutbox);
-        if (ctx?.prevTombstones) writeTombstones(ctx.prevTombstones);
+        if (ctx.prevOutbox) {
+          const current = readOutbox();
+          const seen = new Set(current.map((entry) => entry.mutationId));
+          writeOutbox([
+            ...current,
+            ...ctx.prevOutbox.filter(
+              (entry) =>
+                entry.userId === ctx.userId &&
+                entry.libraryId === ctx.libraryId &&
+                !seen.has(entry.mutationId),
+            ),
+          ]);
+        }
+        rollbackTombstone(ctx.tombstoneKey, ctx.tombstoneTs, ctx.prevTombstones);
         if (ctx?.prevPending) {
           for (const [id, op] of ctx.prevPending) {
             if (!pending.has(id)) {
@@ -1623,7 +1777,8 @@ export function useClearReadingList() {
         }
       } catch {}
     },
-    onSettled: () => {
+    onSettled: (_result, _error, _variables, ctx) => {
+      if (!ctx || ctx.userId !== lastKnownUserId || ctx.libraryId !== getLibraryScopeId()) return;
       qc.invalidateQueries({ queryKey: ["reading-list"] });
     },
   });

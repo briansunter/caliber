@@ -7,6 +7,7 @@ import { useCallback, useEffect, useState } from "react";
 interface FullscreenDocument extends Document {
   webkitFullscreenElement?: Element | null;
   webkitExitFullscreen?: () => Promise<void> | void;
+  webkitFullscreenEnabled?: boolean;
 }
 
 interface FullscreenElement extends HTMLElement {
@@ -14,6 +15,7 @@ interface FullscreenElement extends HTMLElement {
 }
 
 function activeFullscreenElement(): Element | null {
+  if (typeof document === "undefined") return null;
   const doc = document as FullscreenDocument;
   return document.fullscreenElement ?? doc.webkitFullscreenElement ?? null;
 }
@@ -21,7 +23,11 @@ function activeFullscreenElement(): Element | null {
 function isFullscreenSupported(): boolean {
   if (typeof document === "undefined") return false;
   const el = document.documentElement as FullscreenElement;
-  return Boolean(el.requestFullscreen || el.webkitRequestFullscreen);
+  const doc = document as FullscreenDocument;
+  return Boolean(
+    (typeof el.requestFullscreen === "function" && document.fullscreenEnabled !== false) ||
+      (typeof el.webkitRequestFullscreen === "function" && doc.webkitFullscreenEnabled !== false),
+  );
 }
 
 function run(fn?: () => Promise<void> | void): void {
@@ -39,6 +45,7 @@ export function useFullscreen(): {
   const [isFullscreen, setIsFullscreen] = useState(() => Boolean(activeFullscreenElement()));
 
   useEffect(() => {
+    if (typeof document === "undefined") return;
     const onChange = () => setIsFullscreen(Boolean(activeFullscreenElement()));
     document.addEventListener("fullscreenchange", onChange);
     document.addEventListener("webkitfullscreenchange", onChange);
@@ -49,6 +56,7 @@ export function useFullscreen(): {
   }, []);
 
   const toggle = useCallback(() => {
+    if (!isFullscreenSupported()) return;
     const doc = document as FullscreenDocument;
     if (activeFullscreenElement()) {
       run(document.exitFullscreen?.bind(document) ?? doc.webkitExitFullscreen?.bind(doc));

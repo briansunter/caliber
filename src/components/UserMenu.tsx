@@ -1,6 +1,8 @@
-import { useEffect, useRef, useState } from "react";
-import { User as UserIcon, LogOut, Check } from "lucide-react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { User as UserIcon, LogOut, ArrowRight, Loader2, ChevronDown } from "lucide-react";
 import { useCurrentUser, useLogin, useLogout } from "@/lib/user";
+import { HttpError } from "@/lib/http";
+import { useDialogFocusTrap } from "./ReaderChrome";
 
 export function UserMenu() {
   const { user, isLoading } = useCurrentUser();
@@ -10,104 +12,146 @@ export function UserMenu() {
   const [name, setName] = useState("");
   const containerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const dialogId = useId();
+  const usernameId = useId();
+  const close = useCallback(() => setOpen(false), []);
+  useDialogFocusTrap(open, panelRef, close, triggerRef);
 
   useEffect(() => {
     if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
+    const onDown = (event: PointerEvent) => {
+      if (event.target instanceof Node && !containerRef.current?.contains(event.target)) close();
     };
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [open]);
+    document.addEventListener("pointerdown", onDown);
+    return () => document.removeEventListener("pointerdown", onDown);
+  }, [open, close]);
 
   useEffect(() => {
     if (open && !user) inputRef.current?.focus();
   }, [open, user]);
 
-  const submit = (e: React.FormEvent) => {
-    e.preventDefault();
+  const submit = (event: React.FormEvent) => {
+    event.preventDefault();
     const trimmed = name.trim();
     if (!trimmed || login.isPending) return;
     login.mutate(trimmed, {
       onSuccess: () => {
         setName("");
-        setOpen(false);
+        close();
       },
     });
   };
+  const mutationError = user ? logout.error : login.error;
 
   return (
     <div ref={containerRef} className="relative">
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-1.5 rounded-lg border border-ink bg-surface px-2.5 py-1.5 text-sm font-medium text-ink hover:bg-parchment-dark transition-colors"
-        aria-label={user ? `Signed in as ${user.username}` : "Sign in"}
-        title={user ? `Signed in as ${user.username}` : "Sign in"}
+        ref={triggerRef}
+        disabled={isLoading}
+        onClick={() => {
+          login.reset();
+          logout.reset();
+          setOpen((value) => !value);
+        }}
+        className="flex min-h-11 w-full items-center gap-2.5 rounded-xl border border-ink bg-surface px-3 py-2 text-sm font-medium text-ink transition-colors hover:bg-parchment-dark disabled:opacity-50"
+        aria-label={user ? `Account for ${user.username}` : "Sign in to save your reading progress"}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-controls={open ? dialogId : undefined}
       >
-        <UserIcon className="h-4 w-4" strokeWidth={1.5} />
-        <span className="hidden sm:inline max-w-[120px] truncate">
-          {isLoading ? "…" : user ? user.username : "Sign in"}
+        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-accent/10 text-accent">
+          <UserIcon className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
         </span>
+        <span className="max-w-[140px] flex-1 truncate text-left">
+          {isLoading ? "Loading…" : (user?.username ?? "Reader profile")}
+        </span>
+        <ChevronDown className="h-3.5 w-3.5 shrink-0 text-ink-muted" aria-hidden="true" />
       </button>
 
       {open && (
-        <div className="absolute right-0 z-50 mt-2 w-64 rounded-lg border border-ink bg-surface p-3 shadow-lg">
+        <div
+          id={dialogId}
+          ref={panelRef}
+          role="dialog"
+          aria-label="Reader profile"
+          tabIndex={-1}
+          className="absolute right-0 z-50 mt-2 w-72 max-w-[calc(100vw-2rem)] rounded-xl border border-ink bg-surface p-4 shadow-xl"
+        >
           {user ? (
-            <div className="flex flex-col gap-2">
-              <div className="px-1 pb-1">
-                <p className="text-xs text-ink-tertiary">Signed in as</p>
-                <p className="truncate text-sm font-semibold text-ink">{user.username}</p>
+            <div className="flex flex-col gap-3">
+              <div>
+                <p className="text-xs text-ink-tertiary">Reading as</p>
+                <p className="mt-1 truncate text-base font-semibold text-ink">{user.username}</p>
               </div>
               <button
                 type="button"
-                onClick={() => {
-                  logout.mutate();
-                  setOpen(false);
-                }}
-                className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-ink hover:bg-parchment-dark transition-colors"
+                disabled={logout.isPending}
+                onClick={() => logout.mutate(undefined, { onSuccess: close })}
+                className="flex min-h-11 items-center gap-2 rounded-lg border border-ink px-3 py-2 text-sm text-ink transition-colors hover:bg-parchment-dark disabled:opacity-50"
               >
-                <LogOut className="h-4 w-4" strokeWidth={1.5} />
-                Sign out
+                {logout.isPending ? (
+                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                ) : (
+                  <LogOut className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
+                )}
+                {logout.isPending ? "Signing out…" : "Sign out"}
               </button>
             </div>
           ) : (
-            <form onSubmit={submit} className="flex flex-col gap-2">
-              <label htmlFor="username-input" className="px-1 text-xs text-ink-tertiary">
-                Enter a username to save your reading progress
-              </label>
-              <div className="flex items-center gap-1.5">
-                <input
-                  id="username-input"
-                  name="username"
-                  ref={inputRef}
-                  type="text"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  placeholder="username"
-                  maxLength={40}
-                  autoCapitalize="off"
-                  autoCorrect="off"
-                  autoComplete="username"
-                  className="min-w-0 flex-1 rounded-md border border-ink bg-surface px-2 py-1.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-accent"
-                />
-                <button
-                  type="submit"
-                  disabled={!name.trim() || login.isPending}
-                  className="flex items-center justify-center rounded-md bg-ink px-2.5 py-1.5 text-white disabled:opacity-40 hover:bg-ink/90 transition-colors"
-                  aria-label="Save username"
-                >
-                  <Check className="h-4 w-4" strokeWidth={2} />
-                </button>
-              </div>
-              {login.isError && (
-                <p className="px-1 text-xs text-red-600" role="alert" aria-live="polite">
-                  Couldn’t sign in. Try again.
+            <form onSubmit={submit} className="flex flex-col gap-3" aria-busy={login.isPending}>
+              <div>
+                <h2 className="text-sm font-semibold text-ink">Make yourself at home</h2>
+                <p className="mt-1 text-xs leading-relaxed text-ink-tertiary">
+                  Choose a username to keep your reading progress and personal bookshelf.
                 </p>
-              )}
+              </div>
+              <label htmlFor={usernameId} className="sr-only">
+                Username
+              </label>
+              <input
+                id={usernameId}
+                name="username"
+                ref={inputRef}
+                type="text"
+                value={name}
+                onChange={(event) => {
+                  setName(event.target.value);
+                  if (login.isError) login.reset();
+                }}
+                placeholder="Your username"
+                maxLength={40}
+                required
+                disabled={login.isPending}
+                autoCapitalize="off"
+                autoCorrect="off"
+                autoComplete="username"
+                className="input min-h-11 px-3 py-2 text-sm"
+              />
+              <button
+                type="submit"
+                disabled={!name.trim() || login.isPending}
+                className="flex min-h-11 items-center justify-center gap-2 rounded-lg bg-accent px-3 py-2 text-sm font-semibold text-white transition-colors hover:bg-accent-hover disabled:opacity-40"
+              >
+                {login.isPending ? (
+                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                ) : (
+                  <ArrowRight className="h-4 w-4" aria-hidden="true" />
+                )}
+                {login.isPending ? "Signing in…" : "Continue"}
+              </button>
             </form>
+          )}
+          {mutationError && (
+            <p className="mt-3 text-xs text-red-600" role="alert">
+              {mutationError instanceof HttpError
+                ? mutationError.message
+                : user
+                  ? "Could not sign out. Try again."
+                  : "Could not sign in. Try again."}
+            </p>
           )}
         </div>
       )}

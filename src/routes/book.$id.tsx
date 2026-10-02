@@ -9,7 +9,8 @@ export const Route = createFileRoute("/book/$id")({
 
 function BookDetailPage() {
   const { id } = useParams({ from: "/book/$id" });
-  const bookId = parseInt(id, 10);
+  const parsedId = /^[1-9]\d*$/.test(id) ? Number(id) : NaN;
+  const bookId = Number.isSafeInteger(parsedId) ? parsedId : NaN;
   const navigate = useNavigate();
 
   function handleBack() {
@@ -31,13 +32,13 @@ function BookDetailPage() {
     } else {
       navigate({
         to: "/",
-        search: { q: "", view: "list", sortBy: "added", sortOrder: "desc", tag: [], format: [] },
+        search: { q: "", view: "grid", sortBy: "added", sortOrder: "desc", tag: [], format: [] },
       });
     }
   }
 
   return (
-    <div className="min-h-screen bg-parchment paper-texture">
+    <div className="min-h-screen bg-parchment">
       {/* Header */}
       <header className="border-b border-ink bg-surface/90 backdrop-blur-sm sticky top-0 z-50">
         <div className="max-w-6xl mx-auto px-6">
@@ -71,8 +72,12 @@ function BookDetailPage() {
       </header>
 
       {/* Main content */}
-      <main id="main-content" className="max-w-6xl mx-auto px-6 py-10 lg:py-14">
-        <BookDetail bookId={bookId} />
+      <main
+        id="main-content"
+        tabIndex={-1}
+        className="max-w-6xl mx-auto px-5 sm:px-8 py-10 lg:py-14"
+      >
+        <BookDetail key={id} bookId={bookId} />
       </main>
 
       {/* Footer */}

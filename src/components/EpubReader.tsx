@@ -1,25 +1,36 @@
-import React, { useEffect, useRef, useState, useCallback } from "react";
 import ePub from "epubjs";
 import type Book from "epubjs/types/book";
+import type Contents from "epubjs/types/contents";
+import type Navigation from "epubjs/types/navigation";
+import type { NavItem } from "epubjs/types/navigation";
 import type Rendition from "epubjs/types/rendition";
 import type { Location } from "epubjs/types/rendition";
-import type { NavItem } from "epubjs/types/navigation";
-import type Navigation from "epubjs/types/navigation";
 import {
-  Settings,
-  List,
-  Minus,
-  Plus,
-  X,
-  Maximize,
-  Minimize,
+  BookOpen,
   ChevronLeft,
   ChevronRight,
-  Hand,
-  BookOpen,
   Columns2,
   FileText,
+  Hand,
+  List,
+  Maximize,
+  Minimize,
+  Minus,
+  Plus,
+  Settings,
+  X,
 } from "lucide-react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import {
+  fetchBookProgress,
+  flushBookProgress,
+  getLibraryScopeId,
+  progressPosKey,
+  readScopedPos,
+  saveBookProgress,
+} from "@/lib/reading-progress";
+import { useFullscreen } from "@/lib/use-fullscreen";
+import { stored } from "@/lib/utils";
 import {
   ReaderErrorPanel,
   ReaderFooterShell,
@@ -30,17 +41,12 @@ import {
   themedTone,
   useDialogFocusTrap,
 } from "./ReaderChrome";
-import { stored } from "@/lib/utils";
-import { useFullscreen } from "@/lib/use-fullscreen";
 import {
-  flushBookProgress,
-  fetchBookProgress,
-  saveBookProgress,
-  progressPosKey,
-  readScopedPos,
-  getLibraryScopeId,
-} from "@/lib/reading-progress";
-import { getNextReaderLoadMode, type ReaderLoadMode } from "./reader-types";
+  getEpubRestoreCfi,
+  getNextReaderLoadMode,
+  getReaderKeyboardAction,
+  type ReaderLoadMode,
+} from "./reader-types";
 
 // Cap on waiting for the initial server-progress restore; a stalled request
 // must not keep suppressing server saves for the whole session.
@@ -170,10 +176,14 @@ function decodeMaybeHtml(data: ArrayBuffer): string | null {
   return null;
 }
 
-async function loadHtmlFallback(fullUrl: string, prefix?: ArrayBuffer): Promise<string | null> {
+async function loadHtmlFallback(
+  fullUrl: string,
+  prefix?: ArrayBuffer,
+  signal?: AbortSignal,
+): Promise<string | null> {
   if (prefix && !decodeMaybeHtml(prefix)) return null;
 
-  const data = await fetchFileBytes(fullUrl);
+  const data = await fetchFileBytes(fullUrl, undefined, signal);
   return decodeMaybeHtml(data);
 }
 
@@ -321,6 +331,11 @@ function noteIgnoredEpubError(stage: string, error: unknown): void {
   console.debug(`[EpubReader] ignored ${stage} error`, error);
 }
 
+function turnEpubPage(rendition: Rendition | null, direction: "prev" | "next"): void {
+  if (!rendition) return;
+  void rendition[direction]().catch((error: unknown) => noteIgnoredEpubError("turn page", error));
+}
+
 export function EpubReader({
   streamUrl,
   fullUrl,
@@ -334,6 +349,7 @@ export function EpubReader({
   const bookRef = useRef<Book | null>(null);
   const lastLocationRef = useRef<Location | null>(null);
   const touchRef = useRef<{ x: number; y: number; t: number } | null>(null);
+  const lastTouchEndRef = useRef(0);
   // R5: reactive restore gate. Epub displays the server target directly
   // (fetch → display target), so the gate flips to "ready" right after the
   // fetch settles and BEFORE display — the first relocated event is already
@@ -357,33 +373,42 @@ export function EpubReader({
   const [progress, setProgress] = useState(0);
   const [pageInfo, setPageInfo] = useState<EpubPageInfo | null>(null);
   const [toc, setToc] = useState<NavItem[]>([]);
-  const [fontSize, setFontSize] = useState(() => stored("caliber-fontsize", 100));
+  const [fontSize, setFontSize] = useState(() => {
+    const value = stored<unknown>("caliber-fontsize", 100);
+    return typeof value === "number" && Number.isFinite(value)
+      ? Math.min(200, Math.max(60, value))
+      : 100;
+  });
   const [margins, setMargins] = useState<EpubMargin>(() => {
     const saved = stored("caliber-margins", "normal" as EpubMargin);
     return saved === "narrow" || saved === "normal" || saved === "wide" ? saved : "normal";
   });
-  const [theme, setTheme] = useState<ReaderTheme>(() =>
-    stored("caliber-reader-theme", "light" as ReaderTheme),
-  );
+  const [theme, setTheme] = useState<ReaderTheme>(() => {
+    const saved = stored<unknown>("caliber-reader-theme", "light");
+    return saved === "dark" || saved === "sepia" ? saved : "light";
+  });
   // Touch/click navigation zones: narrow 15% edges turn pages, the center
   // 70% is interactive book content. In "read" mode a center tap toggles the
   // toolbars; in "interact" mode the center is fully pass-through so links
   // and selections inside the book always work.
   type TouchMode = "read" | "interact";
   const [touchMode, setTouchMode] = useState<TouchMode>(() =>
-    stored("caliber-touch-mode", "read" as TouchMode),
+    stored<unknown>("caliber-touch-mode", "read") === "interact" ? "interact" : "read",
   );
+  const touchModeRef = useRef(touchMode);
   const [isTouchDevice] = useState(() => window.matchMedia("(hover: none)").matches);
   const settingsDialogRef = useRef<HTMLDivElement>(null);
+  const tocDialogRef = useRef<HTMLDivElement>(null);
   // Single page or side-by-side spread, persisted per book. Applied at
   // rendition creation and toggled live via rendition.spread().
   const spreadKey = `caliber-layout-${getLibraryScopeId()}-${bookId}-epub`;
   const [pageLayout, setPageLayout] = useState<EpubPageLayout>(() =>
-    stored(spreadKey, "single" as EpubPageLayout),
+    stored<unknown>(spreadKey, "single") === "double" ? "double" : "single",
   );
   const pageLayoutRef = useRef(pageLayout);
 
   useEffect(() => {
+    touchModeRef.current = touchMode;
     try {
       localStorage.setItem("caliber-touch-mode", JSON.stringify(touchMode));
     } catch (error) {
@@ -399,9 +424,11 @@ export function EpubReader({
   const closeSettings = useCallback(() => {
     setShowSettings(false);
   }, []);
+  const closeToc = useCallback(() => setShowToc(false), []);
 
   // Focus trap + Esc handling + opener focus-restore for the settings dialog.
   useDialogFocusTrap(showSettings, settingsDialogRef, closeSettings);
+  useDialogFocusTrap(showToc, tocDialogRef, closeToc);
   const {
     isFullscreen,
     supported: fullscreenSupported,
@@ -439,6 +466,21 @@ export function EpubReader({
   }, [isFullscreen, fullscreenSupported]);
 
   useEffect(() => {
+    if (!htmlDocument) return;
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || isInteractiveTarget(event.target)) return;
+      const action = getReaderKeyboardAction(event);
+      if (action !== "back" && action !== "immersive") return;
+      event.preventDefault();
+      if (event.repeat) return;
+      if (action === "back") onBackRef.current();
+      else toggleImmersive();
+    };
+    document.addEventListener("keydown", handleKey);
+    return () => document.removeEventListener("keydown", handleKey);
+  }, [htmlDocument, toggleImmersive]);
+
+  useEffect(() => {
     setLoadMode(initialLoadMode);
   }, [initialLoadMode]);
 
@@ -473,6 +515,24 @@ export function EpubReader({
     const abort = new AbortController();
     let keyHandler: ((e: KeyboardEvent) => void) | null = null;
     let contentHandlers: Array<[string, (e: Event) => void]> = [];
+    const contentKeyboardCleanup = new WeakMap<Document, () => void>();
+    const attachContentKeyboard = (contents: Contents) => {
+      const doc = contents.document;
+      if (cancelled || contentKeyboardCleanup.has(doc)) return;
+      const handleKey = (event: KeyboardEvent) => {
+        if (!cancelled && contents.window.frameElement?.isConnected) keyHandler?.(event);
+      };
+      const remove = () => {
+        doc.removeEventListener("keydown", handleKey);
+        contents.window.removeEventListener("unload", remove);
+        contentKeyboardCleanup.delete(doc);
+      };
+      contentKeyboardCleanup.set(doc, remove);
+      // epub.js forwards DOM events through passive listeners. Listen on the
+      // document directly so page-turn shortcuts can prevent native scrolling.
+      doc.addEventListener("keydown", handleKey);
+      contents.window.addEventListener("unload", remove, { once: true });
+    };
 
     async function openBook() {
       setIsLoading(true);
@@ -483,6 +543,7 @@ export function EpubReader({
       setLoadError(null);
       setHtmlDocument(null);
       setProgress(0);
+      setPageInfo(null);
       setToc([]);
       lastLocationRef.current = null;
 
@@ -492,10 +553,9 @@ export function EpubReader({
           const prefix = await fetchFileBytes(fullUrl, "bytes=0-2047", abort.signal);
           if (abort.signal.aborted || cancelled) return;
           if (!isZipArchive(prefix)) {
-            const html = await loadHtmlFallback(fullUrl, prefix);
+            const html = await loadHtmlFallback(fullUrl, prefix, abort.signal);
             if (!html) throw new Error("Invalid EPUB archive");
             if (!cancelled) {
-              setLoadMode("full");
               setHtmlDocument(html);
               setIsLoading(false);
             }
@@ -551,6 +611,7 @@ export function EpubReader({
           allowScriptedContent: false,
         });
         renditionRef.current = rendition;
+        rendition.hooks.content.register(attachContentKeyboard);
 
         // Themes
         for (const [name, styles] of Object.entries(THEME_STYLES)) {
@@ -561,6 +622,7 @@ export function EpubReader({
 
         // Location tracking
         rendition.on("relocated", (location: Location) => {
+          if (cancelled) return;
           lastLocationRef.current = location;
           const pct = getEpubProgress(location, bookRef.current);
           setProgress(pct);
@@ -584,7 +646,7 @@ export function EpubReader({
                 format: "EPUB",
                 location: cfi,
                 percentage: pct,
-                finished: Boolean(location.atEnd) || pct >= 99,
+                finished: Boolean(location.atEnd) || pct >= 100,
               });
             }
           }
@@ -604,36 +666,30 @@ export function EpubReader({
           }),
         ]);
         if (timerId) clearTimeout(timerId);
+        if (cancelled || abort.signal.aborted) return;
         // R5: fetch settles before display, and display targets the fetched
         // CFI directly — so flipping to ready here is safe. The first
         // relocated event already reflects the server position.
         restoreStateRef.current = "ready";
         setRestoreState("ready");
-        if (
-          serverProgress?.location &&
-          (!serverProgress.format || serverProgress.format.toUpperCase() === "EPUB")
-        ) {
-          savedCfi = serverProgress.location;
-        }
+        savedCfi = getEpubRestoreCfi(serverProgress);
         if (!savedCfi) {
           try {
             const scoped = readScopedPos<{ cfi?: string }>(bookId, "epub", {});
-            if (scoped?.cfi) savedCfi = scoped.cfi;
-            else {
-              const s = localStorage.getItem(posKey);
-              if (s) savedCfi = JSON.parse(s).cfi;
-            }
+            savedCfi = getEpubRestoreCfi(scoped);
           } catch (error) {
             noteIgnoredEpubError("restore position", error);
           }
         }
-        // F03: validate CFI shape before restoring; garbage never reaches display().
-        if (savedCfi && !savedCfi.startsWith("epubcfi(")) {
-          // Allow localStorage's raw CFI variants but drop numeric page strings.
-          if (/^\d+$/.test(savedCfi.trim())) savedCfi = null;
+        try {
+          await rendition.display(savedCfi || undefined);
+        } catch (error) {
+          if (!savedCfi || cancelled) throw error;
+          // A replaced book may no longer contain the saved CFI. Opening its
+          // first section recovers without downloading the whole file again.
+          await rendition.display();
         }
-
-        await rendition.display(savedCfi || undefined);
+        if (cancelled || abort.signal.aborted) return;
         if (rendition.location) {
           lastLocationRef.current = rendition.location;
           setProgress(getEpubProgress(rendition.location, bookRef.current));
@@ -654,7 +710,9 @@ export function EpubReader({
         book.ready
           .then(() => {
             if (cancelled) return;
-            return book.locations.generate(1600);
+            // Generating every location reads every chapter. Streaming keeps
+            // chapter-based progress so opening a book remains on demand.
+            if (loadMode === "full") return book.locations.generate(1600);
           })
           .then(() => {
             if (!cancelled) {
@@ -671,9 +729,9 @@ export function EpubReader({
 
         const navigateFromPointer = (clientX: number, viewportWidth: number) => {
           // Narrow 15% edge zones turn pages; the center 70% is interactive.
-          if (clientX < viewportWidth * 0.15) rendition.prev();
-          else if (clientX > viewportWidth * 0.85) rendition.next();
-          else toggleUI();
+          if (clientX < viewportWidth * 0.15) turnEpubPage(rendition, "prev");
+          else if (clientX > viewportWidth * 0.85) turnEpubPage(rendition, "next");
+          else if (touchModeRef.current === "read") toggleUI();
         };
 
         const contentTouchStart = (e: Event) => {
@@ -704,13 +762,14 @@ export function EpubReader({
           const event = e as TouchEvent;
           const touch = event.changedTouches?.[0];
           if (!touch) return;
+          lastTouchEndRef.current = Date.now();
           const dx = touch.clientX - start.x;
           const dy = touch.clientY - start.y;
           const dt = Date.now() - start.t;
 
           if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5 && dt < 500) {
-            if (dx > 0) rendition.prev();
-            else rendition.next();
+            if (dx > 0) turnEpubPage(rendition, "prev");
+            else turnEpubPage(rendition, "next");
             return;
           }
 
@@ -722,6 +781,7 @@ export function EpubReader({
 
         const contentClick = (e: Event) => {
           if ((e as MouseEvent).defaultPrevented || isInteractiveTarget(e.target)) return;
+          if (Date.now() - lastTouchEndRef.current < 700) return;
           const event = e as MouseEvent;
           const viewportWidth = event.view?.innerWidth || window.innerWidth;
           navigateFromPointer(event.clientX, viewportWidth);
@@ -738,9 +798,9 @@ export function EpubReader({
 
         // Keyboard
         keyHandler = (e: KeyboardEvent) => {
-          const active = document.activeElement;
-          const tag = active?.tagName;
-          if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+          const active = e.target as HTMLElement | null;
+          if (e.defaultPrevented || active?.isContentEditable || isInteractiveTarget(active))
+            return;
           if (showSettingsRef.current || showTocRef.current) {
             if (e.key === "Escape") {
               if (showSettingsRef.current) setShowSettings(false);
@@ -748,14 +808,16 @@ export function EpubReader({
             }
             return;
           }
-          if (e.key === "ArrowLeft" || e.key === "ArrowUp") rendition.prev();
-          else if (e.key === "ArrowRight" || e.key === "ArrowDown" || e.key === " ")
-            rendition.next();
-          else if (e.key === "f" || e.key === "F") toggleImmersive();
-          else if (e.key === "Escape") onBackRef.current();
+          const action = getReaderKeyboardAction(e);
+          if (!action) return;
+          e.preventDefault();
+          if (e.repeat) return;
+          if (action === "previous") turnEpubPage(rendition, "prev");
+          else if (action === "next") turnEpubPage(rendition, "next");
+          else if (action === "immersive") toggleImmersive();
+          else if (action === "back") onBackRef.current();
         };
-        rendition.on("keyup", keyHandler);
-        document.addEventListener("keyup", keyHandler);
+        document.addEventListener("keydown", keyHandler);
       } catch (error) {
         if (cancelled || abort.signal.aborted) return;
 
@@ -776,13 +838,18 @@ export function EpubReader({
     return () => {
       cancelled = true;
       abort.abort();
-      if (keyHandler) document.removeEventListener("keyup", keyHandler);
+      if (keyHandler) document.removeEventListener("keydown", keyHandler);
+      viewerRef.current?.querySelectorAll("iframe").forEach((frame) => {
+        const doc = frame.contentDocument;
+        if (doc) contentKeyboardCleanup.get(doc)?.();
+      });
       flushBookProgress(bookId);
       const r = renditionRef.current;
       const b = bookRef.current;
       renditionRef.current = null;
       bookRef.current = null;
       if (r) {
+        r.hooks.content.deregister(attachContentKeyboard);
         for (const [eventName, handler] of contentHandlers) {
           r.off(eventName, handler);
         }
@@ -823,7 +890,9 @@ export function EpubReader({
   }, [fontSize]);
 
   const handleTocNav = useCallback((href: string) => {
-    renditionRef.current?.display(href);
+    void renditionRef.current
+      ?.display(href)
+      .catch((error: unknown) => noteIgnoredEpubError("open chapter", error));
     setShowToc(false);
     setShowUI(false);
   }, []);
@@ -984,6 +1053,17 @@ export function EpubReader({
 
       {/* Book viewer + touch overlay */}
       <div className="flex-1 relative min-h-0">
+        {htmlDocument && !showUI && (
+          <button
+            type="button"
+            onClick={toggleUI}
+            aria-label="Show toolbars"
+            className="fixed top-4 right-4 z-[107] rounded-full p-3 shadow-lg"
+            style={{ color: fg, background: barBg }}
+          >
+            <Maximize className="h-5 w-5" />
+          </button>
+        )}
         {htmlDocument ? (
           <iframe
             className="absolute inset-0 mx-auto h-full w-full border-0"
@@ -1017,7 +1097,7 @@ export function EpubReader({
               aria-label="Previous page"
               title="Previous page"
               className="absolute left-0 top-0 bottom-0 z-[106] w-[15%] cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none"
-              onClick={() => renditionRef.current?.prev()}
+              onClick={() => turnEpubPage(renditionRef.current, "prev")}
             />
             {touchMode === "read" ? (
               <button
@@ -1038,7 +1118,7 @@ export function EpubReader({
               aria-label="Next page"
               title="Next page"
               className="absolute right-0 top-0 bottom-0 z-[106] w-[15%] cursor-default bg-transparent border-none p-0 m-0 outline-none appearance-none"
-              onClick={() => renditionRef.current?.next()}
+              onClick={() => turnEpubPage(renditionRef.current, "next")}
             />
           </>
         )}
@@ -1046,11 +1126,11 @@ export function EpubReader({
 
       {/* Persistent accessible page controls: always available, including in
           immersive mode and for keyboard / screen-reader users. */}
-      {!isLoading && !loadError && (
+      {!isLoading && !loadError && !htmlDocument && (
         <div className="fixed bottom-4 left-0 right-0 z-[107] flex items-center justify-between px-4 pointer-events-none">
           <button
             type="button"
-            onClick={() => renditionRef.current?.prev()}
+            onClick={() => turnEpubPage(renditionRef.current, "prev")}
             aria-label="Previous page"
             title="Previous page"
             className="pointer-events-auto w-11 h-11 rounded-full flex items-center justify-center shadow-lg active:opacity-70"
@@ -1060,7 +1140,7 @@ export function EpubReader({
           </button>
           <button
             type="button"
-            onClick={() => renditionRef.current?.next()}
+            onClick={() => turnEpubPage(renditionRef.current, "next")}
             aria-label="Next page"
             title="Next page"
             className="pointer-events-auto w-11 h-11 rounded-full flex items-center justify-center shadow-lg active:opacity-70"
@@ -1281,7 +1361,14 @@ export function EpubReader({
 
       {/* TOC panel */}
       {showToc && (
-        <div className="absolute inset-0 z-[112] flex flex-col" style={{ background: bg }}>
+        <div
+          ref={tocDialogRef}
+          role="dialog"
+          aria-modal="true"
+          aria-label="Table of contents"
+          className="absolute inset-0 z-[112] flex flex-col"
+          style={{ background: bg }}
+        >
           <div
             className="flex items-center justify-between px-4 h-12 shrink-0"
             style={{
@@ -1294,7 +1381,8 @@ export function EpubReader({
             </h2>
             <button
               type="button"
-              onClick={() => setShowToc(false)}
+              onClick={closeToc}
+              aria-label="Close table of contents"
               className="p-2 -mr-2 active:opacity-60"
               style={{ color: fg }}
             >

@@ -1,5 +1,4 @@
-import { memo, useEffect, useCallback, useRef, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { memo, useEffect, useCallback, useRef } from "react";
 import { useWindowVirtualizer } from "@tanstack/react-virtual";
 import { useFlattenedBooks, type SortConfig, type SortField } from "@/hooks/useBooksInfinite";
 import type { BookListItem } from "@/lib/calibre-optimized";
@@ -16,6 +15,7 @@ import {
 } from "lucide-react";
 import { isUnknownAuthor } from "@/lib/utils";
 import { BookCoverImage } from "./BookCoverImage";
+import { useBookListLayout, useBookScrollRestoration } from "@/hooks/useBookListViewport";
 
 interface BookTableInfiniteProps {
   searchQuery: string;
@@ -23,6 +23,9 @@ interface BookTableInfiniteProps {
   tagIds?: number[];
   formats?: string[];
   onClearFilters?: () => void;
+  stickyOffset?: number;
+  rowHeight?: number;
+  libraryId?: string;
 }
 
 // All flexible tracks use minmax(0, Nfr) so the grid can never exceed the
@@ -37,11 +40,6 @@ const GRID_COLS_DESKTOP =
   "xl:grid-cols-[minmax(0,3fr)_minmax(0,1.5fr)_minmax(0,1.2fr)_minmax(0,1.5fr)_90px_minmax(0,1fr)_60px]";
 
 const ROW_HEIGHT = 72;
-// Fallback scroll margin used before the runtime measurement below runs.
-// Devtools-measured sticky chrome above the table ~140px on desktop
-// (search bar ~64px + table header ~48px + filter row ~28px); the measured
-// list origin replaces this fallback at mount and on resize.
-const TABLE_SCROLL_MARGIN_FALLBACK = 140;
 const SKELETON_ROW_KEYS = [
   "skeleton-1",
   "skeleton-2",
@@ -92,10 +90,12 @@ const TitleCell = memo(function TitleCell({
   title,
   id,
   hasCover,
+  libraryId,
 }: {
   title: string;
   id: number;
   hasCover?: boolean;
+  libraryId?: string;
 }) {
   return (
     <Link
@@ -107,6 +107,7 @@ const TitleCell = memo(function TitleCell({
       <div className="relative flex-shrink-0 w-9 h-12 rounded bg-parchment-dark overflow-hidden flex items-center justify-center border border-ink">
         <BookCoverImage
           bookId={id}
+          authKey={libraryId}
           title={title}
           hasCover={Boolean(hasCover)}
           size="sm"
@@ -170,27 +171,18 @@ const FormatsCell = memo(function FormatsCell({
 }) {
   if (!formats || formats.length === 0) return <span className="text-ink-muted">—</span>;
 
-  const handleDownload = (format: string) => {
-    const link = document.createElement("a");
-    link.href = `/api/books/${bookId}/download/${format}`;
-    link.download = "";
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  };
-
   return (
     <div className="flex flex-wrap gap-1">
       {formats.slice(0, 3).map((fmt) => (
-        <button
-          type="button"
+        <a
           key={fmt}
-          onClick={() => handleDownload(fmt)}
+          href={`/api/books/${bookId}/download/${encodeURIComponent(fmt)}`}
+          download
           className="format-tag"
           title={`Download ${fmt}`}
         >
           {fmt}
-        </button>
+        </a>
       ))}
       {formats.length > 3 && <span className="text-xs text-ink-muted">+{formats.length - 3}</span>}
     </div>
@@ -222,20 +214,28 @@ function preferredReadFormat(formats: string[]): string {
 // Virtual row component - rendered as a normal row in the flow
 interface TableRowProps {
   book: BookListItem;
+  rowHeight: number;
+  libraryId?: string;
 }
 
-const TableRow = memo(function TableRow({ book }: TableRowProps) {
+const TableRow = memo(function TableRow({ book, rowHeight, libraryId }: TableRowProps) {
+  const compact = rowHeight < ROW_HEIGHT;
   return (
     <div
       className="flex items-center px-3 sm:px-4 border-b border-parchment hover:bg-parchment-dark focus-within:bg-parchment-dark transition-colors"
-      style={{ height: `${ROW_HEIGHT}px` }}
+      style={{ height: `${rowHeight}px` }}
     >
       {/* Mobile layout */}
       <div className={`w-full h-full items-center gap-2 grid sm:!hidden ${GRID_COLS_MOBILE}`}>
-        <div className="flex items-center min-w-0 py-2 overflow-hidden">
-          <TitleCell title={book.title} id={book.id} hasCover={book.has_cover} />
+        <div className={`flex items-center min-w-0 ${compact ? "py-1" : "py-2"} overflow-hidden`}>
+          <TitleCell
+            title={book.title}
+            id={book.id}
+            hasCover={book.has_cover}
+            libraryId={libraryId}
+          />
         </div>
-        <div className="flex items-center min-w-0 py-2 overflow-hidden">
+        <div className={`flex items-center min-w-0 ${compact ? "py-1" : "py-2"} overflow-hidden`}>
           <div className="flex min-w-0 flex-col justify-center gap-0.5">
             <span className="text-xs text-ink-tertiary truncate">
               {isUnknownAuthor(book.authors) ? "—" : book.authors?.[0]}
@@ -266,7 +266,7 @@ const TableRow = memo(function TableRow({ book }: TableRowProps) {
             )}
           </div>
         </div>
-        <div className="flex items-center justify-end py-2">
+        <div className={`flex items-center justify-end ${compact ? "py-1" : "py-2"}`}>
           <ActionsCell id={book.id} />
         </div>
       </div>
@@ -274,25 +274,36 @@ const TableRow = memo(function TableRow({ book }: TableRowProps) {
       <div
         className={`w-full h-full items-center gap-2 lg:gap-4 hidden sm:!grid ${GRID_COLS_DESKTOP}`}
       >
-        <div className="flex items-center min-w-0 py-3 overflow-hidden">
-          <TitleCell title={book.title} id={book.id} hasCover={book.has_cover} />
+        <div className={`flex items-center min-w-0 ${compact ? "py-1" : "py-3"} overflow-hidden`}>
+          <TitleCell
+            title={book.title}
+            id={book.id}
+            hasCover={book.has_cover}
+            libraryId={libraryId}
+          />
         </div>
-        <div className="flex items-center min-w-0 py-3 overflow-hidden">
+        <div className={`flex items-center min-w-0 ${compact ? "py-1" : "py-3"} overflow-hidden`}>
           <AuthorsCell authors={book.authors} />
         </div>
-        <div className="hidden lg:flex items-center min-w-0 py-3 overflow-hidden">
+        <div
+          className={`hidden lg:flex items-center min-w-0 ${compact ? "py-1" : "py-3"} overflow-hidden`}
+        >
           <SeriesCell series={book.series} seriesIndex={book.series_index} />
         </div>
-        <div className="hidden xl:flex items-center min-w-0 py-3 overflow-hidden">
+        <div
+          className={`hidden xl:flex items-center min-w-0 ${compact ? "py-1" : "py-3"} overflow-hidden`}
+        >
           <TagsCell tags={book.tags} />
         </div>
-        <div className="flex items-center min-w-0 py-3">
+        <div className={`flex items-center min-w-0 ${compact ? "py-1" : "py-3"}`}>
           <StarRating rating={book.rating} />
         </div>
-        <div className="hidden lg:flex items-center min-w-0 py-3 overflow-hidden">
+        <div
+          className={`hidden lg:flex items-center min-w-0 ${compact ? "py-1" : "py-3"} overflow-hidden`}
+        >
           <FormatsCell formats={book.formats} bookId={book.id} />
         </div>
-        <div className="flex items-center justify-end py-3">
+        <div className={`flex items-center justify-end ${compact ? "py-1" : "py-3"}`}>
           <ActionsCell id={book.id} />
         </div>
       </div>
@@ -473,6 +484,9 @@ export const BookTableInfinite = memo(function BookTableInfinite({
   tagIds,
   formats,
   onClearFilters,
+  stickyOffset = 0,
+  rowHeight = ROW_HEIGHT,
+  libraryId,
 }: BookTableInfiniteProps) {
   const {
     books,
@@ -493,225 +507,56 @@ export const BookTableInfinite = memo(function BookTableInfinite({
     isOffline,
     refetch,
     queryKey,
-  } = useFlattenedBooks(searchQuery, sortConfig, tagIds, undefined, formats);
-  const queryClient = useQueryClient();
+  } = useFlattenedBooks(searchQuery, sortConfig, tagIds, { libraryId }, formats);
+  const { scrollMargin, measured, setElement } = useBookListLayout();
 
-  // S7: REAL scrollMargin measurement. The callback ref captures the list
-  // container; its document-relative origin (viewport top + scroll offset,
-  // which is scroll-invariant) is measured at mount and re-measured whenever
-  // the origin can move:
-  // - ResizeObserver on the list container itself,
-  // - ResizeObserver on document.body (a sticky shelf/header above the list
-  //   resizing shifts the list origin without resizing the list),
-  // - window resize fallback,
-  // - MutationObserver on document.body (header/shelf DOM moves — filter row
-  //   mount, shelf expand — that shift the origin without a resize event),
-  // - explicit re-measure when books change (the second effect below).
-  // The measured value is passed to the virtualizer as scrollMargin, which
-  // the React adapter picks up dynamically on re-render — no constant
-  // assertion.
-  const [listEl, setListEl] = useState<HTMLDivElement | null>(null);
-  const [measuredScrollMargin, setMeasuredScrollMargin] = useState(TABLE_SCROLL_MARGIN_FALLBACK);
-  useEffect(() => {
-    const el = listEl;
-    if (!el) return;
-    const measure = () => {
-      const origin = Math.max(0, Math.round(el.getBoundingClientRect().top + window.scrollY));
-      setMeasuredScrollMargin((prev) => (prev === origin ? prev : origin));
-    };
-    measure();
-    let ro: ResizeObserver | null = null;
-    if (typeof ResizeObserver !== "undefined") {
-      ro = new ResizeObserver(measure);
-      ro.observe(el);
-      try {
-        ro.observe(document.body);
-      } catch {}
-    }
-    window.addEventListener("resize", measure);
-    let mo: MutationObserver | null = null;
-    if (typeof MutationObserver !== "undefined") {
-      mo = new MutationObserver(measure);
-      try {
-        mo.observe(document.body, { childList: true, subtree: true, attributes: true });
-      } catch {}
-    }
-    return () => {
-      ro?.disconnect();
-      mo?.disconnect();
-      window.removeEventListener("resize", measure);
-    };
-  }, [listEl]);
-
-  // Re-measure the list origin when content above/around the list changes
-  // size (books appended, header/filter state changed). The observer effect
-  // above owns the listeners; this just re-runs the same scroll-invariant
-  // origin math on state transitions the observers might miss.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional re-measure on content transitions observers may miss.
-  useEffect(() => {
-    if (!listEl) return;
-    const origin = Math.max(0, Math.round(listEl.getBoundingClientRect().top + window.scrollY));
-    setMeasuredScrollMargin((prev) => (prev === origin ? prev : origin));
-  }, [listEl, books.length]);
-
-  // Set up window virtualizer - uses window scroll. scrollMargin is the
-  // MEASURED list origin (see above) and keeps the restored/focused row
-  // clear of the sticky search + table headers.
-  // TanStack contract — margin applied ONCE: the virtualizer bakes
-  // scrollMargin into every measurement (first start = scrollMargin,
-  // totalSize excludes the margin), so rows render at
-  // translateY(start - scrollMargin) inside a container that sits AT the
-  // list origin in normal flow. Using translateY(start) verbatim would
-  // double-count the margin. scrollPaddingStart (200px below) is separate
-  // breathing room for scrollToIndex, NOT part of the measured origin.
   const virtualizer = useWindowVirtualizer({
     count: books.length,
-    estimateSize: useCallback(() => ROW_HEIGHT, []),
+    estimateSize: useCallback(() => rowHeight, [rowHeight]),
     overscan: 20,
-    scrollMargin: measuredScrollMargin,
-    scrollPaddingStart: 200,
+    scrollMargin,
+    scrollPaddingStart: stickyOffset,
     useFlushSync: false,
   });
 
   const virtualItems = virtualizer.getVirtualItems();
   const totalSize = virtualizer.getTotalSize();
 
-  // Infinite scroll — no extra state, just derive from virtualizer position
-  const lastVirtualItem = virtualItems[virtualItems.length - 1];
-  const shouldFetch =
-    lastVirtualItem &&
-    lastVirtualItem.index >= books.length - 30 &&
-    hasNextPage &&
-    !isFetchingNextPage;
+  useEffect(() => {
+    if (rowHeight > 0) virtualizer.measure();
+  }, [rowHeight, virtualizer]);
 
+  const isRestoring = useBookScrollRestoration({
+    identity: JSON.stringify([queryKey, "table"]),
+    books,
+    columns: 1,
+    rowHeight,
+    scrollMargin,
+    stickyOffset,
+    ready: measured && books.length > 0 && !isLoading && !isPlaceholder,
+    hasNextPage,
+    fetchNextPage,
+    virtualizer,
+  });
+
+  const lastVirtualItem = virtualItems[virtualItems.length - 1];
+  const shouldFetch = Boolean(
+    lastVirtualItem &&
+      lastVirtualItem.index >= books.length - 30 &&
+      hasNextPage &&
+      !isFetchingNextPage &&
+      !isFetchNextPageError &&
+      !isPlaceholder &&
+      !isRestoring,
+  );
   const fetchRef = useRef(fetchNextPage);
   fetchRef.current = fetchNextPage;
-
   useEffect(() => {
-    if (shouldFetch) {
-      fetchRef.current();
-    }
+    if (shouldFetch) void fetchRef.current({ cancelRefetch: false }).catch(() => {});
   }, [shouldFetch]);
 
-  // Persist the top-visible book anchor (id + offset) for content-based
-  // restore instead of a raw pixel offset.
-  useEffect(() => {
-    let raf = 0;
-    let cancelled = false;
-    const onScroll = () => {
-      cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(() => {
-        if (cancelled) return;
-        try {
-          const start = virtualizer.range?.startIndex ?? 0;
-          const anchor = books[start];
-          if (anchor) {
-            sessionStorage.setItem(
-              "caliber-scroll",
-              JSON.stringify({ id: anchor.id, offset: window.scrollY % ROW_HEIGHT }),
-            );
-          }
-        } catch {}
-      });
-    };
-    window.addEventListener("scroll", onScroll, { passive: true });
-    return () => {
-      cancelled = true;
-      cancelAnimationFrame(raf);
-      window.removeEventListener("scroll", onScroll);
-    };
-  }, [books, virtualizer]);
-
-  // Anchor restore: fetch the required window before scrolling. Cancelled on
-  // unmount or when the query identity changes.
-  // FUP8: deps include books.length/hasNextPage readiness; the loop re-reads
-  // the latest books from the queryClient cache after each fetchNextPage
-  // (never the captured array, which goes stale across awaits).
-  const restoreKey = `${searchQuery}|${sortConfig.field}|${sortConfig.order}|${(tagIds ?? []).join(",")}|${(formats ?? []).join(",")}`;
-  // biome-ignore lint/correctness/useExhaustiveDependencies: restore intentionally reads fresh books via queryClient after each fetch; captured books/fetchNextPage would go stale across awaits.
-  useEffect(() => {
-    let cancelled = false;
-    let raf = 0;
-    const readFreshBooks = (): typeof books => {
-      try {
-        const data = queryClient.getQueryData<{ pages: { items: typeof books }[] }>(queryKey);
-        if (data?.pages) return data.pages.flatMap((p) => p.items);
-      } catch {}
-      return books;
-    };
-    const run = async () => {
-      let anchorId: number | null = null;
-      let anchorOffset = 0;
-      try {
-        const raw = sessionStorage.getItem("caliber-scroll");
-        const saved = raw ? (JSON.parse(raw) as { id?: unknown; offset?: unknown }) : null;
-        if (saved && typeof saved.id === "number") anchorId = saved.id;
-        if (saved && typeof saved.offset === "number") anchorOffset = saved.offset;
-      } catch {
-        anchorId = null;
-      }
-      let fresh = readFreshBooks();
-      if (anchorId === null || fresh.length === 0) return;
-      const wanted = anchorId;
-      let guard = 0;
-      let latestHasNext = hasNextPage;
-      while (!cancelled && guard < 10 && latestHasNext && !fresh.some((b) => b.id === wanted)) {
-        guard++;
-        try {
-          const result = await fetchNextPage();
-          latestHasNext =
-            (result.data?.pages.length ?? 0) > 0
-              ? (result.hasNextPage ?? latestHasNext)
-              : latestHasNext;
-        } catch {
-          break;
-        }
-        fresh = readFreshBooks();
-        if (fresh.some((b) => b.id === wanted)) break;
-      }
-      if (cancelled) return;
-      fresh = readFreshBooks();
-      const idx = fresh.findIndex((b) => b.id === wanted);
-      if (idx >= 0) {
-        const off = anchorOffset;
-        raf = requestAnimationFrame(() => {
-          if (cancelled) return;
-          try {
-            // Single offset adjust only: scrollToIndex already accounts for
-            // scrollMargin; apply the saved intra-row offset once.
-            virtualizer.scrollToIndex(idx, { align: "start" });
-            if (off > 0) window.scrollBy({ top: off });
-          } catch {}
-          try {
-            sessionStorage.removeItem("caliber-scroll");
-          } catch {}
-        });
-      }
-    };
-    void run();
-    return () => {
-      cancelled = true;
-      cancelAnimationFrame(raf);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [restoreKey, books.length, hasNextPage, queryClient, queryKey]);
-
   if (isLoading) {
-    return (
-      <div className="overflow-hidden">
-        <div className="table-header">
-          <div className="px-3 sm:px-4 h-10 sm:h-12 flex items-center gap-4">
-            <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">
-              Title
-            </span>
-            <span className="text-xs font-semibold text-ink-muted uppercase tracking-wider">
-              Author
-            </span>
-          </div>
-        </div>
-        <TableSkeleton />
-      </div>
-    );
+    return <TableSkeleton />;
   }
 
   if (isError && errorStage === "initial") {
@@ -788,12 +633,12 @@ export const BookTableInfinite = memo(function BookTableInfinite({
         : "All books loaded";
 
   return (
-    <div ref={setListEl}>
+    <div>
       {refreshBanner}
       {/* Virtual list container at the list origin in normal flow (no
           internal scroll, uses window); rows offset by (start -
           scrollMargin) so the margin applies exactly once. */}
-      <div style={{ height: `${totalSize}px`, position: "relative" }}>
+      <div ref={setElement} style={{ height: `${totalSize}px`, position: "relative" }}>
         {virtualItems.map((virtualItem) => {
           const book = books[virtualItem.index];
           if (!book) return null;
@@ -809,7 +654,7 @@ export const BookTableInfinite = memo(function BookTableInfinite({
                 transform: `translateY(${virtualItem.start - virtualizer.options.scrollMargin}px)`,
               }}
             >
-              <TableRow book={book} />
+              <TableRow book={book} rowHeight={rowHeight} libraryId={libraryId} />
             </div>
           );
         })}

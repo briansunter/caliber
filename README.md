@@ -66,6 +66,7 @@ Configuration can be stored in the platform config directory (`~/.config/caliber
 | `CALIBER_COOKIE_SECURE` | production: `true` | Add the `Secure` attribute to the progress cookie |
 | `CALIBER_MCP_ENABLED` | `false` | Enable the HTTP MCP endpoint; the standalone stdio server is separate |
 | `CALIBER_AUTH_ENABLED` | `false` | Require sign-in for the web app, API, and OPDS feeds (see [Authentication](#authentication)) |
+| `CALIBER_ALLOW_NOAUTH_ADMIN` | unset | Set to `1` to allow authentication setup from the UI while bound to loopback and auth is off |
 | `CALIBER_USER_DB_PATH` | `<config>/users.db` | Location for local profile and reading-progress data |
 | `PDFINFO_PATH` | auto-detected | Optional path to Poppler `pdfinfo` |
 | `PDFTOPPM_PATH` | auto-detected | Optional path to Poppler `pdftoppm` |
@@ -74,7 +75,7 @@ Copy `.env.example` as a starting point for a deployment. Caliber copies the sou
 
 ## Authentication
 
-Authentication is optional and off by default. The simplest path is the Settings page: under **Authentication**, turn it on and — if no accounts exist yet — create the first account in the same step; you are signed in immediately. The change takes effect without a restart and persists to `config.json`, and the same panel adds, removes, and re-passwords accounts. Auth settings in the UI are available whenever Caliber runs on localhost, or to signed-in users once auth is on.
+Authentication is optional and off by default. For local UI setup, start Caliber with `CALIBER_ALLOW_NOAUTH_ADMIN=1` while bound to loopback, then open the Settings page: under **Authentication**, turn it on and — if no accounts exist yet — create the first account in the same step; you are signed in immediately. The change takes effect without a restart and persists to `config.json`, and the same panel adds, removes, and re-passwords accounts. When authentication is off, UI management requires a loopback bind and `CALIBER_ALLOW_NOAUTH_ADMIN=1`. Once authentication is on, signed-in users can manage accounts according to the server configuration.
 
 For configuration-as-code, set `CALIBER_AUTH_ENABLED=true` (or `"authEnabled": true` in `config.json`) to require a username and password for the web app, the JSON API, the OPDS catalog, and the MCP endpoint. The environment variable takes precedence over `config.json` and disables runtime toggling. When auth is enabled with no accounts yet, the web UI offers to create the first account; that setup screen closes permanently once one user exists. Accounts can also be managed from the CLI:
 
@@ -114,6 +115,8 @@ bun src/mcp-server.ts
 
 The HTTP `/mcp` endpoint is disabled by default. Enable it only on a protected local or authenticated network deployment with `CALIBER_MCP_ENABLED=true`.
 
+REST and HTTP MCP JSON request bodies are limited to 1 MiB, including chunked requests.
+
 ## API
 
 ```text
@@ -143,7 +146,7 @@ bun test            # test suite only
 bun run build       # production frontend bundle
 ```
 
-The production server runs from `src/index.ts` so the Bun runtime can continue to serve the generated HTML entrypoint and reader assets. `dist/` is a frontend build artifact and is intentionally ignored.
+Production and packaged launches build the current frontend sources in memory at startup. JavaScript for EPUB, PDF, and comic readers loads when needed; generated assets use content hashes, and HTML is revalidated. No prebuilt `dist/` directory is required. `bun run dev` retains Bun's hot reloading, while `dist/` remains an optional frontend build artifact.
 
 ## Releases
 

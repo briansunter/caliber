@@ -7,14 +7,12 @@ interface CoverFallbackProps {
 }
 
 const PALETTE = [
-  ["#eef2ff", "#c7d2fe", "#4338ca"],
-  ["#fef3c7", "#fde68a", "#b45309"],
-  ["#dcfce7", "#bbf7d0", "#15803d"],
-  ["#fee2e2", "#fecaca", "#b91c1c"],
-  ["#f3e8ff", "#e9d5ff", "#7e22ce"],
-  ["#cffafe", "#a5f3fc", "#0e7490"],
-  ["#fce7f3", "#fbcfe8", "#be185d"],
-  ["#e0e7ff", "#c7d2fe", "#3730a3"],
+  ["#40594a", "#314a3c", "#eee3c9"],
+  ["#c6aa75", "#b79a66", "#343d2e"],
+  ["#52636c", "#3e515a", "#eae1cd"],
+  ["#ae745e", "#95624f", "#fff0db"],
+  ["#ddd4c0", "#cfc4ab", "#4e5847"],
+  ["#71676d", "#5c535b", "#f0e6d7"],
 ] as const;
 
 function pickPalette(title: string): readonly [string, string, string] {
@@ -31,20 +29,30 @@ export const CoverFallback = memo(function CoverFallback({
 }: CoverFallbackProps) {
   const [bg1, bg2, fg] = pickPalette(title);
   const initials = coverInitials(title);
-  const fontSize = size === "sm" ? "0.75rem" : "1.5rem";
+  const fontSize = size === "sm" ? "0.75rem" : "clamp(1rem, 1.35vw, 1.5rem)";
 
   return (
     <div
       aria-hidden="true"
-      className="w-full h-full flex items-center justify-center font-semibold tracking-tight select-none"
+      className="relative w-full h-full flex flex-col items-center justify-center overflow-hidden text-center select-none"
       style={{
         background: `linear-gradient(135deg, ${bg1} 0%, ${bg2} 100%)`,
         color: fg,
         fontSize,
         letterSpacing: "-0.02em",
+        boxShadow: "inset 5px 0 9px rgb(0 0 0 / .12)",
       }}
     >
-      {initials}
+      {size === "sm" ? (
+        initials
+      ) : (
+        <>
+          <span className="absolute inset-3 border border-current opacity-25" />
+          <span className="relative px-7 font-display leading-snug line-clamp-4">{title}</span>
+          <span className="mt-6 h-px w-7 bg-current opacity-50" />
+          <span className="mt-4 text-[9px] tracking-[.2em] opacity-65">{initials}</span>
+        </>
+      )}
     </div>
   );
 });

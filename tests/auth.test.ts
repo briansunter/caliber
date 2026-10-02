@@ -197,6 +197,23 @@ async function json(path: string, init?: RequestInit) {
   return jsonAt(baseUrl, path, init);
 }
 
+async function runIsolatedAuthScript(name: string, script: string) {
+  const isolatedConfig = join(tempDir, name);
+  const proc = Bun.spawn([process.execPath, "-e", script], {
+    cwd: process.cwd(),
+    env: {
+      ...serverEnv(0),
+      CALIBER_CONFIG_DIR: isolatedConfig,
+      CALIBER_USER_DB_PATH: join(isolatedConfig, "users.db"),
+    },
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+}
+
 beforeAll(async () => {
   tempDir = mkdtempSync(join(tmpdir(), "caliber-auth-"));
   libraryPath = join(tempDir, "library");
@@ -383,6 +400,40 @@ describe("HTTP Basic auth (OPDS clients)", () => {
     });
     expect(response.status).toBe(401);
   });
+
+  test("password rotation invalidates cached Basic credentials and existing sessions", async () => {
+    const username = "rotation-user";
+    const added = await runCli(["user", "add", username, "--password-stdin"], "original-pass-9\n");
+    expect(added.exitCode).toBe(0);
+    try {
+      const login = await json("/api/user/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password: "original-pass-9" }),
+      });
+      expect(login.response.status).toBe(200);
+      const cookie = sessionCookie(login.response);
+      const headers = { Authorization: basicAuth(username, "original-pass-9") };
+      expect((await fetch(`${baseUrl}/opds`, { headers })).status).toBe(200);
+
+      const changed = await runCli(
+        ["user", "passwd", username, "--password-stdin"],
+        "replaced-pass-9\n",
+      );
+      expect(changed.exitCode).toBe(0);
+      expect((await fetch(`${baseUrl}/opds`, { headers })).status).toBe(401);
+      expect(
+        (await fetch(`${baseUrl}/api/books`, { headers: { Cookie: cookie } })).status,
+      ).toBe(401);
+      expect(
+        (await fetch(`${baseUrl}/opds`, {
+          headers: { Authorization: basicAuth(username, "replaced-pass-9") },
+        })).status,
+      ).toBe(200);
+    } finally {
+      await runCli(["user", "remove", username]);
+    }
+  }, TEST_TIMEOUT);
 });
 
 describe("CLI user management", () => {
@@ -501,6 +552,140 @@ describe("login throttling", () => {
     }
     expect(sawTooMany).toBe(true);
   }, 30_000);
+
+  test("username whitespace aliases share the same failure limit", async () => {
+    for (let attempt = 1; attempt <= 10; attempt += 1) {
+      const response = await fetch(`${baseUrl}/api/user/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: `normalized${" ".repeat(attempt)}user`,
+          password: "wrong-password",
+        }),
+      });
+      expect(response.status).toBe(401);
+    }
+    const response = await fetch(`${baseUrl}/api/user/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: " normalized user ", password: "wrong-password" }),
+    });
+    expect(response.status).toBe(429);
+  });
+});
+
+describe("credential rotation races", () => {
+  test("a pending password check and session issuance cannot outlive credential rotation", async () => {
+    // A separate process gives the auth module its own database and deterministic
+    // password-verification gate without changing the integration servers.
+    const script = `
+      import assert from "node:assert/strict";
+      import { authenticateWithPassword, authenticateRequest, createSessionToken, PasswordError } from "./src/lib/auth";
+      import { createUserWithPassword, createSession, getSession, getAuthEpoch, setUserPassword } from "./src/lib/user-db";
+
+      for (const method of ["form", "basic"]) {
+        const user = createUserWithPassword("race-" + method, "old-hash");
+        const epoch = getAuthEpoch(user.id);
+        let started;
+        let release;
+        const entered = new Promise(resolve => { started = resolve; });
+        const gate = new Promise(resolve => { release = resolve; });
+        Bun.password.verify = async () => { started(); await gate; return true; };
+        const req = new Request("http://localhost/test", {
+          headers: method === "basic"
+            ? { Authorization: "Basic " + btoa(user.username + ":old-password") }
+            : {},
+        });
+        const checking = method === "form"
+          ? authenticateWithPassword(req, user.username, "old-password")
+          : authenticateRequest(req);
+        await entered;
+        setUserPassword(user.id, "new-hash");
+        release();
+        assert.equal(await checking, null, method + " accepted credentials changed during verification");
+        assert.equal(createSession("stale-" + method, user.id, Date.now() + 10000, epoch), false);
+        assert.equal(getSession("stale-" + method), null);
+        assert.throws(() => createSessionToken(user.id, epoch), PasswordError);
+        const currentEpoch = getAuthEpoch(user.id);
+        assert.equal(createSession("fresh-" + method, user.id, Date.now() + 10000, currentEpoch), true);
+        assert.equal(getSession("fresh-" + method).authEpoch, currentEpoch);
+      }
+    `;
+    await runIsolatedAuthScript("auth-races", script);
+  });
+});
+
+describe("password workload limits", () => {
+  test("queue admission is bounded and cancellation releases pending password work", async () => {
+    await runIsolatedAuthScript("auth-workload", `
+      import assert from "node:assert/strict";
+      import { authenticateWithPassword, authenticateRequest, hashPassword, loginRateLimited, PasswordError } from "./src/lib/auth";
+      import { createUserWithPassword } from "./src/lib/user-db";
+
+      async function within(promise) {
+        let timer;
+        try {
+          return await Promise.race([
+            promise,
+            new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error("Queued authentication did not settle promptly")), 1000);
+            }),
+          ]);
+        } finally { clearTimeout(timer); }
+      }
+
+      const user = createUserWithPassword("queue-user", "stub-hash");
+      let release;
+      const gate = new Promise(resolve => { release = resolve; });
+      let verifications = 0;
+      let hashes = 0;
+      Bun.password.verify = async () => { verifications++; await gate; return false; };
+      Bun.password.hash = async () => { hashes++; return "created-hash"; };
+      const controllers = Array.from({ length: 128 }, () => new AbortController());
+      const tasks = controllers.map((controller, index) => {
+        const req = new Request("http://localhost/test", {
+          signal: controller.signal,
+          headers: index % 2 === 0
+            ? { Authorization: "Basic " + btoa(user.username + ":wrong-password") }
+            : {},
+        });
+        return index % 2 === 0
+          ? authenticateRequest(req)
+          : authenticateWithPassword(req, user.username, "wrong-password");
+      });
+      // Four running and 64 pending tasks fill the queue. Overflow must
+      // settle without starting expensive work or counting as bad passwords.
+      assert((await within(Promise.all(tasks.slice(68)))).every(value => value === null));
+      assert.equal(verifications, 4);
+      assert.equal(loginRateLimited(new Request("http://localhost/test"), user.username), false);
+      await assert.rejects(hashPassword("new-password"), PasswordError);
+      assert.equal(hashes, 0);
+
+      controllers.forEach(controller => controller.abort());
+      assert((await within(Promise.all(tasks))).every(value => value === null));
+      assert.equal(loginRateLimited(new Request("http://localhost/test"), user.username), false);
+      const creating = hashPassword("new-password");
+      await Promise.resolve();
+      assert.equal(hashes, 0, "Canceled native verifications released their CPU slots too soon");
+      release();
+      assert.equal(await within(creating), "created-hash");
+      assert.equal(verifications, 4, "Canceled queued work still ran");
+      assert.equal(hashes, 1);
+
+      Bun.password.verify = async () => true;
+      assert(await authenticateWithPassword(new Request("http://localhost/test"), user.username, "correct-password"));
+      const canceled = new AbortController();
+      canceled.abort();
+      assert.equal(await authenticateRequest(new Request("http://localhost/test", {
+        signal: canceled.signal,
+        headers: { Authorization: "Basic " + btoa(user.username + ":correct-password") },
+      })), null);
+      Bun.password.hash = () => { throw new Error("hash failed"); };
+      await assert.rejects(hashPassword("new-password"), /hash failed/);
+      Bun.password.hash = async () => "recovered-hash";
+      assert.equal(await within(hashPassword("new-password")), "recovered-hash");
+    `);
+  });
 });
 
 describe("auth configuration via the UI (loopback, no env override)", () => {

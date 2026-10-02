@@ -473,17 +473,24 @@ export function deleteUser(rawUsername: string): User | null {
   return user;
 }
 
-export function createSession(tokenHash: string, userId: number, expiresAt: number): void {
+export function createSession(
+  tokenHash: string,
+  userId: number,
+  expiresAt: number,
+  expectedAuthEpoch?: number,
+): boolean {
   const now = Date.now();
-  const epochRow = getDb()
-    .query<{ auth_epoch: number | null }, [number]>("SELECT auth_epoch FROM users WHERE id = ?")
-    .get(userId);
-  const epoch = epochRow?.auth_epoch ?? 0;
-  getDb()
+  // Select and stamp the epoch in the same statement. A password change
+  // between verification and session creation must not grant a fresh session
+  // to a request that proved only the old credentials.
+  const result = getDb()
     .query(
-      "INSERT INTO sessions (token_hash, user_id, auth_epoch, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+      `INSERT INTO sessions (token_hash, user_id, auth_epoch, created_at, expires_at)
+       SELECT ?, id, COALESCE(auth_epoch, 0), ?, ? FROM users
+       WHERE id = ? AND (? IS NULL OR COALESCE(auth_epoch, 0) = ?)`,
     )
-    .run(tokenHash, userId, epoch, now, expiresAt);
+    .run(tokenHash, now, expiresAt, userId, expectedAuthEpoch ?? null, expectedAuthEpoch ?? null);
+  return result.changes > 0;
 }
 
 export function getSession(tokenHash: string): SessionRow | null {

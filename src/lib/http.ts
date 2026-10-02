@@ -20,19 +20,29 @@ export class HttpError extends Error {
 }
 
 export async function fetchJson<T>(input: string | URL, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers);
+  if (!headers.has("Accept")) headers.set("Accept", "application/json");
   const response = await fetch(input, {
+    // Query keys isolate users/libraries, but the browser cache keys only on
+    // the URL. Revalidate JSON so a fresh response from a previous library or
+    // session cannot bypass the server. ETags still avoid unchanged bodies.
+    cache: "no-cache",
     ...init,
-    headers: {
-      Accept: "application/json",
-      ...(init?.headers ?? {}),
-    },
+    headers,
   });
 
   let payload: unknown = null;
 
   const contentType = response.headers.get("content-type") ?? "";
   if (contentType.includes("application/json")) {
-    payload = await response.json();
+    try {
+      payload = await response.json();
+    } catch (error) {
+      // A proxy or interrupted error response may claim JSON without sending
+      // valid JSON. Preserve its HTTP status so auth recovery and retry rules
+      // still work. Successful responses must satisfy their declared format.
+      if (response.ok || !(error instanceof SyntaxError)) throw error;
+    }
   } else {
     const text = await response.text();
     payload = text.length > 0 ? text : null;

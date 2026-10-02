@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { FileType, X, Check, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { FormatSummary } from "@/hooks/useBooksInfinite";
@@ -9,6 +9,8 @@ interface FormatFilterProps {
   selected: string[];
   onChange: (formats: string[]) => void;
   isLoading?: boolean;
+  error?: unknown;
+  onRetry?: () => void;
 }
 
 // Mobile bottom-sheet breakpoint — below this the panel renders as a sheet,
@@ -20,12 +22,16 @@ export const FormatFilter = memo(function FormatFilter({
   selected,
   onChange,
   isLoading,
+  error,
+  onRetry,
 }: FormatFilterProps) {
   const [open, setOpen] = useState(false);
+  const dialogId = useId();
+  const selectedSet = useMemo(() => new Set(selected), [selected]);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
 
-  const selectedCount = selected.length;
+  const selectedCount = selectedSet.size;
   const active = open || selectedCount > 0;
 
   const close = useCallback(() => setOpen(false), []);
@@ -38,16 +44,21 @@ export const FormatFilter = memo(function FormatFilter({
   // background scroll on desktop where the dropdown is small).
   useEffect(() => {
     if (!open) return;
-    if (!window.matchMedia(MOBILE_MAX).matches) return;
+    const media = window.matchMedia(MOBILE_MAX);
     const prev = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
+    const syncScrollLock = () => {
+      document.body.style.overflow = media.matches ? "hidden" : prev;
+    };
+    syncScrollLock();
+    media.addEventListener("change", syncScrollLock);
     return () => {
+      media.removeEventListener("change", syncScrollLock);
       document.body.style.overflow = prev;
     };
   }, [open]);
 
   const toggle = (name: string) => {
-    if (selected.includes(name)) {
+    if (selectedSet.has(name)) {
       onChange(selected.filter((x) => x !== name));
     } else {
       onChange([...selected, name]);
@@ -66,6 +77,7 @@ export const FormatFilter = memo(function FormatFilter({
         onClick={() => setOpen((o) => !o)}
         aria-haspopup="dialog"
         aria-expanded={open}
+        aria-controls={open ? dialogId : undefined}
         aria-label={triggerLabel}
         className={cn(
           "inline-flex items-center justify-center gap-1.5 rounded-lg border px-3 sm:px-3.5 h-10 sm:h-[46px] min-w-[44px] text-sm font-medium transition-colors",
@@ -75,12 +87,12 @@ export const FormatFilter = memo(function FormatFilter({
         )}
       >
         <FileType className="h-4 w-4" strokeWidth={1.75} />
-        <span className="hidden sm:inline">Formats</span>
+        <span>Formats</span>
         {selectedCount > 0 && (
           <span
             className={cn(
               "inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 rounded-full text-xs font-semibold",
-              open ? "bg-white/25 text-white" : "bg-accent text-white",
+              "bg-white/20 text-white",
             )}
           >
             {selectedCount}
@@ -91,13 +103,17 @@ export const FormatFilter = memo(function FormatFilter({
       {open && (
         <>
           {/* Click-catcher backdrop: faint on desktop, transparent scrim on mobile */}
-          <div
+          <button
+            type="button"
+            tabIndex={-1}
             className="fixed inset-0 z-40 bg-black/20 md:bg-black/10"
             onClick={close}
-            aria-hidden="true"
+            aria-label="Close file type filter"
           />
           <div
             ref={panelRef}
+            id={dialogId}
+            tabIndex={-1}
             role="dialog"
             aria-modal="true"
             aria-label="Filter by file type"
@@ -120,7 +136,7 @@ export const FormatFilter = memo(function FormatFilter({
                 type="button"
                 onClick={close}
                 aria-label="Close file type filter"
-                className="p-1.5 -mr-1.5 rounded-lg text-ink-muted hover:text-ink hover:bg-parchment-dark transition-colors"
+                className="flex h-10 w-10 -mr-1.5 items-center justify-center rounded-lg text-ink-muted hover:text-ink hover:bg-parchment-dark transition-colors"
               >
                 <X className="h-5 w-5" strokeWidth={1.75} />
               </button>
@@ -145,11 +161,24 @@ export const FormatFilter = memo(function FormatFilter({
             </div>
 
             {/* Scrollable format chips */}
-            <div className="flex-1 overflow-y-auto px-4 pb-4 pt-0.5 overscroll-contain">
+            <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-0.5 overscroll-contain">
               {isLoading ? (
                 <div className="flex items-center justify-center gap-2 py-8 text-ink-muted">
                   <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
                   <span className="text-sm">Loading file types…</span>
+                </div>
+              ) : error ? (
+                <div className="py-6 text-center text-sm text-ink-secondary" role="alert">
+                  <p>File types could not be loaded.</p>
+                  {onRetry && (
+                    <button
+                      type="button"
+                      onClick={onRetry}
+                      className="mt-2 min-h-10 px-3 font-semibold text-accent"
+                    >
+                      Try again
+                    </button>
+                  )}
                 </div>
               ) : !formats || formats.length === 0 ? (
                 <p className="py-8 text-center text-sm text-ink-tertiary">
@@ -158,7 +187,7 @@ export const FormatFilter = memo(function FormatFilter({
               ) : (
                 <div className="flex flex-wrap gap-2">
                   {formats.map((format) => {
-                    const isSelected = selected.includes(format.name);
+                    const isSelected = selectedSet.has(format.name);
                     return (
                       <button
                         key={format.name}
@@ -166,7 +195,7 @@ export const FormatFilter = memo(function FormatFilter({
                         onClick={() => toggle(format.name)}
                         aria-pressed={isSelected}
                         className={cn(
-                          "inline-flex items-center gap-1.5 min-h-[36px] px-3 py-1.5 rounded-full text-sm font-medium border transition-colors",
+                          "inline-flex items-center gap-1.5 min-h-10 px-3 py-1.5 rounded-full text-sm font-medium border transition-colors",
                           isSelected
                             ? "bg-accent text-white border-accent"
                             : "bg-surface text-ink-secondary border-ink hover:border-accent hover:text-ink",

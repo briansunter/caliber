@@ -14,13 +14,13 @@ import {
   countUsersWithPassword,
   createSession,
   createUserWithPassword,
-  deleteSessionsForUser,
+  deleteExpiredSessions,
+  deleteSession,
   getAuthEpoch,
   getCredentialByUsername,
   getSession,
   getUserById,
-  deleteSession,
-  deleteExpiredSessions,
+  normalizeUsername,
   setUserPassword,
   type User,
 } from "./user-db";
@@ -33,6 +33,7 @@ const BASIC_CACHE_TTL_MS = 5 * 60 * 1000;
 const BASIC_CACHE_MAX_ENTRIES = 10_000;
 const LOGIN_FAILURE_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_FAILURE_MAX = 10;
+const LOGIN_FAILURE_MAX_ENTRIES = 10_000;
 
 export function authEnabled(): boolean {
   return AUTH_ENABLED;
@@ -49,7 +50,9 @@ export function isValidPassword(password: string): boolean {
 }
 
 export async function hashPassword(password: string): Promise<string> {
-  return Bun.password.hash(password);
+  const hash = await withHashSlot(() => Bun.password.hash(password));
+  if (hash === null) throw new PasswordError("Too many password operations; try again later");
+  return hash;
 }
 
 export async function verifyPassword(password: string, hash: string): Promise<boolean> {
@@ -89,10 +92,12 @@ function randomSessionToken(): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-export function createSessionToken(userId: number): SessionToken {
+export function createSessionToken(userId: number, expectedAuthEpoch?: number): SessionToken {
   const token = randomSessionToken();
   const expiresAt = Date.now() + SESSION_TTL_MS;
-  createSession(sha256Hex(token), userId, expiresAt);
+  if (!createSession(sha256Hex(token), userId, expiresAt, expectedAuthEpoch)) {
+    throw new PasswordError("Credentials changed; sign in again");
+  }
   return { token, expiresAt };
 }
 
@@ -126,17 +131,19 @@ interface FailureEntry {
 }
 
 const loginFailures = new Map<string, FailureEntry>();
+let nextFailurePruneAt = 0;
 
 function clientKey(req: Request, username: string): string {
   const forwarded = TRUST_PROXY
     ? req.headers.get("X-Forwarded-For")?.split(",")[0]?.trim()
     : undefined;
   const ip = forwarded || "local";
-  return `${ip}|${username.trim().toLowerCase()}`;
+  return `${ip}|${normalizeUsername(username).toLowerCase()}`;
 }
 
 function pruneFailures(now: number): void {
-  if (loginFailures.size < 10_000) return;
+  if (loginFailures.size < LOGIN_FAILURE_MAX_ENTRIES || now < nextFailurePruneAt) return;
+  nextFailurePruneAt = now + 60_000;
   for (const [key, entry] of loginFailures) {
     if (entry.resetAt <= now) loginFailures.delete(key);
   }
@@ -156,6 +163,11 @@ function recordLoginFailure(req: Request, username: string): void {
   if (entry && entry.resetAt > now) {
     entry.count += 1;
   } else {
+    pruneFailures(now);
+    if (loginFailures.size >= LOGIN_FAILURE_MAX_ENTRIES && !entry) {
+      const oldestKey = loginFailures.keys().next().value;
+      if (oldestKey !== undefined) loginFailures.delete(oldestKey);
+    }
     loginFailures.set(key, { count: 1, resetAt: now + LOGIN_FAILURE_WINDOW_MS });
   }
 }
@@ -168,45 +180,104 @@ function clearLoginFailures(req: Request, username: string): void {
 // verifications across both the form and Basic paths to avoid starving the
 // event loop under credential-stuffing bursts.
 const MAX_CONCURRENT_HASHES = 4;
+const MAX_PENDING_HASHES = 64;
 let activeHashes = 0;
-const hashWaiters: Array<() => void> = [];
+const hashWaiters = new Set<() => void>();
 
-function withHashSlot<T>(fn: () => Promise<T>): Promise<T> {
-  if (activeHashes >= MAX_CONCURRENT_HASHES) {
-    return new Promise<T>((resolve, reject) => {
-      hashWaiters.push(() => {
-        void withHashSlot(fn).then(resolve, reject);
-      });
-    });
+function drainHashQueue(): void {
+  while (activeHashes < MAX_CONCURRENT_HASHES && hashWaiters.size > 0) {
+    const next = hashWaiters.values().next().value;
+    if (next === undefined) break;
+    hashWaiters.delete(next);
+    next();
   }
-  activeHashes += 1;
-  return fn().finally(() => {
-    activeHashes -= 1;
-    const next = hashWaiters.shift();
-    if (next) next();
+}
+
+// Native password work cannot be interrupted once started. Keep its slot
+// until completion, but immediately release canceled callers and remove
+// queued work so disconnected clients do not consume future CPU time.
+function withHashSlot<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T | null> {
+  if (
+    signal?.aborted ||
+    (activeHashes >= MAX_CONCURRENT_HASHES && hashWaiters.size >= MAX_PENDING_HASHES)
+  ) {
+    return Promise.resolve(null);
+  }
+  return new Promise<T | null>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal?.removeEventListener("abort", onAbort);
+    const finish = (value: T | null) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+    const onAbort = () => {
+      hashWaiters.delete(start);
+      finish(null);
+    };
+    const start = () => {
+      if (settled || signal?.aborted) {
+        finish(null);
+        return;
+      }
+      activeHashes += 1;
+      void Promise.resolve()
+        .then(fn)
+        .then(
+          (value) => finish(signal?.aborted ? null : value),
+          (error: unknown) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(error);
+          },
+        )
+        .finally(() => {
+          activeHashes -= 1;
+          drainHashQueue();
+        });
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (activeHashes < MAX_CONCURRENT_HASHES) start();
+    else hashWaiters.add(start);
   });
 }
 
 // Verify a username/password pair and update the failure throttle.
 // Returns the user on success, null on bad credentials.
+export interface VerifiedUser extends User {
+  authEpoch: number;
+}
+
 export async function authenticateWithPassword(
   req: Request,
   username: string,
   password: string,
-): Promise<User | null> {
+): Promise<VerifiedUser | null> {
+  if (req.signal.aborted || loginRateLimited(req, username)) return null;
   const credential = getCredentialByUsername(username);
   const passwordOk =
-    credential?.passwordHash != null && credential.passwordHash.length > 0
-      ? await withHashSlot(() => verifyPassword(password, credential.passwordHash as string))
+    credential?.passwordHash && password.length > 0 && password.length <= 512
+      ? await withHashSlot(
+          () =>
+            loginRateLimited(req, username)
+              ? Promise.resolve(false)
+              : verifyPassword(password, credential.passwordHash as string),
+          req.signal,
+        )
       : false;
 
-  if (!credential || !passwordOk) {
+  if (passwordOk === null || req.signal.aborted) return null;
+
+  if (!credential || !passwordOk || getAuthEpoch(credential.id) !== credential.authEpoch) {
     recordLoginFailure(req, username);
     return null;
   }
 
   clearLoginFailures(req, username);
-  return getUserById(credential.id);
+  const user = getUserById(credential.id);
+  return user ? { ...user, authEpoch: credential.authEpoch } : null;
 }
 
 // --- HTTP Basic Auth ---
@@ -215,7 +286,11 @@ const basicCache = new Map<string, { userId: number; authEpoch: number; expiresA
 
 function cacheBasicCredential(headerValue: string, userId: number, authEpoch: number): void {
   if (basicCache.size >= BASIC_CACHE_MAX_ENTRIES) basicCache.clear();
-  basicCache.set(sha256Hex(headerValue), { userId, authEpoch, expiresAt: Date.now() + BASIC_CACHE_TTL_MS });
+  basicCache.set(sha256Hex(headerValue), {
+    userId,
+    authEpoch,
+    expiresAt: Date.now() + BASIC_CACHE_TTL_MS,
+  });
 }
 
 function clearBasicCacheForUser(userId: number): void {
@@ -276,20 +351,10 @@ async function authenticateBasic(req: Request, headerValue: string): Promise<Use
   // Same throttle as the form path so OPDS guessing is rate-limited too.
   if (loginRateLimited(req, credentials.username)) return null;
 
-  const credential = getCredentialByUsername(credentials.username);
-  const passwordOk =
-    credential?.passwordHash != null && credential.passwordHash.length > 0
-      ? await withHashSlot(() => verifyPassword(credentials.password, credential.passwordHash as string))
-      : false;
-
-  if (!credential || !passwordOk) {
-    recordLoginFailure(req, credentials.username);
-    return null;
-  }
-
-  clearLoginFailures(req, credentials.username);
-  cacheBasicCredential(headerValue, credential.id, credential.authEpoch);
-  return getUserById(credential.id);
+  const user = await authenticateWithPassword(req, credentials.username, credentials.password);
+  if (!user || getAuthEpoch(user.id) !== user.authEpoch) return null;
+  cacheBasicCredential(headerValue, user.id, user.authEpoch);
+  return user;
 }
 
 // --- Request authentication ---
@@ -321,12 +386,14 @@ export function sessionTokenFromRequest(req: Request): string | null {
 // for anonymous or invalid credentials. When auth is disabled, always null —
 // callers fall back to the username-profile flow.
 export async function authenticateRequest(req: Request): Promise<AuthenticatedRequest | null> {
+  if (!AUTH_ENABLED || req.signal.aborted) return null;
   const cached = requestUserCache.get(req);
   if (cached) return cached;
 
   const authorization = req.headers.get("Authorization");
   if (authorization) {
     const user = await authenticateBasic(req, authorization);
+    if (req.signal.aborted) return null;
     if (user) {
       const result = { user, via: "basic" as const };
       requestUserCache.set(req, result);
@@ -372,7 +439,6 @@ export async function setPasswordForUser(username: string, password: string): Pr
   // (cross-process invalidation via the DB); also drop this process's cached
   // Basic entries for the user.
   setUserPassword(credential.id, hash);
-  deleteSessionsForUser(credential.id);
   clearBasicCacheForUser(credential.id);
   const user = getUserById(credential.id);
   if (!user) throw new PasswordError("Could not update user");

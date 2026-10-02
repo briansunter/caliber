@@ -79,7 +79,7 @@ async function waitForFrontend(url: string): Promise<void> {
       const response = await fetch(url);
       if (response.ok) {
         const html = await response.text();
-        const stylesheetHref = html.match(/<link rel="stylesheet" href="([^"]+)"/)?.[1];
+        const stylesheetHref = html.match(/<link\b[^>]*\brel="stylesheet"[^>]*\bhref="([^"]+)"/)?.[1];
         if (stylesheetHref) {
           const stylesheet = await fetch(new URL(stylesheetHref, url));
           if (stylesheet.ok && stylesheet.headers.get("content-type")?.includes("text/css")) {

@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useRef } from "react";
 import { Link } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import { X, Check, ChevronDown, ChevronUp, Trash2, Undo2 } from "lucide-react";
+import { X, ChevronDown, ChevronUp, Trash2, Undo2 } from "lucide-react";
 import { BookCoverImage } from "./BookCoverImage";
 import { isUnknownAuthor } from "@/lib/utils";
+import { useCurrentUser } from "@/lib/user";
 import {
   useReadingList,
   useRemoveFromReadingList,
@@ -23,13 +24,18 @@ const SORT_OPTIONS: { value: ReadingSort; label: string }[] = [
 ];
 
 interface UndoToast {
+  scope: string;
   key: number;
   message: string;
   items: ReadingListItem[];
 }
 
-export function RecentlyRead() {
+export function RecentlyRead({ libraryId }: { libraryId?: string }) {
   const { data, isLoading, isError } = useReadingList();
+  const { user } = useCurrentUser();
+  const scope = `${user?.id ?? "anon"}:${libraryId ?? "default"}`;
+  const scopeRef = useRef(scope);
+  scopeRef.current = scope;
   const queryClient = useQueryClient();
   const remove = useRemoveFromReadingList();
   const clear = useClearReadingList();
@@ -40,22 +46,32 @@ export function RecentlyRead() {
 
   const items = useMemo(() => sortReadingList(data?.items ?? [], sort), [data?.items, sort]);
 
-  // Auto-dismiss the undo toast after 6s.
+  // A profile switch must never carry an undo snapshot into the next shelf.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: profile changes intentionally clear local UI state.
+  useEffect(() => {
+    setToast(null);
+    setConfirmClear(false);
+  }, [scope]);
+
+  // Auto-dismiss the undo toast after 8s.
   useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => {
       setToast((cur) => (cur?.key === toast.key ? null : cur));
-    }, 6000);
+    }, 8000);
     return () => clearTimeout(t);
   }, [toast]);
 
   const undo = () => {
     const snapshot = toast;
-    if (!snapshot) return;
+    if (!snapshot || snapshot.scope !== scopeRef.current) {
+      setToast(null);
+      return;
+    }
     setToast(null);
     // Restore the shelf optimistically, then re-save each entry. The
-    // re-save lands after the deletion tombstone (ts >= deletedAt), so the
-    // documented last-writer-wins policy resurrects the rows server-side.
+    // deletion sequence acknowledged by the mutation authorizes restoration
+    // without losing the saved reader location.
     try {
       const current = queryClient.getQueryData<{ items: ReadingListItem[] }>(["reading-list"]);
       const seen = new Set((current?.items ?? []).map((i) => i.book.id));
@@ -70,7 +86,7 @@ export function RecentlyRead() {
       try {
         saveBookProgress(entry.book.id, {
           format: entry.progress.format,
-          location: null,
+          location: entry.progress.location ?? null,
           percentage: entry.progress.percentage,
           finished: entry.progress.finished,
         });
@@ -78,45 +94,93 @@ export function RecentlyRead() {
     }
   };
 
+  const busy = remove.isPending || clear.isPending;
   const handleRemove = (item: ReadingListItem) => {
-    setToast({
-      key: Date.now(),
-      message: `Removed “${item.book.title}”.`,
-      items: [item],
+    if (busy) return;
+    const requestScope = scope;
+    remove.mutate(item.book.id, {
+      onSuccess: () => {
+        if (requestScope !== scopeRef.current) return;
+        setToast({
+          scope: requestScope,
+          key: Date.now(),
+          message: `Removed “${item.book.title}”.`,
+          items: [item],
+        });
+      },
     });
-    remove.mutate(item.book.id);
   };
 
   const handleClear = () => {
-    if (items.length > 0) {
-      setToast({
-        key: Date.now(),
-        message: `Cleared ${items.length} recently read book${items.length === 1 ? "" : "s"}.`,
-        items,
-      });
-    }
-    clear.mutate();
-    setConfirmClear(false);
-    setExpanded(false);
+    if (busy) return;
+    const snapshot = items;
+    const requestScope = scope;
+    clear.mutate(undefined, {
+      onSuccess: () => {
+        if (requestScope !== scopeRef.current) return;
+        if (snapshot.length)
+          setToast({
+            scope: requestScope,
+            key: Date.now(),
+            message: `Cleared ${snapshot.length} recently read book${snapshot.length === 1 ? "" : "s"}.`,
+            items: snapshot,
+          });
+        setConfirmClear(false);
+        setExpanded(false);
+      },
+    });
   };
+
+  const undoToast = toast && toast.scope === scope && (
+    <output
+      aria-live="polite"
+      className="fixed bottom-4 left-1/2 z-50 flex max-w-[calc(100vw-2rem)] -translate-x-1/2 items-center gap-2 rounded-lg border border-ink bg-surface px-3 py-2 shadow-xl"
+    >
+      <span className="max-w-[50vw] truncate text-sm text-ink">{toast.message}</span>
+      <button
+        type="button"
+        onClick={undo}
+        aria-label="Undo remove from recently read"
+        className="flex flex-shrink-0 items-center gap-1 rounded-md bg-ink px-2.5 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+      >
+        <Undo2 className="h-3.5 w-3.5" strokeWidth={2} />
+        Undo
+      </button>
+      <button
+        type="button"
+        onClick={() => setToast(null)}
+        aria-label="Dismiss notification"
+        className="flex-shrink-0 rounded-md p-1 text-ink-muted transition-colors hover:bg-parchment-dark hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+      >
+        <X className="h-4 w-4" strokeWidth={2} />
+      </button>
+    </output>
+  );
+  const mutationError = remove.error || clear.error;
+  const errorBanner = mutationError ? (
+    <p role="alert" className="mb-3 text-sm text-error">
+      Could not update your reading history. Please try again.
+    </p>
+  ) : null;
 
   // Loading skeleton keeps the shelf space stable while the reading list
   // resolves. Signed-out (error) stays hidden, as does an empty shelf.
   if (isLoading) {
     return (
-      <section className="mb-4 sm:mb-6" aria-label="Loading recently read" aria-busy="true">
+      <section
+        className="recently-read-section"
+        aria-label="Loading recently read"
+        aria-busy="true"
+      >
         <div className="mb-2 flex items-center gap-3">
           <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-secondary">
             Recently read
           </h2>
         </div>
-        <div
-          className="grid grid-cols-3 gap-2 sm:grid-cols-4 sm:gap-3 md:grid-cols-6"
-          aria-hidden="true"
-        >
+        <div className="recent-reading-grid" aria-hidden="true">
           {Array.from({ length: COLLAPSED_COUNT }, (_, i) => `recent-skeleton-${i}`).map((key) => (
-            <div key={key} className="overflow-hidden rounded-lg border border-ink bg-surface">
-              <div className="aspect-[2/3] w-full animate-pulse bg-parchment-dark/70" />
+            <div key={key} className="flex gap-3 rounded-lg border border-ink bg-surface p-3">
+              <div className="h-24 w-16 flex-shrink-0 animate-pulse rounded bg-parchment-dark/70" />
               <div className="flex min-h-[52px] flex-col gap-1.5 p-1.5">
                 <div className="h-3 w-4/5 animate-pulse rounded bg-parchment-dark/70" />
                 <div className="h-2.5 w-3/5 animate-pulse rounded bg-parchment-dark/70" />
@@ -129,13 +193,20 @@ export function RecentlyRead() {
   }
 
   // Hidden entirely when signed out or nothing read yet.
-  if (isError || items.length === 0) return null;
+  if (isError || items.length === 0)
+    return (
+      <>
+        {errorBanner}
+        {undoToast}
+      </>
+    );
 
   const visible = expanded ? items : items.slice(0, COLLAPSED_COUNT);
   const hasMore = items.length > COLLAPSED_COUNT;
 
   return (
-    <section className="mb-4 sm:mb-6">
+    <section id="recently-read" className="recently-read-section" aria-label="Recently read">
+      {errorBanner}
       <div className="mb-2 flex items-center gap-3">
         <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-secondary">
           Recently read
@@ -163,6 +234,7 @@ export function RecentlyRead() {
               <button
                 type="button"
                 onClick={handleClear}
+                disabled={busy}
                 className="rounded-md bg-red-600 px-2 py-1 text-xs font-semibold text-white hover:bg-red-700 transition-colors"
               >
                 Clear all
@@ -179,6 +251,7 @@ export function RecentlyRead() {
             <button
               type="button"
               onClick={() => setConfirmClear(true)}
+              disabled={busy}
               className="flex items-center gap-1 rounded-md border border-ink px-2 py-1 text-xs text-ink-secondary hover:text-ink hover:bg-parchment-dark transition-colors"
               title="Clear recently read"
             >
@@ -189,9 +262,15 @@ export function RecentlyRead() {
         </div>
       </div>
 
-      <div className="grid grid-cols-3 gap-2 sm:grid-cols-4 sm:gap-3 md:grid-cols-6">
+      <div className="recent-reading-grid">
         {visible.map((item) => (
-          <ReadingCard key={item.book.id} item={item} onRemove={() => handleRemove(item)} />
+          <ReadingCard
+            key={item.book.id}
+            item={item}
+            busy={busy}
+            libraryId={libraryId}
+            onRemove={() => handleRemove(item)}
+          />
         ))}
       </div>
 
@@ -214,101 +293,66 @@ export function RecentlyRead() {
           </button>
         </div>
       )}
-      {toast && (
-        <output
-          aria-live="polite"
-          className="fixed bottom-4 left-1/2 z-50 flex max-w-[calc(100vw-2rem)] -translate-x-1/2 items-center gap-2 rounded-lg border border-ink bg-surface px-3 py-2 shadow-xl"
-        >
-          <span className="max-w-[50vw] truncate text-sm text-ink">{toast.message}</span>
-          <button
-            type="button"
-            onClick={undo}
-            aria-label="Undo remove from recently read"
-            className="flex flex-shrink-0 items-center gap-1 rounded-md bg-ink px-2.5 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-          >
-            <Undo2 className="h-3.5 w-3.5" strokeWidth={2} />
-            Undo
-          </button>
-          <button
-            type="button"
-            onClick={() => setToast(null)}
-            aria-label="Dismiss notification"
-            className="flex-shrink-0 rounded-md p-1 text-ink-muted transition-colors hover:bg-parchment-dark hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-          >
-            <X className="h-4 w-4" strokeWidth={2} />
-          </button>
-        </output>
-      )}
+      {undoToast}
     </section>
   );
 }
 
-function ReadingCard({ item, onRemove }: { item: ReadingListItem; onRemove: () => void }) {
+function ReadingCard({
+  item,
+  onRemove,
+  busy,
+  libraryId,
+}: {
+  item: ReadingListItem;
+  onRemove: () => void;
+  busy: boolean;
+  libraryId?: string;
+}) {
   const { book, progress } = item;
   const unknown = isUnknownAuthor(book.authors);
-  const pct = Math.round(progress.percentage);
-
+  const pct = Math.max(0, Math.min(100, Math.round(progress.percentage)));
   return (
-    <div className="group relative">
+    <div className="group relative recent-reading-card">
       <button
         type="button"
-        onClick={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          onRemove();
-        }}
+        onClick={onRemove}
+        disabled={busy}
         aria-label={`Remove ${book.title} from recently read`}
         title="Remove"
-        className="absolute right-1 top-1 z-10 flex h-8 w-8 items-center justify-center rounded-full bg-ink/80 text-white shadow-sm transition-opacity hover:bg-ink sm:h-6 sm:w-6 sm:opacity-0 sm:group-hover:opacity-100 sm:focus:opacity-100"
+        className="absolute right-1.5 top-1.5 z-10 flex h-7 w-7 items-center justify-center rounded-full text-ink-tertiary hover:bg-parchment-dark hover:text-ink disabled:opacity-40"
       >
-        <X className="h-4 w-4 sm:h-3.5 sm:w-3.5" strokeWidth={2} />
+        <X className="h-3.5 w-3.5" strokeWidth={1.7} />
       </button>
-
       <Link
         to="/book/$id"
         params={{ id: String(book.id) }}
         aria-label={book.title}
-        className="flex flex-col overflow-hidden rounded-lg border border-ink bg-surface transition-[box-shadow,border-color] hover:border-accent/50 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        className="recent-reading-link hover:bg-parchment-dark/40 transition-colors"
       >
-        <div className="relative aspect-[2/3] w-full overflow-hidden bg-parchment-dark">
+        <div className="recent-reading-cover">
           <BookCoverImage
             bookId={book.id}
             title={book.title}
             hasCover={book.has_cover}
-            width={240}
-            height={360}
+            authKey={libraryId}
+            width={130}
+            height={196}
           />
-          {progress.finished ? (
-            <span className="absolute bottom-1 left-1 flex items-center gap-0.5 rounded bg-emerald-700/90 px-1.5 py-0.5 text-[10px] font-semibold text-white">
-              <Check className="h-3 w-3" strokeWidth={2.5} /> Read
-            </span>
-          ) : (
-            pct > 0 && (
-              <span className="absolute bottom-1 left-1 rounded bg-ink/80 px-1.5 py-0.5 text-[10px] font-semibold text-white">
-                {pct}%
-              </span>
-            )
-          )}
-          {/* Progress bar */}
-          <div className="absolute inset-x-0 bottom-0 h-1 bg-black/20">
-            <div
-              className={`h-full ${progress.finished ? "bg-emerald-500" : "bg-accent"}`}
-              style={{ width: `${progress.finished ? 100 : pct}%` }}
-            />
-          </div>
         </div>
-        <div className="flex min-h-[52px] flex-col gap-0.5 p-1.5">
-          <span
-            title={book.title}
-            className="line-clamp-2 text-[12px] font-semibold leading-snug text-ink"
-          >
+        <div className="recent-reading-info">
+          <span title={book.title} className="recent-reading-title line-clamp-2">
             {book.title}
           </span>
           {!unknown && (
-            <span className="truncate text-[11px] text-ink-tertiary">
-              {book.authors?.join(", ")}
-            </span>
+            <span className="recent-reading-author truncate">{book.authors?.join(", ")}</span>
           )}
+          <div className="recent-reading-progress">
+            <span>{progress.finished ? "Finished" : `${pct}% complete`}</span>
+            <div className="recent-reading-track">
+              <div style={{ width: `${progress.finished ? 100 : pct}%` }} />
+            </div>
+          </div>
         </div>
       </Link>
     </div>

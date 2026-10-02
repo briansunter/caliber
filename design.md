@@ -1,14 +1,15 @@
 # Caliber design system
 
-Caliber is a quiet, paper-like library surface: the catalogue stays bright and readable, while ink-black branding and indigo actions provide a clear visual spine. Reader screens intentionally switch to dark, low-distraction controls.
+Caliber is a quiet personal reading space: warm ivory surfaces, forest green actions, charcoal text, and an editorial bookshelf. Dark reader canvases retain their low-distraction controls.
 
 ## Visual direction
 
-- **Surface:** cool paper background (`#fafafa`) with white elevated cards and a barely visible paper texture.
-- **Ink:** near-black text and controls for high contrast and a strong brand mark.
-- **Accent:** indigo for links, focus rings, selected filters, ratings, and primary actions.
-- **Shape:** restrained 6–14px rounding, thin ink borders, and small shadows that distinguish surfaces without making the catalogue feel like a dashboard.
-- **Signature detail:** the repeating paper texture and centered ornamental footer divider establish the library feel without decorative noise.
+- Background: warm paper (`#f8f7f3`) with white control and settings surfaces.
+- Ink: charcoal (`#242923`) for clear, readable text.
+- Accent: forest green (`#285a48`) for selected navigation, actions, links, and focus rings.
+- Display typography: system Georgia for the welcome headline and book detail titles. UI text uses the system sans-serif stack. No network font request is required.
+- Shape: restrained 6–12px rounding, light borders, and subtle cover shadows. Books sit on an open shelf rather than inside dashboard cards.
+- Missing covers use a deterministic muted palette and title treatment. Compact list thumbnails use initials, including non-Latin titles.
 
 ## Tokens
 
@@ -16,43 +17,43 @@ The source of truth is `styles/globals.css`.
 
 ```css
 :root {
-  --bg: #fafafa;
+  --bg: #f8f7f3;
   --bg-elevated: #ffffff;
-  --bg-muted: #f5f5f5;
-  --bg-subtle: #f0f0f0;
-  --text: #171717;
-  --text-secondary: #525252;
-  --text-tertiary: #737373;
-  --text-muted: #a3a3a3;
-  --accent: #4f46e5;
-  --accent-hover: #4338ca;
-  --border-default: rgba(0, 0, 0, 0.08);
+  --bg-muted: #f0eee7;
+  --bg-subtle: #e9e6dc;
+  --text: #242923;
+  --text-secondary: #565e53;
+  --text-tertiary: #73796d;
+  --text-muted: #858b7f;
+  --accent: #285a48;
+  --accent-hover: #1e4738;
 }
 ```
 
-Use semantic classes such as `bg-surface`, `bg-parchment`, `text-ink`, `text-ink-secondary`, and `border-ink`. Avoid adding literal white catalogue surfaces; reader overlays may use translucent white controls on their dark canvas.
+Use semantic classes such as `bg-surface`, `bg-parchment`, `text-ink`, and `border-ink`. Reader overlays may use translucent white controls on their dark canvas.
 
 ## Layout
 
-- The home page uses one responsive content column capped at `max-w-7xl`.
-- Search, filters, and view controls remain visible in a sticky toolbar.
-- List and grid views use virtual scrolling and should keep their row/card geometry stable.
-- Cards and table sections are elevated surfaces with borders, so they remain distinct from the paper background on small and large screens.
-- Detail and Settings routes provide a `#main-content` landmark and a keyboard-visible skip link is available from the root layout.
-
-## Typography
-
-Inter is the primary UI font with system fallbacks. Titles use a compact semibold hierarchy; metadata is smaller and muted. Long titles and author names must truncate or wrap safely rather than overflow controls.
+- Desktop library navigation occupies a 232px sidebar. Mobile uses a compact header with the same profile and settings controls.
+- The main content is capped at 1500px. A welcome section and simple library counts lead into the bookshelf.
+- The toolbar wraps on small screens. Its actual height determines the sticky list header offset.
+- Grid and list views use window virtualization. Covers reserve a 2:3 aspect ratio; grid layout derives from the actual container width. Compact list rows are 56px; comfortable rows are 72px.
+- Recent books use small horizontal cards with saved progress and a working Undo action even after removing the final item.
+- URL parameters preserve search, view, sorting, tags, and formats. Grid is the default. Scroll anchors are scoped to the query, view, user, and library.
 
 ## Interaction and accessibility
 
-- Every icon-only control has an accessible label and a visible focus ring.
-- Search and settings inputs have labels or accessible names, stable IDs, and useful autocomplete semantics.
-- Async loading/error messages use ellipsis and live regions where appropriate; errors include a retry action when the request can be retried.
-- Cover images reserve their aspect ratio and fall back to deterministic initials if a Calibre cover is missing or fails to load.
-- `prefers-reduced-motion` removes animation and transitions.
-- Reader toolbars are dark by design; catalogue surfaces must preserve contrast between `bg-surface`, `bg-parchment`, borders, and text.
+- Every icon-only control has an accessible name and visible keyboard focus.
+- Search supports composition input, debouncing, Enter, and clearing. Changing URL state cancels older pending searches.
+- Filters expose selected counts and removable chips. Dialogs support Escape, focus trapping, and focus return; mobile sheets lock background scrolling.
+- Loading, empty, offline, and error states distinguish their causes. Recoverable failures include a retry control.
+- Failed facet requests display an error instead of claiming that the library has no tags or formats.
+- Profile and library changes clear stale data and prevent pending operations from restoring another shelf.
+- Cover URLs include library identity so switching libraries cannot reuse old artwork.
+- Reduced-motion preferences remove animation and transitions.
 
-## Reader screens
+## Readers
 
-EPUB, PDF, and comic readers use a dark canvas with translucent controls. Reader content is sandboxed where possible, streamed through bounded endpoints, and uses explicit back, zoom, page, load-mode, and settings labels. Do not reuse the dark reader palette for catalogue pages.
+EPUB, PDF, and comic readers use explicit back, page, zoom, load-mode, and settings controls. Hidden chrome is inert. Position input is committed on Enter or blur and reverted on Escape. Only successfully displayed pages update reading progress. Corrupt saved positions are validated; stale locations can recover without a complete book reload. Streaming EPUB mode does not load every chapter just to calculate progress.
+
+Arrow keys and Space turn pages without scrolling the next page; Shift+Space goes back. Browser shortcuts and text composition retain their normal behavior. If a reader fails to load, its recovery screen offers reload or return to the library.

@@ -30,13 +30,13 @@ export function isUnknownAuthor(authors?: string[] | null): boolean {
 }
 
 export function coverInitials(title: string): string {
-  const cleaned = title.replace(/[^A-Za-z0-9]+/g, " ").trim();
+  const cleaned = title.replace(/[^\p{L}\p{N}]+/gu, " ").trim();
   if (!cleaned) return "?";
   const words = cleaned.split(" ");
   const first = words[0];
   const second = words[1];
   if (first && second && first[0] && second[0]) {
-    return (first[0] + second[0]).toUpperCase();
+    return ((Array.from(first)[0] ?? "") + (Array.from(second)[0] ?? "")).toUpperCase();
   }
-  return cleaned.slice(0, 2).toUpperCase();
+  return Array.from(cleaned).slice(0, 2).join("").toUpperCase();
 }

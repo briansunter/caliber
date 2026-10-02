@@ -1,4 +1,13 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Tags, X, Check, Search, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { TagSummary } from "@/hooks/useBooksInfinite";
@@ -9,6 +18,8 @@ interface TagFilterProps {
   selectedIds: number[];
   onChange: (ids: number[]) => void;
   isLoading?: boolean;
+  error?: unknown;
+  onRetry?: () => void;
 }
 
 // Mobile bottom-sheet breakpoint — below this the panel renders as a sheet,
@@ -20,14 +31,19 @@ export const TagFilter = memo(function TagFilter({
   selectedIds,
   onChange,
   isLoading,
+  error,
+  onRetry,
 }: TagFilterProps) {
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState("");
+  const deferredFilter = useDeferredValue(filter);
+  const dialogId = useId();
+  const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const inputRef = useRef<HTMLInputElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
 
-  const selectedCount = selectedIds.length;
+  const selectedCount = selectedSet.size;
   const active = open || selectedCount > 0;
 
   const close = useCallback(() => setOpen(false), []);
@@ -41,10 +57,15 @@ export const TagFilter = memo(function TagFilter({
   // background scroll on desktop where the dropdown is small).
   useEffect(() => {
     if (!open) return;
-    if (!window.matchMedia(MOBILE_MAX).matches) return;
+    const media = window.matchMedia(MOBILE_MAX);
     const prev = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
+    const syncScrollLock = () => {
+      document.body.style.overflow = media.matches ? "hidden" : prev;
+    };
+    syncScrollLock();
+    media.addEventListener("change", syncScrollLock);
     return () => {
+      media.removeEventListener("change", syncScrollLock);
       document.body.style.overflow = prev;
     };
   }, [open]);
@@ -58,25 +79,21 @@ export const TagFilter = memo(function TagFilter({
   }, [open]);
 
   const filteredTags = useMemo(() => {
-    const q = filter.trim().toLowerCase();
-    if (!q || !tags) return tags ?? [];
-    return tags.filter((t) => t.name.toLowerCase().includes(q));
-  }, [tags, filter]);
-
-  // Cap the number of chips rendered at once so libraries with hundreds/thousands
-  // of tags stay snappy. With no filter active the list is already sorted by
-  // popularity (count desc), so showing the top slice surfaces the most useful
-  // tags; typing in the search box narrows past the cap.
+    const q = deferredFilter.trim().toLowerCase();
+    if (q) return tags?.filter((tag) => tag.name.toLowerCase().includes(q)) ?? [];
+    // Keep active filters discoverable even when they are outside the popular slice.
+    const chosen: TagSummary[] = [];
+    const remaining: TagSummary[] = [];
+    for (const tag of tags ?? []) (selectedSet.has(tag.id) ? chosen : remaining).push(tag);
+    return [...chosen, ...remaining];
+  }, [tags, deferredFilter, selectedSet]);
   const RENDER_CAP = 300;
-  const isFiltering = filter.trim().length > 0;
-  const visibleTags =
-    !isFiltering && filteredTags.length > RENDER_CAP
-      ? filteredTags.slice(0, RENDER_CAP)
-      : filteredTags;
+  const isFiltering = deferredFilter.trim().length > 0;
+  const visibleTags = filteredTags.slice(0, RENDER_CAP);
   const hiddenCount = filteredTags.length - visibleTags.length;
 
   const toggle = (id: number) => {
-    if (selectedIds.includes(id)) {
+    if (selectedSet.has(id)) {
       onChange(selectedIds.filter((x) => x !== id));
     } else {
       onChange([...selectedIds, id]);
@@ -95,6 +112,7 @@ export const TagFilter = memo(function TagFilter({
         onClick={() => setOpen((o) => !o)}
         aria-haspopup="dialog"
         aria-expanded={open}
+        aria-controls={open ? dialogId : undefined}
         aria-label={triggerLabel}
         className={cn(
           "inline-flex items-center justify-center gap-1.5 rounded-lg border px-3 sm:px-3.5 h-10 sm:h-[46px] min-w-[44px] text-sm font-medium transition-colors",
@@ -104,12 +122,12 @@ export const TagFilter = memo(function TagFilter({
         )}
       >
         <Tags className="h-4 w-4" strokeWidth={1.75} />
-        <span className="hidden sm:inline">Tags</span>
+        <span>Tags</span>
         {selectedCount > 0 && (
           <span
             className={cn(
               "inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 rounded-full text-xs font-semibold",
-              open ? "bg-white/25 text-white" : "bg-accent text-white",
+              "bg-white/20 text-white",
             )}
           >
             {selectedCount}
@@ -120,13 +138,17 @@ export const TagFilter = memo(function TagFilter({
       {open && (
         <>
           {/* Click-catcher backdrop: faint on desktop, transparent scrim on mobile */}
-          <div
+          <button
+            type="button"
+            tabIndex={-1}
             className="fixed inset-0 z-40 bg-black/20 md:bg-black/10"
             onClick={close}
-            aria-hidden="true"
+            aria-label="Close tag filter"
           />
           <div
             ref={panelRef}
+            id={dialogId}
+            tabIndex={-1}
             role="dialog"
             aria-modal="true"
             aria-label="Filter by tags"
@@ -149,7 +171,7 @@ export const TagFilter = memo(function TagFilter({
                 type="button"
                 onClick={close}
                 aria-label="Close tag filter"
-                className="p-1.5 -mr-1.5 rounded-lg text-ink-muted hover:text-ink hover:bg-parchment-dark transition-colors"
+                className="flex h-10 w-10 -mr-1.5 items-center justify-center rounded-lg text-ink-muted hover:text-ink hover:bg-parchment-dark transition-colors"
               >
                 <X className="h-5 w-5" strokeWidth={1.75} />
               </button>
@@ -188,7 +210,8 @@ export const TagFilter = memo(function TagFilter({
                   value={filter}
                   onChange={(e) => setFilter(e.target.value)}
                   placeholder="Filter tags…"
-                  className="input pl-9 pr-9 py-2 text-sm"
+                  className="input py-2 text-sm"
+                  style={{ paddingInline: "2.25rem" }}
                   aria-label="Filter tags by name"
                 />
                 {filter && (
@@ -205,11 +228,24 @@ export const TagFilter = memo(function TagFilter({
             </div>
 
             {/* Scrollable tag chips */}
-            <div className="flex-1 overflow-y-auto px-4 pb-4 pt-0.5 overscroll-contain">
+            <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-0.5 overscroll-contain">
               {isLoading ? (
                 <div className="flex items-center justify-center gap-2 py-8 text-ink-muted">
                   <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
                   <span className="text-sm">Loading tags…</span>
+                </div>
+              ) : error ? (
+                <div className="py-6 text-center text-sm text-ink-secondary" role="alert">
+                  <p>Tags could not be loaded.</p>
+                  {onRetry && (
+                    <button
+                      type="button"
+                      onClick={onRetry}
+                      className="mt-2 min-h-10 px-3 font-semibold text-accent"
+                    >
+                      Try again
+                    </button>
+                  )}
                 </div>
               ) : filteredTags.length === 0 ? (
                 <p className="py-8 text-center text-sm text-ink-tertiary">
@@ -221,7 +257,7 @@ export const TagFilter = memo(function TagFilter({
                 <>
                   <div className="flex flex-wrap gap-2">
                     {visibleTags.map((tag) => {
-                      const selected = selectedIds.includes(tag.id);
+                      const selected = selectedSet.has(tag.id);
                       return (
                         <button
                           key={tag.id}
@@ -229,7 +265,7 @@ export const TagFilter = memo(function TagFilter({
                           onClick={() => toggle(tag.id)}
                           aria-pressed={selected}
                           className={cn(
-                            "inline-flex items-center gap-1.5 min-h-[36px] px-3 py-1.5 rounded-full text-sm font-medium border transition-colors",
+                            "inline-flex items-center gap-1.5 min-h-10 px-3 py-1.5 rounded-full text-sm font-medium border transition-colors",
                             selected
                               ? "bg-accent text-white border-accent"
                               : "bg-surface text-ink-secondary border-ink hover:border-accent hover:text-ink",
@@ -251,9 +287,9 @@ export const TagFilter = memo(function TagFilter({
                   </div>
                   {hiddenCount > 0 && (
                     <p className="mt-3 text-xs text-ink-tertiary">
-                      Showing the {visibleTags.length} most-used tags.{" "}
-                      {hiddenCount.toLocaleString()} more hidden — use the search box above to find
-                      them.
+                      Showing {visibleTags.length.toLocaleString()} of{" "}
+                      {filteredTags.length.toLocaleString()}{" "}
+                      {isFiltering ? "matching" : "most-used"} tags. Refine your search to see more.
                     </p>
                   )}
                 </>

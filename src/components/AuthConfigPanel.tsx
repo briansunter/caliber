@@ -19,7 +19,7 @@ function errorText(error: unknown): string {
 const inputClass =
   "rounded-md border border-ink bg-surface px-2 py-1.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-accent";
 const secondaryButtonClass =
-  "inline-flex items-center gap-1.5 rounded-lg border border-ink px-3 py-1.5 text-sm text-ink-muted hover:text-ink hover:bg-ink/5 transition-colors disabled:opacity-40";
+  "inline-flex min-h-11 items-center gap-1.5 rounded-lg border border-ink px-3 py-1.5 text-sm text-ink-muted hover:text-ink hover:bg-ink/5 transition-colors disabled:opacity-40";
 
 export function AuthConfigPanel() {
   const { config, isLoading } = useAuthConfig();
@@ -74,7 +74,11 @@ export function AuthConfigPanel() {
   };
 
   const disable = () => {
-    if (!window.confirm("Disable authentication? The web app, API, and OPDS will be open to anyone who can reach this server.")) {
+    if (
+      !window.confirm(
+        "Disable authentication? The web app, API, and OPDS will be open to anyone who can reach this server.",
+      )
+    ) {
       return;
     }
     setMessage(null);
@@ -159,28 +163,34 @@ export function AuthConfigPanel() {
 
       {config && !config.canManage && (
         <output className="block text-xs text-amber-700">
-          Authentication settings are available only while Caliber runs on localhost (or while
-          signed in). Use CALIBER_AUTH_ENABLED to configure it for an exposed deployment.
+          Authentication management is disabled for this server. For local setup, set{" "}
+          <code>CALIBER_ALLOW_NOAUTH_ADMIN=1</code> and restart Caliber. Remote management requires
+          a signed-in account and permission from the server configuration.
         </output>
       )}
 
       {config?.envControlled && (
         <output className="block text-xs text-amber-700">
-          The on/off state is controlled by the CALIBER_AUTH_ENABLED environment variable; use it
-          to change it. Accounts can still be managed below.
+          The on/off state is controlled by the CALIBER_AUTH_ENABLED environment variable; use it to
+          change it. Accounts can still be managed below.
         </output>
       )}
 
-      {config && !config.authEnabled && (
+      {config?.canManage && !config.authEnabled && (
         <div className="flex flex-col gap-3">
           {config.hasAccounts ? (
             <>
               <p className="text-sm text-ink">
-                Authentication is <strong>off</strong>. Accounts exist and will be required to
-                sign in once it is enabled.
+                Authentication is <strong>off</strong>. Accounts exist and will be required to sign
+                in once it is enabled.
               </p>
               <div>
-                <button type="button" onClick={enable} disabled={!canToggle || busy} className="btn-primary disabled:cursor-not-allowed disabled:opacity-50">
+                <button
+                  type="button"
+                  onClick={enable}
+                  disabled={!canToggle || busy}
+                  className="btn-primary disabled:cursor-not-allowed disabled:opacity-50"
+                >
                   <span className="inline-flex items-center gap-1.5">
                     <KeyRound className="h-4 w-4" strokeWidth={1.5} />
                     Enable authentication
@@ -204,8 +214,8 @@ export function AuthConfigPanel() {
               className="flex flex-col gap-3 max-w-sm"
             >
               <p className="text-sm text-ink">
-                Authentication is <strong>off</strong>. Enable it and create the first account —
-                you will be signed in immediately.
+                Authentication is <strong>off</strong>. Enable it and create the first account — you
+                will be signed in immediately.
               </p>
               <div className="flex flex-col gap-1.5">
                 <label htmlFor="auth-admin-username" className="text-sm font-medium text-ink">
@@ -313,9 +323,11 @@ export function AuthConfigPanel() {
             <ul className="flex flex-col divide-y divide-ink/10">
               {config.users.map((user) => (
                 <li key={user.id} className="py-2 flex flex-col gap-2">
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="text-sm text-ink font-medium">{user.username}</span>
-                    <div className="flex items-center gap-2">
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+                    <span className="min-w-0 break-all text-sm text-ink font-medium">
+                      {user.username}
+                    </span>
+                    <div className="flex shrink-0 flex-wrap items-center gap-2">
                       <button
                         type="button"
                         onClick={() => {

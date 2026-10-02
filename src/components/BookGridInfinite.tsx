@@ -1,13 +1,19 @@
-import { memo, useEffect, useState, useCallback, useRef } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { memo, useEffect, useCallback, useRef } from "react";
 
 import { useWindowVirtualizer } from "@tanstack/react-virtual";
 import { useFlattenedBooks, type SortConfig } from "@/hooks/useBooksInfinite";
 import type { BookListItem } from "@/lib/calibre-optimized";
 import { Link } from "@tanstack/react-router";
-import { BookOpen, Search, Loader2 } from "lucide-react";
+import { BookOpen, Search, Loader2, Star } from "lucide-react";
 import { isUnknownAuthor } from "@/lib/utils";
 import { BookCoverImage } from "./BookCoverImage";
+import { useBookListLayout, useBookScrollRestoration } from "@/hooks/useBookListViewport";
+import {
+  bookGridLayout,
+  BOOK_GRID_COLUMN_GAP,
+  BOOK_GRID_ROW_GAP,
+  BOOK_GRID_METADATA_HEIGHT,
+} from "@/lib/book-list-layout";
 
 interface BookGridInfiniteProps {
   searchQuery: string;
@@ -15,46 +21,66 @@ interface BookGridInfiniteProps {
   tagIds?: number[];
   formats?: string[];
   onClearFilters?: () => void;
+  stickyOffset?: number;
+  libraryId?: string;
 }
 
-const CARD_GAP = 16;
-const CARD_MIN_WIDTH = 140;
-
-// Fallback scroll margin used before the runtime measurement below runs.
-// Devtools-measured sticky chrome above the grid ~120px (desktop + mobile:
-// search bar ~64px + section/filter header ~56px); the measured list origin
-// replaces this fallback at mount and on resize.
-const GRID_SCROLL_MARGIN_FALLBACK = 120;
-
-const GridCard = memo(function GridCard({ book }: { book: BookListItem }) {
+const GridCard = memo(function GridCard({
+  book,
+  libraryId,
+}: {
+  book: BookListItem;
+  libraryId?: string;
+}) {
   const unknown = isUnknownAuthor(book.authors);
+  const formats = book.formats?.map((format) => format.toUpperCase()) ?? [];
+  const format = formats.includes("EPUB") ? "EPUB" : formats.includes("PDF") ? "PDF" : formats[0];
+  const rating = book.rating ? Math.min(5, Math.max(0, book.rating / 2)) : null;
   return (
     <Link
       to="/book/$id"
       params={{ id: String(book.id) }}
-      aria-label={book.title}
-      className="group flex flex-col overflow-hidden rounded-lg border border-ink bg-surface hover:shadow-md hover:border-accent/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 transition-[box-shadow,border-color]"
+      aria-label={`${book.title}${unknown ? "" : ` by ${book.authors?.join(", ")}`}`}
+      className="group flex min-w-0 flex-col rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-4 focus-visible:ring-offset-parchment"
     >
-      <div className="relative w-full aspect-[2/3] bg-parchment-dark flex items-center justify-center overflow-hidden">
+      <div className="relative aspect-[2/3] w-full shrink-0 overflow-hidden rounded-lg bg-parchment-dark shadow-[0_4px_12px_-3px_rgba(35,45,35,0.20)] ring-1 ring-ink/10 transition-[box-shadow,transform] duration-200 group-hover:-translate-y-1 group-hover:shadow-[0_10px_20px_-6px_rgba(35,45,35,0.25)]">
         <BookCoverImage
           bookId={book.id}
+          authKey={libraryId}
           title={book.title}
           hasCover={book.has_cover}
           width={240}
           height={360}
-          className="group-hover:brightness-[1.04] transition-[filter] duration-200"
+          className="transition-[filter] duration-200 group-hover:brightness-[1.04]"
         />
       </div>
-      <div className="flex flex-col gap-0.5 p-2 min-h-[76px]">
+      <div className="flex shrink-0 flex-col pt-3" style={{ height: BOOK_GRID_METADATA_HEIGHT }}>
         <span
           title={book.title}
-          className="text-[13px] font-semibold text-ink leading-snug line-clamp-3 group-hover:text-accent transition-colors"
+          className="line-clamp-2 text-sm font-semibold leading-5 text-ink transition-colors group-hover:text-accent"
         >
           {book.title}
         </span>
-        {!unknown && (
-          <span className="text-xs text-ink-tertiary truncate">{book.authors?.join(", ")}</span>
-        )}
+        <span className="mt-1 truncate text-xs leading-4 text-ink-tertiary">
+          {unknown ? "Unknown author" : book.authors?.join(", ")}
+        </span>
+        <div className="mt-2 flex min-h-5 items-center gap-2">
+          {format && (
+            <span className="rounded bg-accent/8 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-accent">
+              {format}
+            </span>
+          )}
+          {rating !== null && (
+            <span
+              className="inline-flex items-center gap-1 text-[11px] font-medium text-ink-tertiary"
+              role="img"
+              aria-label={`${rating} out of 5 stars`}
+            >
+              <Star className="h-3 w-3 fill-accent text-accent" aria-hidden="true" />
+              {rating.toLocaleString(undefined, { maximumFractionDigits: 1 })}
+            </span>
+          )}
+        </div>
       </div>
     </Link>
   );
@@ -66,6 +92,8 @@ export const BookGridInfinite = memo(function BookGridInfinite({
   tagIds,
   formats,
   onClearFilters,
+  stickyOffset = 0,
+  libraryId,
 }: BookGridInfiniteProps) {
   const {
     books,
@@ -86,138 +114,17 @@ export const BookGridInfinite = memo(function BookGridInfinite({
     isOffline,
     refetch,
     queryKey,
-  } = useFlattenedBooks(searchQuery, sortConfig, tagIds, undefined, formats);
-  const queryClient = useQueryClient();
-
-  // FUP8: callback-ref container so the ResizeObserver re-attaches when the
-  // node mounts/changes (plain useRef + once-on-mount misses remounts).
-  const [containerEl, setContainerEl] = useState<HTMLDivElement | null>(null);
-  const [containerWidth, setContainerWidth] = useState(() => {
-    if (typeof window === "undefined") return 1232;
-    return Math.min(window.innerWidth - 48, 1280 - 48);
-  });
-  const [columns, setColumns] = useState(() => {
-    const available = Math.min(
-      typeof window === "undefined" ? 1232 : window.innerWidth - 48,
-      1280 - 48,
-    );
-    return Math.max(2, Math.floor((available + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP)));
-  });
-  const [cardHeight, setCardHeight] = useState(320);
-
-  // S7: REAL scrollMargin measurement. The callback ref (setContainerEl)
-  // captures the list container; its document-relative origin (viewport top
-  // + scroll offset, which is scroll-invariant) is measured at mount and
-  // re-measured whenever the origin can move:
-  // - ResizeObserver on the list container itself,
-  // - ResizeObserver on document.body (a sticky shelf/header above the list
-  //   resizing shifts the list origin without resizing the list),
-  // - window resize fallback,
-  // - MutationObserver on document.body (header/shelf DOM moves — filter row
-  //   mount, shelf expand — that shift the origin without a resize event),
-  // - explicit re-measure when books/columns/cardHeight change (the second
-  //   effect below).
-  // The measured value is passed to the virtualizer as scrollMargin, which
-  // the React adapter picks up dynamically on re-render — no constant
-  // assertion.
-  const [measuredScrollMargin, setMeasuredScrollMargin] = useState(GRID_SCROLL_MARGIN_FALLBACK);
-  useEffect(() => {
-    const el = containerEl;
-    if (!el) return;
-    const measureOrigin = () => {
-      const origin = Math.max(0, Math.round(el.getBoundingClientRect().top + window.scrollY));
-      setMeasuredScrollMargin((prev) => (prev === origin ? prev : origin));
-    };
-    measureOrigin();
-    let ro: ResizeObserver | null = null;
-    if (typeof ResizeObserver !== "undefined") {
-      ro = new ResizeObserver(measureOrigin);
-      ro.observe(el);
-      try {
-        ro.observe(document.body);
-      } catch {}
-    }
-    window.addEventListener("resize", measureOrigin);
-    let mo: MutationObserver | null = null;
-    if (typeof MutationObserver !== "undefined") {
-      mo = new MutationObserver(measureOrigin);
-      try {
-        mo.observe(document.body, { childList: true, subtree: true, attributes: true });
-      } catch {}
-    }
-    return () => {
-      ro?.disconnect();
-      mo?.disconnect();
-      window.removeEventListener("resize", measureOrigin);
-    };
-  }, [containerEl]);
-
-  // Re-measure the list origin when content above/around the list changes
-  // size (books appended, columns re-flowed, shelf/header state changed).
-  // The observer effect above owns the listeners; this just re-runs the same
-  // scroll-invariant origin math on state transitions the observers might
-  // miss.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional re-measure on content transitions observers may miss.
-  useEffect(() => {
-    if (!containerEl) return;
-    const origin = Math.max(
-      0,
-      Math.round(containerEl.getBoundingClientRect().top + window.scrollY),
-    );
-    setMeasuredScrollMargin((prev) => (prev === origin ? prev : origin));
-  }, [containerEl, books.length, columns, cardHeight]);
-
-  // Measure the container (not the window) so grid sizing tracks the real
-  // layout width, including sidebars and padding.
-  useEffect(() => {
-    const el = containerEl;
-    if (!el) return;
-    const apply = (width: number) => {
-      if (width > 0) setContainerWidth(width);
-    };
-    apply(el.clientWidth);
-    let ro: ResizeObserver | null = null;
-    if (typeof ResizeObserver !== "undefined") {
-      ro = new ResizeObserver((entries) => {
-        apply(entries[0]?.contentRect.width ?? el.clientWidth);
-      });
-      ro.observe(el);
-    }
-    // Window-resize fallback (kept): covers environments where ResizeObserver
-    // misses a layout change.
-    const onResize = () => apply(el.clientWidth);
-    window.addEventListener("resize", onResize);
-    return () => {
-      ro?.disconnect();
-      window.removeEventListener("resize", onResize);
-    };
-  }, [containerEl]);
-
-  useEffect(() => {
-    const cols = Math.max(2, Math.floor((containerWidth + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP)));
-    setColumns(cols);
-    const cardWidth = (containerWidth - CARD_GAP * (cols - 1)) / cols;
-    setCardHeight(Math.round(cardWidth * 1.5 + 76 + CARD_GAP));
-  }, [containerWidth]);
-
+  } = useFlattenedBooks(searchQuery, sortConfig, tagIds, { libraryId }, formats);
+  const { width, scrollMargin, measured, setElement } = useBookListLayout();
+  const { columns, rowHeight } = bookGridLayout(width);
   const rowCount = Math.ceil(books.length / columns);
 
-  // scrollMargin is the MEASURED list origin (see above); it keeps the
-  // restored/focused row from sliding under the sticky search + header.
-  // TanStack contract — margin applied ONCE: the virtualizer bakes
-  // scrollMargin into every measurement (first start = scrollMargin,
-  // totalSize excludes the margin), so rows render at
-  // translateY(start - scrollMargin) inside a container that sits AT the
-  // list origin in normal flow. Using translateY(start) verbatim would
-  // double-count the margin and push every row down by the sticky offset.
-  // scrollPaddingStart (200px below) is separate breathing room for
-  // scrollToIndex, NOT part of the measured origin.
   const virtualizer = useWindowVirtualizer({
     count: rowCount,
-    estimateSize: useCallback(() => cardHeight, [cardHeight]),
+    estimateSize: useCallback(() => rowHeight, [rowHeight]),
     overscan: 5,
-    scrollMargin: measuredScrollMargin,
-    scrollPaddingStart: 200,
+    scrollMargin,
+    scrollPaddingStart: stickyOffset,
     // React 19 warns when the adapter flushes a virtualizer rerender while a
     // route transition is still rendering. Normal scheduling is sufficient
     // here and keeps grid view free of render-phase updates.
@@ -227,141 +134,42 @@ export const BookGridInfinite = memo(function BookGridInfinite({
   const virtualItems = virtualizer.getVirtualItems();
   const totalSize = virtualizer.getTotalSize();
 
-  // Re-measure when the row size changes: cardHeight derives from the column
-  // count, and columns is listed explicitly so a width-only change that
-  // re-flows columns also invalidates cached measurements.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: columns intentionally included to invalidate measurements on re-flow.
   useEffect(() => {
-    if (cardHeight > 0) virtualizer.measure();
-  }, [cardHeight, columns, virtualizer]);
+    if (rowHeight > 0) virtualizer.measure();
+  }, [rowHeight, virtualizer]);
 
-  // Infinite scroll — just use isFetchingNextPage, no extra state
+  const isRestoring = useBookScrollRestoration({
+    identity: JSON.stringify([queryKey, "grid"]),
+    books,
+    columns,
+    rowHeight,
+    scrollMargin,
+    stickyOffset,
+    ready: measured && books.length > 0 && !isLoading && !isPlaceholder,
+    hasNextPage,
+    fetchNextPage,
+    virtualizer,
+  });
+
   const lastVirtualItem = virtualItems[virtualItems.length - 1];
-  const shouldFetch =
-    lastVirtualItem && lastVirtualItem.index >= rowCount - 5 && hasNextPage && !isFetchingNextPage;
-
+  const shouldFetch = Boolean(
+    lastVirtualItem &&
+      lastVirtualItem.index >= rowCount - 5 &&
+      hasNextPage &&
+      !isFetchingNextPage &&
+      !isFetchNextPageError &&
+      !isPlaceholder &&
+      !isRestoring,
+  );
   const fetchRef = useRef(fetchNextPage);
   fetchRef.current = fetchNextPage;
-
   useEffect(() => {
-    if (shouldFetch) {
-      fetchRef.current();
-    }
+    if (shouldFetch) void fetchRef.current({ cancelRefetch: false }).catch(() => {});
   }, [shouldFetch]);
-
-  // Persist the top-visible book anchor (id + offset) so back-navigation
-  // restores by content, not by raw pixel offset which shifts as pages load.
-  useEffect(() => {
-    let raf = 0;
-    let cancelled = false;
-    const onScroll = () => {
-      cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(() => {
-        if (cancelled) return;
-        try {
-          const range = virtualizer.range;
-          const startRow = range?.startIndex ?? 0;
-          const anchor = books[startRow * columns];
-          if (anchor) {
-            sessionStorage.setItem(
-              "caliber-scroll",
-              JSON.stringify({
-                id: anchor.id,
-                offset: window.scrollY % Math.max(cardHeight, 1),
-                columns,
-              }),
-            );
-          }
-        } catch {}
-      });
-    };
-    window.addEventListener("scroll", onScroll, { passive: true });
-    return () => {
-      cancelled = true;
-      cancelAnimationFrame(raf);
-      window.removeEventListener("scroll", onScroll);
-    };
-  }, [books, columns, cardHeight, virtualizer]);
-
-  // Anchor restore: fetch the required window first, then scroll. The retry
-  // chain is cancelled on unmount or when search/sort/tags change.
-  // FUP8: deps include books.length/hasNextPage readiness; the loop re-reads
-  // the latest books from the queryClient cache after each fetchNextPage
-  // (never the captured array, which goes stale across awaits).
-  const restoreKey = `${searchQuery}|${sortConfig.field}|${sortConfig.order}|${(tagIds ?? []).join(",")}|${(formats ?? []).join(",")}`;
-  // biome-ignore lint/correctness/useExhaustiveDependencies: restore intentionally reads fresh books via queryClient after each fetch; captured books/fetchNextPage would go stale across awaits.
-  useEffect(() => {
-    let cancelled = false;
-    let raf = 0;
-    const readFreshBooks = (): typeof books => {
-      try {
-        const data = queryClient.getQueryData<{ pages: { items: typeof books }[] }>(queryKey);
-        if (data?.pages) return data.pages.flatMap((p) => p.items);
-      } catch {}
-      return books;
-    };
-    const run = async () => {
-      let anchorId: number | null = null;
-      let anchorOffset = 0;
-      try {
-        const raw = sessionStorage.getItem("caliber-scroll");
-        const saved = raw ? (JSON.parse(raw) as { id?: unknown; offset?: unknown }) : null;
-        if (saved && typeof saved.id === "number") anchorId = saved.id;
-        if (saved && typeof saved.offset === "number") anchorOffset = saved.offset;
-      } catch {
-        anchorId = null;
-      }
-      let fresh = readFreshBooks();
-      if (anchorId === null || fresh.length === 0) return;
-      const wanted = anchorId;
-      // Fetch forward until the anchor id is in the retained window.
-      let guard = 0;
-      let latestHasNext = hasNextPage;
-      while (!cancelled && guard < 10 && latestHasNext && !fresh.some((b) => b.id === wanted)) {
-        guard++;
-        try {
-          const result = await fetchNextPage();
-          latestHasNext =
-            (result.data?.pages.length ?? 0) > 0
-              ? (result.hasNextPage ?? latestHasNext)
-              : latestHasNext;
-        } catch {
-          break;
-        }
-        fresh = readFreshBooks();
-        if (fresh.some((b) => b.id === wanted)) break;
-      }
-      if (cancelled) return;
-      fresh = readFreshBooks();
-      const idx = fresh.findIndex((b) => b.id === wanted);
-      if (idx >= 0) {
-        const row = Math.floor(idx / columns);
-        const off = anchorOffset;
-        raf = requestAnimationFrame(() => {
-          if (cancelled) return;
-          try {
-            // Single offset adjust only: scrollToIndex already accounts for
-            // scrollMargin; apply the saved intra-row offset once.
-            virtualizer.scrollToIndex(row, { align: "start" });
-            if (off > 0) window.scrollBy({ top: off });
-          } catch {}
-          try {
-            sessionStorage.removeItem("caliber-scroll");
-          } catch {}
-        });
-      }
-    };
-    void run();
-    return () => {
-      cancelled = true;
-      cancelAnimationFrame(raf);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [restoreKey, books.length, hasNextPage, columns, queryClient, queryKey]);
 
   if (isLoading) {
     return (
-      <div className="grid gap-4 p-4" style={{ gridTemplateColumns: `repeat(${columns}, 1fr)` }}>
+      <div className="grid gap-6" style={{ gridTemplateColumns: `repeat(${columns}, 1fr)` }}>
         {Array.from({ length: columns * 2 }, (_, i) => `skeleton-${i}`).map((key, i) => (
           <div
             key={key}
@@ -475,38 +283,37 @@ export const BookGridInfinite = memo(function BookGridInfinite({
         : "All books loaded";
 
   return (
-    <div ref={setContainerEl}>
+    <div>
       {refreshBanner}
       {/* List-origin container: sits in normal flow at the measured origin;
           rows below offset by (start - scrollMargin) so the margin applies
           exactly once. */}
-      <div style={{ height: `${totalSize}px`, position: "relative" }}>
+      <div ref={setElement} style={{ height: `${totalSize}px`, position: "relative" }}>
         {virtualItems.map((virtualRow) => {
           const startIndex = virtualRow.index * columns;
           const rowBooks = books.slice(startIndex, startIndex + columns);
 
           return (
             <div
-              key={virtualRow.index}
+              key={rowBooks[0]?.id ?? virtualRow.index}
               style={{
                 position: "absolute",
                 top: 0,
                 left: 0,
                 width: "100%",
                 transform: `translateY(${virtualRow.start - virtualizer.options.scrollMargin}px)`,
-                height: `${cardHeight}px`,
-                padding: `0 16px`,
+                height: `${rowHeight - BOOK_GRID_ROW_GAP}px`,
               }}
             >
               <div
                 className="grid h-full"
                 style={{
                   gridTemplateColumns: `repeat(${columns}, 1fr)`,
-                  gap: `${CARD_GAP}px`,
+                  gap: `${BOOK_GRID_COLUMN_GAP}px`,
                 }}
               >
                 {rowBooks.map((book) => (
-                  <GridCard key={book.id} book={book} />
+                  <GridCard key={book.id} book={book} libraryId={libraryId} />
                 ))}
               </div>
             </div>
