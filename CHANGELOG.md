@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.17](https://github.com/briansunter/caliber/compare/v0.1.16...v0.1.17) (2026-10-05)
+
+
+### Features
+
+* expand sidebar tag list ([805ebb2](https://github.com/briansunter/caliber/commit/805ebb233a08c8b3efdb797390a1bb1b0526280f))
+
 ## [0.1.16](https://github.com/briansunter/caliber/compare/v0.1.15...v0.1.16) (2026-10-05)
 
 
