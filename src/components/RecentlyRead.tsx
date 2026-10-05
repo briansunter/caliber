@@ -334,6 +334,7 @@ function ReadingCard({
           <BookCoverImage
             bookId={book.id}
             title={book.title}
+            author={unknown ? undefined : book.authors?.join(", ")}
             hasCover={book.has_cover}
             authKey={libraryId}
             width={130}

@@ -18,7 +18,7 @@ import { CoverFallback } from "@/components/CoverFallback";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useBook, useLibraryConfig } from "@/hooks/useBooksInfinite";
-import { cn, stripHtmlTags } from "@/lib/utils";
+import { cn, isUnknownAuthor, stripHtmlTags } from "@/lib/utils";
 
 interface BookDetailProps {
   bookId: number;
@@ -35,11 +35,13 @@ const BOOK_ACTION_BUTTON_CLASS =
 const BookCover = memo(function BookCover({
   bookId,
   title,
+  author,
   hasCover,
   libraryId,
 }: {
   bookId: number;
   title: string;
+  author?: string;
   hasCover: boolean;
   libraryId?: string;
 }) {
@@ -58,7 +60,7 @@ const BookCover = memo(function BookCover({
   if (!hasCover || hasError) {
     return (
       <div className="relative w-full aspect-[2/3] bg-parchment-dark rounded-lg flex flex-col items-center justify-center text-ink-muted border border-ink">
-        <CoverFallback title={title} />
+        <CoverFallback title={title} author={author} />
       </div>
     );
   }
@@ -69,8 +71,8 @@ const BookCover = memo(function BookCover({
       <div className="relative bg-parchment-dark rounded-lg p-1.5 border border-ink shadow-lg">
         <div className="relative overflow-hidden rounded-md border border-ink">
           {!isLoaded && (
-            <div className="absolute inset-0 flex items-center justify-center bg-parchment-dark">
-              <div className="h-6 w-6 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
+            <div className="absolute inset-0">
+              <CoverFallback title={title} author={author} />
             </div>
           )}
           <img
@@ -317,6 +319,7 @@ export function BookDetail({ bookId }: BookDetailProps) {
                 key={`${bookId}:${libraryId ?? ""}`}
                 bookId={bookId}
                 title={book.title}
+                author={isUnknownAuthor(book.authors) ? undefined : authorNames || undefined}
                 hasCover={book.has_cover}
                 libraryId={libraryId}
               />

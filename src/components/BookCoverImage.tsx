@@ -5,6 +5,7 @@ import { CoverFallback } from "./CoverFallback";
 interface BookCoverImageProps {
   bookId: number;
   title: string;
+  author?: string;
   hasCover: boolean;
   size?: "sm" | "lg";
   width: number;
@@ -18,6 +19,7 @@ interface BookCoverImageProps {
 export const BookCoverImage = memo(function BookCoverImage({
   bookId,
   title,
+  author,
   hasCover,
   size = "lg",
   width,
@@ -26,6 +28,7 @@ export const BookCoverImage = memo(function BookCoverImage({
   authKey,
 }: BookCoverImageProps) {
   const [failed, setFailed] = useState(false);
+  const [isLoaded, setIsLoaded] = useState(false);
   const coverKey = `${bookId}:${String(authKey ?? "")}:${hasCover ? "1" : "0"}`;
   const [lastCoverKey, setLastCoverKey] = useState(coverKey);
 
@@ -35,10 +38,11 @@ export const BookCoverImage = memo(function BookCoverImage({
   if (lastCoverKey !== coverKey) {
     setLastCoverKey(coverKey);
     setFailed(false);
+    setIsLoaded(false);
   }
 
   if (!hasCover || failed) {
-    return <CoverFallback title={title} size={size} />;
+    return <CoverFallback title={title} author={author} size={size} />;
   }
 
   const src =
@@ -47,17 +51,25 @@ export const BookCoverImage = memo(function BookCoverImage({
       : `/api/books/${bookId}/thumb`;
 
   return (
-    <img
-      key={coverKey}
-      src={src}
-      alt={title}
-      width={width}
-      height={height}
-      loading="lazy"
-      decoding="async"
-      fetchPriority="low"
-      onError={() => setFailed(true)}
-      className={cn("h-full w-full object-cover", className)}
-    />
+    <div className="relative h-full w-full">
+      <CoverFallback title={title} author={author} size={size} />
+      <img
+        key={coverKey}
+        src={src}
+        alt={title}
+        width={width}
+        height={height}
+        loading="lazy"
+        decoding="async"
+        fetchPriority="low"
+        onLoad={() => setIsLoaded(true)}
+        onError={() => setFailed(true)}
+        className={cn(
+          "absolute inset-0 h-full w-full object-cover transition-[filter,opacity] duration-200",
+          isLoaded ? "opacity-100" : "opacity-0",
+          className,
+        )}
+      />
+    </div>
   );
 });

@@ -3,6 +3,7 @@ import { coverInitials } from "@/lib/utils";
 
 interface CoverFallbackProps {
   title: string;
+  author?: string;
   size?: "sm" | "lg";
 }
 
@@ -25,6 +26,7 @@ function pickPalette(title: string): readonly [string, string, string] {
 
 export const CoverFallback = memo(function CoverFallback({
   title,
+  author,
   size = "lg",
 }: CoverFallbackProps) {
   const [bg1, bg2, fg] = pickPalette(title);
@@ -49,8 +51,13 @@ export const CoverFallback = memo(function CoverFallback({
         <>
           <span className="absolute inset-3 border border-current opacity-25" />
           <span className="relative px-7 font-display leading-snug line-clamp-4">{title}</span>
-          <span className="mt-6 h-px w-7 bg-current opacity-50" />
-          <span className="mt-4 text-[9px] tracking-[.2em] opacity-65">{initials}</span>
+          {author && (
+            <span className="relative mt-3 max-w-[78%] text-xs leading-4 opacity-80 line-clamp-2">
+              {author}
+            </span>
+          )}
+          <span className="mt-4 h-px w-7 bg-current opacity-50" />
+          <span className="mt-3 text-[9px] tracking-[.2em] opacity-65">{initials}</span>
         </>
       )}
     </div>

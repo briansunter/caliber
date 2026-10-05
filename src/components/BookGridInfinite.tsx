@@ -48,10 +48,11 @@ const GridCard = memo(function GridCard({
           bookId={book.id}
           authKey={libraryId}
           title={book.title}
+          author={unknown ? undefined : book.authors?.join(", ")}
           hasCover={book.has_cover}
           width={240}
           height={360}
-          className="transition-[filter] duration-200 group-hover:brightness-[1.04]"
+          className="group-hover:brightness-[1.04]"
         />
       </div>
       <div className="flex shrink-0 flex-col pt-3" style={{ height: BOOK_GRID_METADATA_HEIGHT }}>
