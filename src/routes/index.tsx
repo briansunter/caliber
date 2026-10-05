@@ -4,6 +4,8 @@ import {
   ArrowUpRight,
   BookOpen,
   Check,
+  ChevronDown,
+  ChevronUp,
   Clock3,
   FolderOpen,
   LayoutGrid,
@@ -36,6 +38,7 @@ import { useReadingList } from "@/lib/reading-progress";
 
 type Density = "comfortable" | "compact";
 const DENSITY_KEY = "caliber-density";
+const SIDEBAR_TAGS_COLLAPSED_COUNT = 6;
 
 function loadDensity(): Density {
   try {
@@ -54,6 +57,7 @@ function IndexComponent() {
   const search = Route.useSearch();
   const navigate = useNavigate();
   const [density, setDensity] = useState<Density>(loadDensity);
+  const [showAllTags, setShowAllTags] = useState(false);
   const toolbarRef = useRef<HTMLDivElement>(null);
   const [toolbarHeight, setToolbarHeight] = useState(120);
   const tagIds = useMemo(() => search.tag.map(Number), [search.tag]);
@@ -88,6 +92,13 @@ function IndexComponent() {
   const { data: readingList } = useReadingList();
   const recentCount = readingList?.items.length ?? 0;
   const hasFilters = Boolean(search.q || search.tag.length || search.format.length);
+  const hasMoreSidebarTags = (tags?.length ?? 0) > SIDEBAR_TAGS_COLLAPSED_COUNT;
+  const sidebarTags = showAllTags
+    ? (tags ?? [])
+    : [
+        ...(tags ?? []).slice(0, SIDEBAR_TAGS_COLLAPSED_COUNT),
+        ...(tags ?? []).slice(SIDEBAR_TAGS_COLLAPSED_COUNT).filter((tag) => tagIds.includes(tag.id)),
+      ];
 
   // Functional URL updates preserve other controls changed in the same render.
   const updateSearch = useCallback(
@@ -193,8 +204,8 @@ function IndexComponent() {
               <span>Browse by tag</span>
               <Tags size={14} strokeWidth={1.6} />
             </div>
-            <nav className="sidebar-nav" aria-label="Popular tags">
-              {tags?.slice(0, 6).map((tag) => (
+            <nav className="sidebar-nav" id="sidebar-tag-list" aria-label="Tags">
+              {sidebarTags.map((tag) => (
                 <button
                   key={tag.id}
                   type="button"
@@ -214,6 +225,24 @@ function IndexComponent() {
                 </button>
               ))}
             </nav>
+            {hasMoreSidebarTags && (
+              <button
+                type="button"
+                className="sidebar-tag-toggle"
+                aria-controls="sidebar-tag-list"
+                aria-expanded={showAllTags}
+                onClick={() => setShowAllTags((expanded) => !expanded)}
+              >
+                <span>
+                  {showAllTags ? "Show fewer tags" : `Show all ${tags?.length ?? 0} tags`}
+                </span>
+                {showAllTags ? (
+                  <ChevronUp size={14} strokeWidth={1.6} aria-hidden="true" />
+                ) : (
+                  <ChevronDown size={14} strokeWidth={1.6} aria-hidden="true" />
+                )}
+              </button>
+            )}
           </>
         )}
         <div className="sidebar-note">
