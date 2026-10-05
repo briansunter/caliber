@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.16](https://github.com/briansunter/caliber/compare/v0.1.15...v0.1.16) (2026-10-05)
+
+
+### Features
+
+* show book details while covers load ([7e9c3a3](https://github.com/briansunter/caliber/commit/7e9c3a32846deb0ad926190035a1703ed28ededb))
+
 ## [0.1.15](https://github.com/briansunter/caliber/compare/v0.1.14...v0.1.15) (2026-10-02)
 
 
