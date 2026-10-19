@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
+import { cliCommand, serverCommand } from "./server-cmd";
 
 const TEST_TIMEOUT = 30_000;
 
@@ -158,7 +159,8 @@ function server2Env(port: number) {
 }
 
 async function runCli(args: string[], stdinData?: string) {
-  const proc = Bun.spawn(["bun", "src/cli.ts", ...args], {
+  const cli = cliCommand();
+  const proc = Bun.spawn([cli.cmd, ...cli.args, ...args], {
     cwd: process.cwd(),
     env: serverEnv(0),
     stdin: stdinData === undefined ? "ignore" : "pipe",
@@ -210,7 +212,8 @@ beforeAll(async () => {
 
   const port = await freePort();
   baseUrl = `http://localhost:${port}`;
-  serverProcess = Bun.spawn(["bun", "src/index.ts"], {
+  const server = serverCommand();
+  serverProcess = Bun.spawn([server.cmd, ...server.args], {
     cwd: process.cwd(),
     env: serverEnv(port),
     stdout: "pipe",
@@ -223,7 +226,7 @@ beforeAll(async () => {
 
   const port2 = await freePort();
   baseUrl2 = `http://localhost:${port2}`;
-  serverProcess2 = Bun.spawn(["bun", "src/index.ts"], {
+  serverProcess2 = Bun.spawn([server.cmd, ...server.args], {
     cwd: process.cwd(),
     env: server2Env(port2),
     stdout: "pipe",

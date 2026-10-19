@@ -1,6 +1,10 @@
 # dependencies
 node_modules
 
+# rust
+/target
+Cargo.lock.bak
+
 # build output
 dist
 out

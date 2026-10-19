@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
 import { createServer } from "node:net";
+import { serverCommand } from "./server-cmd";
 
 const TEST_TIMEOUT = 30_000;
 const ONE_BY_ONE_PNG = Buffer.from(
@@ -29,6 +30,10 @@ let baseUrl = "";
 let serverProcess: ReturnType<typeof Bun.spawn> | null = null;
 let serverStdout = "";
 let serverStderr = "";
+
+// Spawn command resolved once per run (TS by default; the Rust binary when
+// CALIBER_TEST_SERVER is set).
+const serverCmd = serverCommand();
 
 // Only these host variables pass through to the spawned server; everything
 // else is set explicitly below so tests are hermetic.
@@ -553,11 +558,9 @@ beforeAll(async () => {
 
   const port = await freePort();
   baseUrl = `http://localhost:${port}`;
-  // Spawn via process.execPath (not bare "bun") so the server under test is
-  // byte-for-byte the same executable as this test process — PATH-resolved
-  // "bun" can drift (e.g. pinned 1.2.x vs local 1.4.x) and silently change
-  // whether Bun.Image exists.
-  serverProcess = Bun.spawn([process.execPath, "src/index.ts"], {
+  // Spawn via the configured server command so this compatibility suite
+  // runs against either implementation.
+  serverProcess = Bun.spawn([serverCmd.cmd, ...serverCmd.args], {
     cwd: process.cwd(),
     env: childEnv({
       HOME: homePath,
@@ -852,7 +855,7 @@ describe("format variant fixtures", () => {
     const port = await freePort();
     const degradedBaseUrl = `http://localhost:${port}`;
     const degradedConfigDir = join(homePath, ".config", "caliber-degraded");
-    const proc = Bun.spawn([process.execPath, "src/index.ts"], {
+    const proc = Bun.spawn([serverCmd.cmd, ...serverCmd.args], {
       cwd: process.cwd(),
       env: childEnv({
         HOME: homePath,
