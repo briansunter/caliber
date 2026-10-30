@@ -8,16 +8,17 @@ export function preferredDownloadFormat(formats: string[] = []): string | undefi
 }
 
 export function createDownloadAction(
-  request: (url: string) => Promise<Response> = (url) => fetch(url),
+  request: (url: string, init: RequestInit) => Promise<Response> = (url, init) => fetch(url, init),
 ) {
   let pending = false;
-  return async (bookId: number, format: string): Promise<Blob | null> => {
+  return async (bookId: number, format: string): Promise<string | null> => {
     if (pending) return null;
     pending = true;
     try {
-      const response = await request(`/api/books/${bookId}/download/${encodeURIComponent(format)}`);
+      const url = `/api/books/${bookId}/download/${encodeURIComponent(format)}`;
+      const response = await request(url, { method: "HEAD" });
       if (!response.ok) throw new Error(`Download failed (${response.status})`);
-      return await response.blob();
+      return url;
     } finally {
       pending = false;
     }
