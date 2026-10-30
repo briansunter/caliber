@@ -34,6 +34,7 @@ import {
   type SortOrder,
 } from "@/hooks/useBooksInfinite";
 import { parseLibrarySearch, type LibrarySearch } from "@/lib/library-state";
+import { LIBRARY_RETURN_KEY } from "@/lib/library-return";
 import { useReadingList } from "@/lib/reading-progress";
 
 type Density = "comfortable" | "compact";
@@ -56,6 +57,11 @@ export const Route = createFileRoute("/")({
 function IndexComponent() {
   const search = Route.useSearch();
   const navigate = useNavigate();
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(LIBRARY_RETURN_KEY, JSON.stringify(search));
+    } catch {}
+  }, [search]);
   const [density, setDensity] = useState<Density>(loadDensity);
   const [showAllTags, setShowAllTags] = useState(false);
   const toolbarRef = useRef<HTMLDivElement>(null);
@@ -97,7 +103,9 @@ function IndexComponent() {
     ? (tags ?? [])
     : [
         ...(tags ?? []).slice(0, SIDEBAR_TAGS_COLLAPSED_COUNT),
-        ...(tags ?? []).slice(SIDEBAR_TAGS_COLLAPSED_COUNT).filter((tag) => tagIds.includes(tag.id)),
+        ...(tags ?? [])
+          .slice(SIDEBAR_TAGS_COLLAPSED_COUNT)
+          .filter((tag) => tagIds.includes(tag.id)),
       ];
 
   // Functional URL updates preserve other controls changed in the same render.

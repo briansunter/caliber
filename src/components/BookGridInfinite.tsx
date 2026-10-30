@@ -6,6 +6,7 @@ import type { BookListItem } from "@/lib/calibre-optimized";
 import { Link } from "@tanstack/react-router";
 import { BookOpen, Search, Loader2, Star } from "lucide-react";
 import { isUnknownAuthor } from "@/lib/utils";
+import { QuickDownload } from "./QuickDownload";
 import { BookCoverImage } from "./BookCoverImage";
 import { useBookListLayout, useBookScrollRestoration } from "@/hooks/useBookListViewport";
 import {
@@ -37,53 +38,58 @@ const GridCard = memo(function GridCard({
   const format = formats.includes("EPUB") ? "EPUB" : formats.includes("PDF") ? "PDF" : formats[0];
   const rating = book.rating ? Math.min(5, Math.max(0, book.rating / 2)) : null;
   return (
-    <Link
-      to="/book/$id"
-      params={{ id: String(book.id) }}
-      aria-label={`${book.title}${unknown ? "" : ` by ${book.authors?.join(", ")}`}`}
-      className="group flex min-w-0 flex-col rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-4 focus-visible:ring-offset-parchment"
-    >
-      <div className="relative aspect-[2/3] w-full shrink-0 overflow-hidden rounded-lg bg-parchment-dark shadow-[0_4px_12px_-3px_rgba(35,45,35,0.20)] ring-1 ring-ink/10 transition-[box-shadow,transform] duration-200 group-hover:-translate-y-1 group-hover:shadow-[0_10px_20px_-6px_rgba(35,45,35,0.25)]">
-        <BookCoverImage
-          bookId={book.id}
-          authKey={libraryId}
-          title={book.title}
-          author={unknown ? undefined : book.authors?.join(", ")}
-          hasCover={book.has_cover}
-          width={240}
-          height={360}
-          className="group-hover:brightness-[1.04]"
-        />
-      </div>
-      <div className="flex shrink-0 flex-col pt-3" style={{ height: BOOK_GRID_METADATA_HEIGHT }}>
-        <span
-          title={book.title}
-          className="line-clamp-2 text-sm font-semibold leading-5 text-ink transition-colors group-hover:text-accent"
-        >
-          {book.title}
-        </span>
-        <span className="mt-1 truncate text-xs leading-4 text-ink-tertiary">
-          {unknown ? "Unknown author" : book.authors?.join(", ")}
-        </span>
-        <div className="mt-2 flex min-h-5 items-center gap-2">
-          {format && (
-            <span className="rounded bg-accent/8 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-accent">
-              {format}
-            </span>
-          )}
-          {rating !== null && (
-            <span
-              className="inline-flex items-center gap-1 text-[11px] font-medium text-ink-tertiary"
-              role="img"
-              aria-label={`${rating} out of 5 stars`}
-            >
-              <Star className="h-3 w-3 fill-accent text-accent" aria-hidden="true" />
-              {rating.toLocaleString(undefined, { maximumFractionDigits: 1 })}
-            </span>
-          )}
+    <div className="relative min-w-0">
+      <Link
+        to="/book/$id"
+        params={{ id: String(book.id) }}
+        aria-label={`${book.title}${unknown ? "" : ` by ${book.authors?.join(", ")}`}`}
+        className="group flex min-w-0 flex-col rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-4 focus-visible:ring-offset-parchment"
+      >
+        <div className="relative aspect-[2/3] w-full shrink-0 overflow-hidden rounded-lg bg-parchment-dark shadow-[0_4px_12px_-3px_rgba(35,45,35,0.20)] ring-1 ring-ink/10 transition-[box-shadow,transform] duration-200 group-hover:-translate-y-1 group-hover:shadow-[0_10px_20px_-6px_rgba(35,45,35,0.25)]">
+          <BookCoverImage
+            bookId={book.id}
+            authKey={libraryId}
+            title={book.title}
+            author={unknown ? undefined : book.authors?.join(", ")}
+            hasCover={book.has_cover}
+            width={240}
+            height={360}
+            className="group-hover:brightness-[1.04]"
+          />
         </div>
+        <div className="flex shrink-0 flex-col pt-3" style={{ height: BOOK_GRID_METADATA_HEIGHT }}>
+          <span
+            title={book.title}
+            className="line-clamp-2 text-sm font-semibold leading-5 text-ink transition-colors group-hover:text-accent"
+          >
+            {book.title}
+          </span>
+          <span className="mt-1 truncate text-xs leading-4 text-ink-tertiary">
+            {unknown ? "Unknown author" : book.authors?.join(", ")}
+          </span>
+          <div className="mt-2 flex min-h-5 items-center gap-2">
+            {format && (
+              <span className="rounded bg-accent/8 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-accent">
+                {format}
+              </span>
+            )}
+            {rating !== null && (
+              <span
+                className="inline-flex items-center gap-1 text-[11px] font-medium text-ink-tertiary"
+                role="img"
+                aria-label={`${rating} out of 5 stars`}
+              >
+                <Star className="h-3 w-3 fill-accent text-accent" aria-hidden="true" />
+                {rating.toLocaleString(undefined, { maximumFractionDigits: 1 })}
+              </span>
+            )}
+          </div>
+        </div>
+      </Link>
+      <div className="absolute right-2 top-2">
+        <QuickDownload id={book.id} title={book.title} formats={book.formats} />
       </div>
-    </Link>
+    </div>
   );
 });
 

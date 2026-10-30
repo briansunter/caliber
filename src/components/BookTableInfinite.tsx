@@ -14,6 +14,7 @@ import {
   ArrowUpDown,
 } from "lucide-react";
 import { isUnknownAuthor } from "@/lib/utils";
+import { QuickDownload } from "./QuickDownload";
 import { BookCoverImage } from "./BookCoverImage";
 import { useBookListLayout, useBookScrollRestoration } from "@/hooks/useBookListViewport";
 
@@ -33,11 +34,11 @@ interface BookTableInfiniteProps {
 // long titles/authors force horizontal scroll on phones and iPads).
 // Columns appear progressively: sm = title/author/rating, lg adds
 // series/formats, xl adds tags.
-const GRID_COLS_MOBILE = "grid-cols-[minmax(0,1fr)_minmax(0,35%)_40px]";
+const GRID_COLS_MOBILE = "grid-cols-[minmax(0,1fr)_minmax(0,35%)_80px]";
 const GRID_COLS_DESKTOP =
-  "sm:grid-cols-[minmax(0,3fr)_minmax(0,2fr)_90px_48px] " +
-  "lg:grid-cols-[minmax(0,3fr)_minmax(0,1.5fr)_minmax(0,1.2fr)_90px_minmax(0,1fr)_48px] " +
-  "xl:grid-cols-[minmax(0,3fr)_minmax(0,1.5fr)_minmax(0,1.2fr)_minmax(0,1.5fr)_90px_minmax(0,1fr)_60px]";
+  "sm:grid-cols-[minmax(0,3fr)_minmax(0,2fr)_90px_80px] " +
+  "lg:grid-cols-[minmax(0,3fr)_minmax(0,1.5fr)_minmax(0,1.2fr)_90px_minmax(0,1fr)_80px] " +
+  "xl:grid-cols-[minmax(0,3fr)_minmax(0,1.5fr)_minmax(0,1.2fr)_minmax(0,1.5fr)_90px_minmax(0,1fr)_80px]";
 
 const ROW_HEIGHT = 72;
 const SKELETON_ROW_KEYS = [
@@ -267,6 +268,7 @@ const TableRow = memo(function TableRow({ book, rowHeight, libraryId }: TableRow
           </div>
         </div>
         <div className={`flex items-center justify-end ${compact ? "py-1" : "py-2"}`}>
+          <QuickDownload id={book.id} title={book.title} formats={book.formats} />
           <ActionsCell id={book.id} />
         </div>
       </div>
@@ -304,6 +306,7 @@ const TableRow = memo(function TableRow({ book, rowHeight, libraryId }: TableRow
           <FormatsCell formats={book.formats} bookId={book.id} />
         </div>
         <div className={`flex items-center justify-end ${compact ? "py-1" : "py-3"}`}>
+          <QuickDownload id={book.id} title={book.title} formats={book.formats} />
           <ActionsCell id={book.id} />
         </div>
       </div>

@@ -1,4 +1,5 @@
 import { createFileRoute, useParams, useNavigate } from "@tanstack/react-router";
+import { LIBRARY_RETURN_KEY, libraryReturnSearch } from "@/lib/library-return";
 import { BookDetail } from "@/components/BookDetail";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft, BookOpen } from "lucide-react";
@@ -14,27 +15,11 @@ function BookDetailPage() {
   const navigate = useNavigate();
 
   function handleBack() {
-    // Library state (q/view/sort/tags) lives in the URL, so going back
-    // through history pops to the intact library entry and preserves it.
-    // No document.referrer sniffing or window.history.length gate here:
-    // the referrer does not update on SPA pushes (misfires on normal
-    // fresh tab -> library -> detail navigation), and history.length counts
-    // external/cross-origin entries too, so a direct open/bookmark can
-    // still report length > 1 and back() would exit the app entirely.
-    // TanStack Router stamps each in-app entry with __TSR_index in
-    // history.state (0 on the first entry), so it is the reliable signal
-    // for "there is an in-app entry to return to". Direct opens/bookmarks
-    // have no in-app entry to return to, so they fall back to the library
-    // root (there is no prior state to preserve).
-    const tsrIndex = (window.history.state as { __TSR_index?: number } | null)?.__TSR_index ?? 0;
-    if (tsrIndex > 0) {
-      window.history.back();
-    } else {
-      navigate({
-        to: "/",
-        search: { q: "", view: "grid", sortBy: "added", sortOrder: "desc", tag: [], format: [] },
-      });
-    }
+    let saved: string | null = null;
+    try {
+      saved = sessionStorage.getItem(LIBRARY_RETURN_KEY);
+    } catch {}
+    void navigate({ to: "/", search: libraryReturnSearch(saved) });
   }
 
   return (

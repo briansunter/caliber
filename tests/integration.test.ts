@@ -358,7 +358,7 @@ function seedFormatVariantBooks(db: Database) {
     [15, "Metadata Only", "Metadata Only Book", "99999999-9999-9999-9999-999999999999", 0],
     // Claims a cover but ships no cover file: the cover endpoint must 404
     // so the client falls back instead of hanging on a broken image.
-    [16, "Missing Cover", "Missing Cover Book", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 1],
+    [16, "Missing – Cover", "Missing Cover Book", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 1],
   ] as const;
   for (const [id, title, path, uuid, hasCover] of rows) {
     db.run(
@@ -1295,4 +1295,12 @@ describe("format variant fixtures", () => {
       await proc.exited.catch(() => {});
     }
   }, TEST_TIMEOUT);
+});
+
+test("downloads Unicode titles with a valid encoded filename", async () => {
+  for (const method of ["GET", "HEAD"]) {
+    const response = await fetch(`${baseUrl}/api/books/16/download/EPUB`, { method });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-disposition")).toContain("filename*=UTF-8''Missing_%E2%80%93_Cover.epub");
+  }
 });
